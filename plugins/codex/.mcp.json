@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "coord": {
+      "command": "coord",
+      "args": ["mcp"]
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "name": "@johntimothybailey/coord",
+  "version": "0.1.0-private",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "coord": "dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "node scripts/static-check.mjs",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "check": "npm run lint && npm run typecheck && npm test",
+    "doctor": "node dist/src/cli.js doctor --json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "convex": "1.49.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
+  }
+}

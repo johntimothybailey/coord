@@ -1,0 +1,6 @@
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "coord hook codex SessionStart", "timeout": 10}]}],
+    "PreToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": "coord hook codex PreToolUse", "timeout": 10}]}]
+  }
+}

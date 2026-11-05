@@ -1,0 +1,22 @@
+:root { color-scheme: light; font: 1rem/1.5 system-ui, sans-serif; color: #172431; background: #f6f8fb; }
+body { margin: 0; }
+main { max-width: 42rem; margin: 3rem auto; padding: 0 1.25rem; }
+h1 { margin: .25rem 0; font-size: 2.25rem; }
+h2 { font-size: 1.25rem; }
+.eyebrow { color: #43566b; margin: 0; }
+form, section { margin-top: 2rem; }
+label { font-weight: 600; }
+#title-help, #count { color: #43566b; }
+.add-row { display: flex; gap: .75rem; flex-wrap: wrap; }
+input[type="text"] { flex: 1; min-width: 12rem; }
+input, button { font: inherit; }
+input[type="text"], button { padding: .75rem; border: 1px solid #52677c; border-radius: .4rem; }
+button { background: #174e91; color: white; cursor: pointer; }
+button:disabled, input:disabled { opacity: .7; cursor: wait; }
+:focus-visible { outline: 3px solid #174e91; outline-offset: 3px; }
+ul { list-style: none; padding: 0; }
+li { padding: .9rem 0; border-bottom: 1px solid #bac7d5; }
+li label { display: flex; align-items: start; gap: .75rem; overflow-wrap: anywhere; font-weight: 400; cursor: pointer; }
+input[type="checkbox"] { width: 1.25rem; height: 1.25rem; margin-top: .15rem; accent-color: #174e91; }
+.completed { text-decoration: line-through; color: #43566b; }
+#status { min-height: 3rem; margin-top: 2rem; }

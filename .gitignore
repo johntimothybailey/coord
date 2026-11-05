@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.worktrees/
+.coord-local/
+.env*
+!.env.example
+*.tsbuildinfo

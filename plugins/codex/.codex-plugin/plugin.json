@@ -1,0 +1,8 @@
+{
+  "name": "coord",
+  "version": "0.1.0",
+  "description": "Cooperative coordination through approved tasks and explicit check-ins.",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json"
+}

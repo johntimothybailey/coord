@@ -1,0 +1,7 @@
+{
+  "coord-checkin": {
+    "SessionStart": [{"type": "command", "command": "coord hook antigravity SessionStart", "timeout": 10}],
+    "PreInvocation": [{"type": "command", "command": "coord hook antigravity PreInvocation", "timeout": 10}],
+    "PreToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": "coord hook antigravity PreToolUse", "timeout": 10}]}]
+  }
+}
