@@ -6,7 +6,7 @@ import { CoordError } from "../src/protocol.js";
 import type { CapabilityKey } from "../src/protocol.js";
 import { CAPABILITIES, CLIENT_VERSION, REQUIRED_CHECKS } from "../src/protocol.js";
 import { BackendFixture } from "./backend.fixture.js";
-import { bootstrap } from "../convex/auth.js";
+import { bootstrap, digest } from "../convex/auth.js";
 import * as projects from "../convex/projects.js";
 import * as goals from "../convex/goals.js";
 import * as tasks from "../convex/tasks.js";
@@ -99,7 +99,7 @@ async function dispatchFixture() {
   const fixture = new BackendFixture(), humanToken = "1".repeat(64), agentToken = "2".repeat(64);
   let serial = 0;
   const request = (token = agentToken) => ({ token, protocolVersion: 1, clientVersion: CLIENT_VERSION, capabilities: [...CAPABILITIES], backendId: "backend", projectId: "project", requestId: `dispatch_${++serial}` });
-  await fixture.call(bootstrap, { backendId: "backend", projectId: "project", repository: "github.com/team/fixture", remote: "https://github.com/team/fixture.git", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: [], ruleTargets: [], humanId: "human", humanToken, agentId: "agent", agentToken, expiresAt: Date.now() + 3600_000 });
+  await fixture.call(bootstrap, { backendId: "backend", projectId: "project", repository: "github.com/team/fixture", remote: "https://github.com/team/fixture.git", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: [], ruleTargets: [], humanId: "human", humanDigest: await digest(humanToken), agentId: "agent", agentDigest: await digest(agentToken), expiresAt: Date.now() + 3600_000 });
   await fixture.call(projects.configure, { ...request(humanToken), repository: "github.com/team/fixture", remote: "https://github.com/team/fixture.git", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: [], ruleTargets: [], sharingApproved: true, capacity: 2, taskCap: 20 });
   const goal = await fixture.call(goals.propose, { ...request(), goalId: "goal", expectedRevision: 0, content: "Dispatch fixture", taskLimit: 20, runTimeoutMs: 60_000 }) as { revision: number; hash: string };
   await fixture.call(goals.approve, { ...request(humanToken), goalId: "goal", revision: goal.revision, hash: goal.hash });

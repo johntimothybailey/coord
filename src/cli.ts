@@ -8,10 +8,12 @@ import { runCoordHook } from "./hooks.js";
 import { loadSession, registerManual } from "./session.js";
 import { exportProject, syncApprovedRules } from "./operations.js";
 import { resolveWorkspace } from "./config.js";
+import { setupCommand } from "./onboarding.js";
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const [command, ...args] = argv;
   if (command === "--version") { console.log(CLIENT_VERSION); return; }
+  if (command === "setup") { await setupCommand(args); return; }
   if (command === "doctor") {
     if (args.some(arg => !["--json", "--no-fixtures"].includes(arg))) throw new CoordError("INVALID_INPUT", "Usage: coord doctor [--json] [--no-fixtures]");
     const report = await runDoctor({ fixtures: !args.includes("--no-fixtures") });
@@ -49,7 +51,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (!command || command === "--help" || command === "help") {
-    console.log("coord — private v2.5 implementation\n\n  doctor [--json] [--no-fixtures]\n  status\n  mcp\n  hook codex|antigravity [event]\n  rules sync\n  export <new-local-file.jsonl>\n  --version\n\nFull release gates are tracked in docs/execution.md. No deployment is configured automatically."); return;
+    console.log("coord — private v2.5 implementation\n\n  doctor [--json] [--no-fixtures]\n  setup inspect <plan.json>\n  setup bootstrap|connect <plan.json> <absolute-encrypted-vault>\n  status\n  mcp\n  hook codex|antigravity [event]\n  rules sync\n  export <new-local-file.jsonl>\n  --version\n\nProtected setup must run in a separate operator terminal. See docs/onboarding.md. Full release gates are tracked in docs/execution.md."); return;
   }
   throw new CoordError("INVALID_INPUT", "Unknown command; run coord --help");
 }

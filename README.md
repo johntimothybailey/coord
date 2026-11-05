@@ -16,7 +16,7 @@ node dist/src/cli.js doctor --json
 
 Doctor exits `2` when qualification gates are blocked and still emits valid redacted JSON. It does not install plugins, invoke a paid model, create a backend or publish code. Disposable primitive checks remain labelled `fixture`.
 
-Implemented CLI entry points: `doctor`, `status`, `mcp`, `hook`, `rules sync`, and project-scoped `export`. Backend-dependent commands require a trusted workspace association and the appropriate backend-bound agent/run credential. `COORD_SESSION_ID` identifies a participating host session; pending admission and its grant are persisted before the backend call. A persisted receipt never substitutes for current backend authority.
+Implemented CLI entry points: `doctor`, `status`, `mcp`, `hook`, `rules sync`, project-scoped `export`, and `setup inspect`. The protected `setup bootstrap` / `setup connect` commands are operator-only; follow [protected onboarding](docs/onboarding.md) outside agent-controlled terminals. Backend-dependent commands require a trusted workspace association and the appropriate backend-bound agent/run credential. `COORD_SESSION_ID` identifies a participating host session; pending admission and its grant are persisted before the backend call. A persisted receipt never substitutes for current backend authority.
 
 Do not manually synthesize human approval or qualification records to make admission pass. No `approved=true` switch, TTY check or ordinary file permission is treated as protected human participation.
 

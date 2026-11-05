@@ -18,7 +18,7 @@ const key: CapabilityKey = { os: "fixture", harness: "codex", harnessVersion: "f
 const isCode = (code: string) => (error: unknown) => error instanceof CoordError && error.code === code;
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 async function temporary(run: (root: string) => Promise<void>): Promise<void> {
-  const root = await mkdtemp(join(tmpdir(), "coord-adversarial-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "coord-adversarial-")));
   try { await run(root); } finally { await rm(root, { recursive: true, force: true }); }
 }
 async function repository(directory: string) {
@@ -83,15 +83,31 @@ test("T2 linked worktree inherits only the matching common Git directory, routin
 test("T1 credential files cannot substitute another backend destination, identity, role or malformed secret", async () => {
   await temporary(async directory => {
     const path = join(directory, `${credentialKey(config.backendId, config.backendUrl)}.json`);
-    const token = "a".repeat(64), stored = { backendId: config.backendId, backendUrl: config.backendUrl, role: "agent", token };
-    for (const changed of [{ backendId: "other" }, { backendUrl: "https://other.convex.cloud" }, { role: "human" }, { token: "short" }]) {
-      await writeFile(path, JSON.stringify({ ...stored, ...changed }));
+    const token = "a".repeat(64), stored = { schemaVersion: 1, backendId: config.backendId, backendUrl: config.backendUrl, role: "agent", memberId: "agent", projectIds: [config.projectId], expiresAt: Date.now() + 60_000, token };
+    for (const changed of [{ backendId: "other" }, { backendUrl: "https://other.convex.cloud" }, { role: "human" }, { token: "short" }, { schemaVersion: 0 }, { projectIds: ["other-project"] }, { projectIds: [] }, { expiresAt: Date.now() - 1 }, { expiresAt: Number.POSITIVE_INFINITY }]) {
+      await writeFile(path, JSON.stringify({ ...stored, ...changed }), { mode: 0o600 });
       await assert.rejects(readAgentCredential(config, directory), isCode("UNAUTHORIZED"));
     }
     await writeFile(path, JSON.stringify(stored));
     assert.equal(await readAgentCredential(config, directory), token);
     const other: WorkspaceConfig = { ...config, backendUrl: "https://other.convex.cloud" };
     await assert.rejects(readAgentCredential(other, directory), { code: "ENOENT" });
+  });
+});
+
+test("T1 agent credentials reject shared file/directory access and symlink paths before returning a token", async () => {
+  await temporary(async directory => {
+    const path = join(directory, `${credentialKey(config.backendId, config.backendUrl)}.json`);
+    const stored = { schemaVersion: 1, backendId: config.backendId, backendUrl: config.backendUrl, role: "agent", memberId: "agent", projectIds: [config.projectId], expiresAt: Date.now() + 60_000, token: "a".repeat(64) };
+    await writeFile(path, JSON.stringify(stored), { mode: 0o600 });
+    await chmod(path, 0o644); await assert.rejects(readAgentCredential(config, directory));
+    await chmod(path, 0o600); await chmod(directory, 0o755); await assert.rejects(readAgentCredential(config, directory));
+    await chmod(directory, 0o700);
+    const external = join(directory, "external.json"); await writeFile(external, JSON.stringify(stored), { mode: 0o600 });
+    await rm(path); await symlink(external, path); await assert.rejects(readAgentCredential(config, directory));
+    await rm(path);
+    const alias = join(directory, "credential-alias"); await symlink(directory, alias, "dir");
+    await assert.rejects(readAgentCredential(config, alias));
   });
 });
 

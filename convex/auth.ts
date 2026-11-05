@@ -84,19 +84,34 @@ export async function revokeGrant(ctx: MutationCtx, run: Doc<"runs">): Promise<v
 }
 
 // Deployment-owner-only primitive. Never exposed through a public action, HTTP route or agent tool.
-// The operator supplies locally generated random 32-byte tokens; only their digests persist.
+// The protected operator generates credentials locally and supplies only their SHA-256 digests.
 export const bootstrap = internalMutation({
-  args: { backendId: v.string(), projectId: v.string(), repository: v.string(), remote: v.string(), defaultBranch: v.string(), allowedPaths: v.array(v.string()), excludedPaths: v.array(v.string()), ruleTargets: v.array(v.string()), humanId: v.string(), humanToken: v.string(), agentId: v.string(), agentToken: v.string(), expiresAt: v.number() },
+  args: { backendId: v.string(), projectId: v.string(), repository: v.string(), remote: v.string(), defaultBranch: v.string(), allowedPaths: v.array(v.string()), excludedPaths: v.array(v.string()), ruleTargets: v.array(v.string()), humanId: v.string(), humanDigest: v.string(), agentId: v.string(), agentDigest: v.string(), expiresAt: v.number() },
   handler: async (ctx, args) => {
     stableId(args.backendId); stableId(args.projectId); stableId(args.humanId); stableId(args.agentId); paths(args.allowedPaths); for (const p of args.excludedPaths) path(p); for (const p of args.ruleTargets) path(p);
     bounded(args.repository, 2048, "repository"); bounded(args.remote, 2048, "remote"); bounded(args.defaultBranch, 256, "branch");
-    tokenFormat(args.humanToken); tokenFormat(args.agentToken);
-    if (args.humanToken === args.agentToken || args.humanId === args.agentId || args.expiresAt <= Date.now() || args.expiresAt > Date.now() + 365 * 86400_000) fail("INVALID_INPUT", "Invalid bootstrap credentials");
-    if (await ctx.db.query("metadata").take(1).then(rows => rows.length)) fail("FORBIDDEN", "Backend is already initialized");
-    await ctx.db.insert("metadata", { backendId: args.backendId, protocolVersion: PROTOCOL_VERSION, minSupportedClientVersion: "0.1.0-private", migrationVersion: 1, writersPaused: false, requiredCapabilities: [...CAPABILITIES], supportedCapabilities: [...CAPABILITIES] });
-    await ctx.db.insert("projects", { id: args.projectId, backendId: args.backendId, repository: args.repository, remote: args.remote, defaultBranch: args.defaultBranch, allowedPaths: args.allowedPaths, excludedPaths: args.excludedPaths, ruleTargets: args.ruleTargets, capacity: DEFAULTS.projectCapacity, taskCap: DEFAULTS.taskCap, configVersion: 1, policyVersion: 1, sharingApproved: false });
-    for (const [id, token, role] of [[args.humanId, args.humanToken, "human"], [args.agentId, args.agentToken, "agent"]] as const) await ctx.db.insert("credentials", { id, memberId: id, digest: await digest(token), role, backendId: args.backendId, projectIds: [args.projectId], expiresAt: args.expiresAt });
-    return { backendId: args.backendId, projectId: args.projectId, humanId: args.humanId, agentId: args.agentId };
+    if (!/^[a-f0-9]{64}$/.test(args.humanDigest) || !/^[a-f0-9]{64}$/.test(args.agentDigest) || args.humanDigest === args.agentDigest || args.humanId === args.agentId || !Number.isSafeInteger(args.expiresAt) || args.expiresAt <= Date.now() || args.expiresAt > Date.now() + 365 * 86400_000) fail("INVALID_INPUT", "Invalid bootstrap credential digests or expiry");
+    const metadata = { backendId: args.backendId, protocolVersion: PROTOCOL_VERSION, minSupportedClientVersion: "0.1.0-private", migrationVersion: 1, writersPaused: false, requiredCapabilities: [...CAPABILITIES], supportedCapabilities: [...CAPABILITIES] };
+    const project = { id: args.projectId, backendId: args.backendId, repository: args.repository, remote: args.remote, defaultBranch: args.defaultBranch, allowedPaths: args.allowedPaths, excludedPaths: args.excludedPaths, ruleTargets: args.ruleTargets, capacity: DEFAULTS.projectCapacity, taskCap: DEFAULTS.taskCap, configVersion: 1, policyVersion: 1, sharingApproved: false };
+    const credentials = ([[args.humanId, args.humanDigest, "human"], [args.agentId, args.agentDigest, "agent"]] as const).map(([id, credentialDigest, role]) => ({ id, memberId: id, digest: credentialDigest, role, backendId: args.backendId, projectIds: [args.projectId], expiresAt: args.expiresAt }));
+    const result = { backendId: args.backendId, projectId: args.projectId, humanId: args.humanId, agentId: args.agentId };
+    const existing = await ctx.db.query("metadata").take(2);
+    if (existing.length) {
+      const sameRecord = (stored: { _id: unknown; _creationTime: number } | null, expected: unknown) => {
+        if (!stored) return false;
+        const { _id: _id, _creationTime: _created, ...fields } = stored;
+        return canonical(fields) === canonical(expected);
+      };
+      const storedProject = await ctx.db.query("projects").withIndex("by_stable_id", q => q.eq("id", args.projectId)).unique();
+      const storedHuman = await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", args.humanId)).unique();
+      const storedAgent = await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", args.agentId)).unique();
+      if (existing.length !== 1 || !sameRecord(existing[0]!, metadata) || !sameRecord(storedProject, project) || !sameRecord(storedHuman, credentials[0]) || !sameRecord(storedAgent, credentials[1]) || storedHuman?.revokedAt !== undefined || storedAgent?.revokedAt !== undefined || !storedHuman || storedHuman.expiresAt <= Date.now() || !storedAgent || storedAgent.expiresAt <= Date.now()) fail("FORBIDDEN", "Existing bootstrap state differs; protected operator inspection is required");
+      return result;
+    }
+    await ctx.db.insert("metadata", metadata);
+    await ctx.db.insert("projects", project);
+    for (const credential of credentials) await ctx.db.insert("credentials", credential);
+    return result;
   },
 });
 

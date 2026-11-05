@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { CoordError } from "./protocol.js";
+import { readSmallFile } from "./credentials.js";
 
 export interface WorkspaceConfig {
   schemaVersion: 1; backendId: string; backendUrl: string; projectId: string;
@@ -58,7 +59,7 @@ export async function resolveWorkspace(cwd: string, registryPath = join(homedir(
 }
 export function credentialKey(backendId: string, backendUrl: string): string { return createHash("sha256").update(JSON.stringify([backendId, backendUrl])).digest("hex"); }
 export async function readAgentCredential(config: WorkspaceConfig, directory = join(homedir(), ".config/coord/credentials")): Promise<string> {
-  const credential = object(JSON.parse(await readFile(join(directory, `${credentialKey(config.backendId, config.backendUrl)}.json`), "utf8")) as unknown);
-  if (credential.backendId !== config.backendId || credential.backendUrl !== config.backendUrl || credential.role !== "agent" || typeof credential.token !== "string" || !/^[a-f0-9]{64}$/.test(credential.token)) throw new CoordError("UNAUTHORIZED", "No matching project-agent credential");
+  const credential = object(JSON.parse(await readSmallFile(join(directory, `${credentialKey(config.backendId, config.backendUrl)}.json`), true)) as unknown);
+  if (credential.schemaVersion !== 1 || credential.backendId !== config.backendId || credential.backendUrl !== config.backendUrl || credential.role !== "agent" || !Array.isArray(credential.projectIds) || !credential.projectIds.includes(config.projectId) || !Number.isSafeInteger(credential.expiresAt) || (credential.expiresAt as number) <= Date.now() || typeof credential.token !== "string" || !/^[a-f0-9]{64}$/.test(credential.token)) throw new CoordError("UNAUTHORIZED", "No matching project-agent credential");
   return credential.token;
 }

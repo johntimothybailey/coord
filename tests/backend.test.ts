@@ -15,7 +15,7 @@ let serial = 0;
 const request = (token = agentToken) => ({ token, protocolVersion: 1, clientVersion: CLIENT_VERSION, capabilities: [...CAPABILITIES], backendId: "backend", projectId: "project", requestId: `request_${++serial}` });
 async function setup() {
   const fixture = new BackendFixture();
-  await fixture.call(bootstrap, { backendId: "backend", projectId: "project", repository: "https://example.test/repository", remote: "origin", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: ["src/secrets"], ruleTargets: ["AGENTS.md"], humanId: "human", humanToken, agentId: "agent", agentToken, expiresAt: Date.now() + 86400_000 });
+  await fixture.call(bootstrap, { backendId: "backend", projectId: "project", repository: "https://example.test/repository", remote: "origin", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: ["src/secrets"], ruleTargets: ["AGENTS.md"], humanId: "human", humanDigest: await digest(humanToken), agentId: "agent", agentDigest: await digest(agentToken), expiresAt: Date.now() + 86400_000 });
   await fixture.call(projects.configure, { ...request(humanToken), repository: "https://example.test/repository", remote: "origin", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: ["src/secrets"], ruleTargets: ["AGENTS.md"], sharingApproved: true, capturePolicyDigest: "d".repeat(64), capacity: 2, taskCap: 20 });
   const draft = await fixture.call(goals.propose, { ...request(), goalId: "goal", expectedRevision: 0, content: "Implement fixture task", taskLimit: 20, runTimeoutMs: 1800_000 }) as { revision: number; hash: string };
   await fixture.call(goals.approve, { ...request(humanToken), goalId: "goal", revision: draft.revision, hash: draft.hash });
@@ -406,4 +406,47 @@ test("anonymous invite throttle persists unknown denials in one server-chosen de
   const invitation = [...fixture.rows.values()].find(row => row._table === "invites"); assert.equal(invitation?.redeemedAt, undefined);
   now += auth.INVITE_REDEEM_WINDOW_MS;
   const allowed = await fixture.call(auth.redeem, { ...request(), inviteToken, newToken, credentialExpiresAt: now + 3600_000 }) as { joined: boolean }; assert.equal(allowed.joined, true);
+});
+
+function bootstrapInput() {
+  return { backendId: "bootstrap_backend", projectId: "bootstrap_project", repository: "https://example.test/bootstrap", remote: "origin", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: ["src/private"], ruleTargets: ["AGENTS.md"], humanId: "bootstrap_human", humanDigest: "a".repeat(64), agentId: "bootstrap_agent", agentDigest: "b".repeat(64), expiresAt: Date.now() + 3600_000 };
+}
+test("internal bootstrap accepts only digest fields and stores supplied digests without rehashing", async () => {
+  const fixture = new BackendFixture(), input = bootstrapInput();
+  const definition = bootstrap as unknown as { isInternal: boolean; exportArgs(): string };
+  assert.equal(definition.isInternal, true);
+  const fields = (JSON.parse(definition.exportArgs()) as { value: Record<string, unknown> }).value;
+  assert("humanDigest" in fields && "agentDigest" in fields); assert(!("humanToken" in fields)); assert(!("agentToken" in fields));
+  const result = await fixture.call(bootstrap, input);
+  assert.deepEqual(result, { backendId: input.backendId, projectId: input.projectId, humanId: input.humanId, agentId: input.agentId });
+  assert.equal(fixture.find("credentials", input.humanId).digest, input.humanDigest);
+  assert.equal(fixture.find("credentials", input.agentId).digest, input.agentDigest);
+  assert.notEqual(fixture.find("credentials", input.humanId).digest, await digest(input.humanDigest));
+});
+test("bootstrap rejects equal, malformed and legacy raw-token credential input before writing", async () => {
+  const input = bootstrapInput();
+  for (const invalid of [{ ...input, agentDigest: input.humanDigest }, { ...input, humanDigest: "A".repeat(64) }, { ...input, humanDigest: "a".repeat(63) }, { ...input, agentDigest: "g".repeat(64) }, { ...input, expiresAt: Number.NaN }]) {
+    const fixture = new BackendFixture(); await assert.rejects(fixture.call(bootstrap, invalid), isCode("INVALID_INPUT")); assert.equal(fixture.rows.size, 0);
+  }
+  const { humanDigest: _humanDigest, agentDigest: _agentDigest, ...legacy } = input;
+  const fixture = new BackendFixture();
+  await assert.rejects(fixture.call(bootstrap, { ...legacy, humanToken: "c".repeat(64), agentToken: "d".repeat(64) }), isCode("INVALID_INPUT")); assert.equal(fixture.rows.size, 0);
+});
+test("exact bootstrap replay returns IDs only and rejects changed input, policy, credential authority or revocation", async () => {
+  const fixture = new BackendFixture(), input = bootstrapInput();
+  const first = await fixture.call(bootstrap, input), before = structuredClone(fixture.rows);
+  assert.deepEqual(await fixture.call(bootstrap, input), first); assert.deepEqual(fixture.rows, before);
+  for (const changed of [{ ...input, humanDigest: "c".repeat(64) }, { ...input, agentDigest: "c".repeat(64) }, { ...input, projectId: "different_project" }, { ...input, expiresAt: input.expiresAt + 1 }, { ...input, repository: "https://example.test/changed" }]) await assert.rejects(fixture.call(bootstrap, changed), isCode("FORBIDDEN"));
+  assert.deepEqual(fixture.rows, before);
+  for (const patch of [{ sharingApproved: true }, { policyVersion: 2 }, { capacity: 3 }, { allowedPaths: ["other"] }]) {
+    const changed = new BackendFixture(); await changed.call(bootstrap, input); await changed.context().db.patch(changed.find("projects", input.projectId)._id, patch);
+    await assert.rejects(changed.call(bootstrap, input), isCode("FORBIDDEN"));
+  }
+  for (const patch of [{ revokedAt: Date.now() }, { role: "agent" as const }, { memberId: "different_member" }, { projectIds: ["different_project"] }, { expiresAt: 1 }]) {
+    const changed = new BackendFixture(); await changed.call(bootstrap, input); await changed.context().db.patch(changed.find("credentials", input.humanId)._id, patch);
+    await assert.rejects(changed.call(bootstrap, input), isCode("FORBIDDEN"));
+  }
+  const changed = new BackendFixture(); await changed.call(bootstrap, input);
+  const metadata = (await changed.context().db.query("metadata").take(1))[0]!; await changed.context().db.patch(metadata._id, { writersPaused: true });
+  await assert.rejects(changed.call(bootstrap, input), isCode("FORBIDDEN"));
 });
