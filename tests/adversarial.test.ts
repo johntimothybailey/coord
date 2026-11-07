@@ -199,7 +199,7 @@ test("T1/T2 private admission receipts reject routing substitution, broad permis
     await assert.rejects(loadSession(root, new ReceiptClient(state), "session"), isCode("UNAUTHORIZED"));
     const external = join(root, "external"); await mkdir(external);
     await symlink(external, join(root, ".coord-local/sessions/linked"), "dir");
-    await assert.rejects(loadSession(root, new ReceiptClient(state), "linked"), isCode("UNTRUSTED_WORKSPACE_CONFIG"));
+    await assert.rejects(loadSession(root, new ReceiptClient(state), "linked"), isCode("UNAUTHORIZED"));
     await assert.rejects(registerManual(root, new ReceiptClient(state), "../escape", admission), isCode("INVALID_INPUT"));
     await assert.rejects(registerManual(root, new ReceiptClient(state), undefined, admission), isCode("BLOCKED_ENV"));
   });

@@ -22,7 +22,7 @@ export function scopeChunks(paths: string[], revision: string, sourceHead: strin
 /** Net tracked/selected-untracked changes are read from the audited candidate, including local commits. */
 export async function scanCheckpoint(options: CaptureOptions, checkpoint: PreparedCheckpoint, revision: string): Promise<ScopeChunk[]> {
   await validatePreparedCheckpoint(options, checkpoint);
-  const output = await git(options.repo, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", options.executionBase.sha, checkpoint.tree, "--"]);
+  const output = await git(options.repo, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", options.executionBase.sha, checkpoint.tree, "--"], { transport: options.gitTransport, metadataIsolation: options.gitMetadataIsolation });
   let names: string;
   try { names = new TextDecoder("utf-8", { fatal: true }).decode(output.stdout); } catch { throw new CoordError("COVERAGE_INCOMPLETE", "Scope scan contains an unsupported non-UTF8 path"); }
   return scopeChunks(names.split("\0").filter(Boolean), revision, checkpoint.sourceHead, checkpoint.tree);

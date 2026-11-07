@@ -1,4 +1,5 @@
 import { v } from "convex/values";
+import type { Doc, QueryCtx } from "./server.js";
 import { mutation, query } from "./server.js";
 import { authenticate, liveRun, replay, runArgs, identityArgs, stableId, bounded, path, fail, digest, canonical } from "./auth.js";
 import { taskById } from "./tasks.js";
@@ -32,22 +33,33 @@ export const approveRule = mutation({ args: { ...identityArgs, memoryId: v.strin
     return { memoryId: memory.id, policyVersion, hash: memory.hash };
   });
 } });
-export const rules = query({ args: runArgs, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["run"]); await liveRun(ctx, args, actor);
+async function approvedRuleProjection(ctx: Pick<QueryCtx, "db">, project: Doc<"projects">) {
   const records = await ctx.db.query("memories").withIndex("by_project_kind_status", q => q.eq("projectId", project.id).eq("kind", "rule").eq("status", "active")).take(201);
   const result = boundedRecords(records.filter(r => r.kind === "rule" && r.status === "active" && r.approvedHash === r.hash && !!r.approvedBy), 12 * 1024);
   return { rules: result.records, ruleTargets: project.ruleTargets, policyVersion: project.policyVersion, complete: records.length <= 200 && result.complete, bytes: result.bytes };
+}
+export const rules = query({ args: runArgs, handler: async (ctx, args) => {
+  const { actor, project } = await authenticate(ctx, args, ["run"]); await liveRun(ctx, args, actor, ["reserved", "starting", "running"]);
+  return approvedRuleProjection(ctx, project);
+} });
+export const projectRules = query({ args: identityArgs, handler: async (ctx, args) => {
+  const { project } = await authenticate(ctx, args, ["agent", "human"]);
+  return approvedRuleProjection(ctx, project);
 } });
 export const context = query({ args: { ...runArgs, cursor: v.optional(v.string()) }, handler: async (ctx, args) => {
   const { actor } = await authenticate(ctx, args, ["run"]); const { task } = await liveRun(ctx, args, actor);
+  const currentTask = { id: task.id, dependencies: task.dependencies };
+  const currentTaskBytes = new TextEncoder().encode(canonical(currentTask)).length;
+  if (currentTaskBytes > 8 * 1024) fail("COVERAGE_INCOMPLETE", "Declared input metadata exceeds bounded context capacity");
+  const memoryBudget = 10 * 1024 - currentTaskBytes;
   const page = await ctx.db.query("memories").withIndex("by_project", q => q.eq("projectId", args.projectId)).paginate({ cursor: args.cursor ?? null, numItems: 1 });
   const related = page.page.filter(r => (r.status === "active" || r.status === "conflicting") && r.applicability.some(p => task.scope.some(s => p === s || p.startsWith(`${s}/`) || s.startsWith(`${p}/`))));
-  const full = boundedRecords(related.map(memory => ({ ...memory, untrusted: memory.kind !== "rule", authoritative: memory.kind === "rule" && memory.approvedHash === memory.hash && !!memory.approvedBy })), 10 * 1024);
+  const full = boundedRecords(related.map(memory => ({ ...memory, untrusted: memory.kind !== "rule", authoritative: memory.kind === "rule" && memory.approvedHash === memory.hash && !!memory.approvedBy })), memoryBudget);
   const truncated = !full.complete;
-  const selected = truncated ? boundedRecords(related.map(memory => ({ id: memory.id, revision: memory.revision, kind: memory.kind, status: memory.status, hash: memory.hash, contentPreview: Array.from(memory.content).slice(0, 128).join(""), sourceCount: memory.sources.length, untrusted: true, authoritative: false, requiresExpansion: true })), 10 * 1024) : full;
+  const selected = truncated ? boundedRecords(related.map(memory => ({ id: memory.id, revision: memory.revision, kind: memory.kind, status: memory.status, hash: memory.hash, contentPreview: Array.from(memory.content).slice(0, 128).join(""), sourceCount: memory.sources.length, untrusted: true, authoritative: false, requiresExpansion: true })), memoryBudget) : full;
   const goalTasks = await ctx.db.query("tasks").withIndex("by_goal", q => q.eq("goalId", task.goalId)).take(101);
   const taskResult = boundedRecords(goalTasks.filter(t => t.id !== task.id).map(t => ({ id: t.id, title: t.title, scope: t.scope, state: t.state, latestCheckpointId: t.latestCheckpointId, publicationId: t.publicationId, codeAvailability: t.latestCheckpointId ? "published_reference_requires_verification" : "unavailable" })), 2 * 1024);
-  return { memories: selected.records, tasks: taskResult.records, bytes: selected.bytes + taskResult.bytes, complete: page.isDone && goalTasks.length <= 100 && selected.complete && taskResult.complete && !truncated, nextCursor: page.isDone ? null : page.continueCursor };
+  return { currentTask, memories: selected.records, tasks: taskResult.records, bytes: currentTaskBytes + selected.bytes + taskResult.bytes, complete: page.isDone && goalTasks.length <= 100 && selected.complete && taskResult.complete && !truncated, nextCursor: page.isDone ? null : page.continueCursor };
 } });
 export const expand = query({ args: { ...runArgs, memoryId: v.string(), offset: v.number(), sourceOffset: v.optional(v.number()) }, handler: async (ctx, args) => {
   const { actor } = await authenticate(ctx, args, ["run"]); await liveRun(ctx, args, actor);

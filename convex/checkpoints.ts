@@ -1,17 +1,21 @@
 import { v } from "convex/values";
+import type { Doc, QueryCtx } from "./server.js";
 import { mutation, query } from "./server.js";
 import { runArgs, identityArgs, authenticate, liveRun, replay, bounded, fail, digest, canonical, stableId, approvedGoal } from "./auth.js";
-import { safeBaseRetry, taskById, validateScope } from "./tasks.js";
+import { safeBaseRetry, taskById, validateScope, noConflicts, dependencyInput } from "./tasks.js";
 import { manifestValidator, validateManifest, verifiedRun, progressHash, requireVerifiedScan } from "./artifacts.js";
 export const authority = query({ args: runArgs, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["run"]); const { task } = await liveRun(ctx, args, actor);
-  return { identity: { taskId: task.id, runId: args.runId, epoch: task.epoch, goalRevision: task.goalRevision }, executionBase: task.executionBase, progressRevision: task.progressRevision, progressHash: await progressHash(task.progress), policyDigest: project.capturePolicyDigest ?? null };
+  const { actor, project } = await authenticate(ctx, args, ["run", "artifact_verifier", "human"]);
+  const { task, run } = actor.role === "run" ? await liveRun(ctx, args, actor) : await verifiedRun(ctx, args, actor);
+  let conflictBlocked = false; try { await noConflicts(ctx, task); } catch { conflictBlocked = true; }
+  return { identity: { taskId: task.id, runId: run.id, epoch: task.epoch, goalRevision: task.goalRevision }, executionBase: task.executionBase, progressRevision: task.progressRevision, progressHash: await progressHash(task.progress), policyDigest: project.capturePolicyDigest ?? null, progress: task.progress, taskState: task.state, runMode: run.mode, conflictBlocked };
 } });
 export const prepare = mutation({ args: { ...runArgs, manifest: manifestValidator, summary: v.string() }, handler: async (ctx, args) => {
   const { actor } = await authenticate(ctx, args, ["run"]); const { task, run } = await liveRun(ctx, args, actor);
   return replay(ctx, actor, "checkpoints.prepare", args, async () => {
     if (run.mode === "replan") fail("FORBIDDEN", "Replanning runs cannot prepare implementation code artifacts");
     bounded(args.summary, 16 * 1024, "checkpoint summary"); stableId(args.manifest.checkpointId); await validateManifest(args.manifest, task, run);
+    if (await progressHash(args.summary) !== args.manifest.progressHash) fail("CHECKPOINT_INCOMPLETE", "Checkpoint summary must preserve its exact captured progress");
     const old = await ctx.db.query("checkpoints").withIndex("by_stable_id", q => q.eq("id", args.manifest.checkpointId)).unique();
     if (old) fail("IDEMPOTENCY_CONFLICT", "Checkpoint ID already exists; retry the original request identity");
     const m = args.manifest;
@@ -46,18 +50,42 @@ export const ready = mutation({ args: { ...runArgs, checkpointId: v.string() }, 
   });
 } });
 
+async function dependencySummaries(ctx: Pick<QueryCtx, "db">, project: Doc<"projects">, task: Doc<"tasks">) {
+  if (task.dependencies.length > 20 || new Set(task.dependencies.map(input => input.taskId)).size !== task.dependencies.length) fail("COVERAGE_INCOMPLETE", "Dependency input list exceeds its complete bounded contract");
+  const inputs = [];
+  for (const dependency of task.dependencies) inputs.push(await dependencyInput(ctx, project, task, dependency.taskId, false));
+  // Bound only the added compact inputs, never the existing accepted checkpoint/manifest response.
+  if (new TextEncoder().encode(canonical(inputs)).length > 64 * 1024) fail("COVERAGE_INCOMPLETE", "Compact dependency inputs exceed their complete response bound");
+  return inputs;
+}
+export const getInput = query({ args: { ...identityArgs, taskId: v.string(), dependencyTaskId: v.string(), includeManifest: v.optional(v.boolean()) }, handler: async (ctx, args) => {
+  const { actor, project } = await authenticate(ctx, args, ["agent", "human", "run"]);
+  let task: Doc<"tasks">;
+  if (actor.role === "run") {
+    const run = actor.runId ? await ctx.db.query("runs").withIndex("by_stable_id", q => q.eq("id", actor.runId!)).unique() : null;
+    if (!run || run.taskId !== args.taskId || run.projectId !== project.id) fail("FORBIDDEN", "Run credentials may inspect only their bound task's declared inputs");
+    ({ task } = await liveRun(ctx, { ...args, runId: run.id, epoch: run.epoch, goalRevision: run.goalRevision }, actor, ["reserved", "starting", "running"]));
+  } else {
+    task = await taskById(ctx, args.taskId, project.id); await approvedGoal(ctx, task); validateScope(project, task.scope);
+    if (!project.sharingApproved) fail("FORBIDDEN", "Project sharing is not approved");
+  }
+  return dependencyInput(ctx, project, task, args.dependencyTaskId, args.includeManifest === true);
+} });
+
 export const getReady = query({ args: { ...identityArgs, taskId: v.string(), checkpointId: v.optional(v.string()) }, handler: async (ctx, args) => {
   const { project } = await authenticate(ctx, args, ["agent", "human"]);
   const task = await taskById(ctx, args.taskId, args.projectId); const goal = await approvedGoal(ctx, task);
   validateScope(project, task.scope);
   if (!project.sharingApproved) fail("FORBIDDEN", "Project sharing is not approved");
+  const inputs = await dependencySummaries(ctx, project, task);
   if (!args.checkpointId) {
     if (task.latestCheckpointId || !await safeBaseRetry(ctx, task)) fail("BLOCKED_CHECKPOINT", "Select the explicit latest ready checkpoint; absent progress is not evidence that execution never started");
-    return { status: "initial_base" as const, task, goal, checkpoint: null, manifest: null, summary: null, executionBase: task.executionBase };
+    return { status: "initial_base" as const, task, goal, checkpoint: null, manifest: null, summary: null, executionBase: task.executionBase, inputs };
   }
   const checkpoint = await ctx.db.query("checkpoints").withIndex("by_stable_id", q => q.eq("id", args.checkpointId!)).unique();
   if (!checkpoint || checkpoint.projectId !== project.id || checkpoint.taskId !== task.id || checkpoint.id !== task.latestCheckpointId || checkpoint.state !== "ready") fail("BLOCKED_CHECKPOINT", "Selected checkpoint is unavailable, incomplete or not the current latest ready artifact");
   const manifest = JSON.parse(checkpoint.manifestJson) as typeof manifestValidator.type;
   if (manifest.identity.goalRevision !== task.goalRevision || canonical(manifest.executionBase) !== canonical(task.executionBase) || checkpoint.commit !== manifest.commit || checkpoint.tree !== manifest.tree || !project.capturePolicyDigest || manifest.policyDigest !== project.capturePolicyDigest) fail("BLOCKED_CHECKPOINT", "Ready artifact no longer matches the current approved goal, execution base or sharing policy");
-  return { status: "ready" as const, task, goal, checkpoint, manifest, summary: checkpoint.summary, executionBase: checkpoint.executionBase };
+  if (await progressHash(checkpoint.summary) !== manifest.progressHash) fail("BLOCKED_CHECKPOINT", "Ready checkpoint has no matching immutable progress summary");
+  return { status: "ready" as const, task, goal, checkpoint, manifest, summary: checkpoint.summary, executionBase: checkpoint.executionBase, inputs };
 } });

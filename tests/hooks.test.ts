@@ -1,12 +1,30 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runCoordHook, renderCheckIn } from "../src/hooks.js";
+import { runCoordHook, renderCheckIn, backendFailure } from "../src/hooks.js";
 import type { CoordBackend, RunConnection } from "../src/mcp.js";
 import { CoordError, DEFAULTS, type RunIdentity } from "../src/protocol.js";
 
 const identity: RunIdentity = { taskId: "task1", runId: "run1", epoch: 2, goalRevision: 1 };
 const message = { id: "message1", recipientTaskId: "task1", recipientEpoch: 2, type: "warning", payload: "Coordinate the shared interface", conflict: false, state: "queued" };
-const data = (messages: unknown[] = [message]) => ({ task: { id: "task1", epoch: 2, progressRevision: 1, state: "running" }, run: { id: "run1", epoch: 2, goalRevision: 1 }, policyVersion: 1, messages, complete: true });
+const data = (messages: unknown[] = [message]) => ({ task: { id: "task1", epoch: 2, progressRevision: 1, state: "running", dependencies: [] as { taskId: string; mode: string; artifact?: string }[] }, run: { id: "run1", epoch: 2, goalRevision: 1 }, policyVersion: 1, messages, complete: true });
+
+test("command recovery errors preserve safe backend codes without returning private error text", () => {
+  for (const code of ["PROTOCOL_INCOMPATIBLE", "UNTRUSTED_WORKSPACE_CONFIG", "LAUNCH_UNCERTAIN", "CHECKPOINT_INCOMPLETE", "BLOCKED_CHECKPOINT", "PUBLICATION_STALE", "NEEDS_HUMAN"]) {
+    const failure = backendFailure({ data: { code, message: "synthetic-private-error-canary" }, message: "synthetic-private-error-canary" });
+    assert.equal(failure.code, code); assert(!failure.message.includes("synthetic-private-error-canary"));
+  }
+});
+test("routine context retains exact dependency pins or an explicit bounded expansion pointer", () => {
+  const response = data([]);
+  response.task.dependencies = [{ taskId: "input_task", mode: "published", artifact: "older_pinned_checkpoint" }];
+  const small = renderCheckIn(response, identity);
+  assert.match(small.text, /older_pinned_checkpoint/); assert.equal(small.blocked, false);
+  response.task.dependencies = Array.from({ length: 20 }, (_, index) => ({ taskId: `task_${index}_${"x".repeat(80)}`, mode: "published", artifact: `pinned_${index}_${"y".repeat(80)}` }));
+  const large = renderCheckIn(response, identity);
+  assert(large.text.includes("coord_dependency_input")); assert(large.text.includes("20"));
+  assert(Buffer.byteLength(large.text) <= DEFAULTS.updateBytes);
+  assert.equal(large.blocked, false, "optional input details remain expandable instead of permanently blocking every check-in");
+});
 
 test("stateless hooks independently fetch durable messages and replay offered output after a lost response", async () => {
   const calls: string[] = [], receipts: unknown[] = [];

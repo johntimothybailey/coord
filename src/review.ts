@@ -26,9 +26,9 @@ interface Journal { schemaVersion: 1; fingerprint: string; state: "prepared" | "
 async function liveTarget(options: PublishReviewOptions): Promise<string> {
   const ref = `refs/coord/internal/${randomUUID()}`;
   try {
-    await git(options.capture.repo, ["fetch", "--no-tags", "--no-write-fetch-head", options.capture.remote.name, `${options.targetRef}:${ref}`]);
-    return await gitText(options.capture.repo, ["rev-parse", `${ref}^{commit}`]);
-  } finally { await git(options.capture.repo, ["update-ref", "-d", ref]); }
+    await git(options.capture.repo, ["fetch", "--no-tags", "--no-write-fetch-head", options.capture.remote.name, `${options.targetRef}:${ref}`], { transport: options.capture.gitTransport, metadataIsolation: options.capture.gitMetadataIsolation });
+    return await gitText(options.capture.repo, ["rev-parse", `${ref}^{commit}`], { transport: options.capture.gitTransport, metadataIsolation: options.capture.gitMetadataIsolation });
+  } finally { await git(options.capture.repo, ["update-ref", "-d", ref], { transport: options.capture.gitTransport, metadataIsolation: options.capture.gitMetadataIsolation }); }
 }
 function verifyEvidence(options: PublishReviewOptions, base: string): void {
   if (!options.requiredCommands.length || options.requiredCommands.some(command => !command.length || command.some(arg => typeof arg !== "string" || arg.includes("\0")))) throw new CoordError("INVALID_INPUT", "Review requires explicit verification commands from approved project policy");
@@ -58,7 +58,7 @@ async function hostFind(options: PublishReviewOptions, lookup: ReviewLookup): Pr
 export async function publishReview(options: PublishReviewOptions): Promise<PublishedReview> {
   options = { ...options, capture: snapshotCaptureOptions(options.capture), artifact: structuredClone(options.artifact), verification: structuredClone(options.verification), requiredCommands: structuredClone(options.requiredCommands) };
   if (!/^[A-Za-z0-9_-]{1,100}$/.test(options.publicationId) || !/^[A-Za-z0-9_./:-]{1,512}$/.test(options.repositoryId) || !options.targetRef.startsWith("refs/heads/")) throw new CoordError("INVALID_INPUT", "Invalid selected review repository, target or publication identity");
-  await git(options.capture.repo, ["check-ref-format", options.targetRef]);
+  await git(options.capture.repo, ["check-ref-format", options.targetRef], { transport: options.capture.gitTransport, metadataIsolation: options.capture.gitMetadataIsolation });
   await options.preflight("review.start");
   await validatePreparedCheckpoint(options.capture, options.artifact);
   const base = await liveTarget(options);
@@ -66,7 +66,7 @@ export async function publishReview(options: PublishReviewOptions): Promise<Publ
   const headRef = `coord/reviews/${options.artifact.identity.taskId}/e${options.artifact.identity.epoch}/${options.publicationId}`;
   const lookup: ReviewLookup = { repositoryId: options.repositoryId, publicationId: options.publicationId, headRef, baseRef: options.targetRef.slice("refs/heads/".length) };
   const fingerprint = captureDigest({ lookup, head: options.artifact.commit, tree: options.artifact.tree, base, manifestDigest: options.artifact.manifestDigest, environmentDigest: options.environmentDigest, requiredCommands: options.requiredCommands });
-  const common = await realpath(resolve(options.capture.repo, await gitText(options.capture.repo, ["rev-parse", "--git-common-dir"])));
+  const common = await realpath(resolve(options.capture.repo, await gitText(options.capture.repo, ["rev-parse", "--git-common-dir"], { transport: options.capture.gitTransport, metadataIsolation: options.capture.gitMetadataIsolation })));
   const directory = join(common, "coord-publications"); await mkdir(directory, { recursive: true, mode: 0o700 });
   if (await realpath(directory) !== directory) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Publication journal cannot traverse a symlink");
   const parentDirectory = await open(common, "r");

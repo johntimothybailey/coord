@@ -1,11 +1,19 @@
 import { spawn } from "node:child_process";
+import { realpath, stat } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import { CoordError } from "./protocol.js";
 import type { ReviewHostAdapter, ReviewLookup, ReviewRecord } from "./review.js";
 
 type Request = (args: string[], input?: string) => Promise<unknown>;
-function ghRequest(environment: NodeJS.ProcessEnv): Request {
-  return (args, input) => new Promise((resolve, reject) => {
-    const child = spawn("gh", ["api", "--hostname", "github.com", "-H", "Accept: application/vnd.github+json", "-H", "X-GitHub-Api-Version: 2022-11-28", ...args], { env: environment, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
+function ghRequest(environment: NodeJS.ProcessEnv, executable: string): Request {
+  const selectedEnvironment = { ...environment };
+  return async (args, input) => {
+    try {
+      const info = await stat(executable);
+      if (await realpath(executable) !== executable || !info.isFile() || !(info.mode & 0o111) || (info.mode & 0o022) || (process.getuid && info.uid !== 0 && info.uid !== process.getuid())) throw new Error();
+    } catch { throw new CoordError("UNSUPPORTED_FOR_AUTONOMOUS_EXECUTION", "Selected canonical GitHub executable is unavailable or unsafe"); }
+    return new Promise((resolve, reject) => {
+    const child = spawn(executable, ["api", "--hostname", "github.com", "-H", "Accept: application/vnd.github+json", "-H", "X-GitHub-Api-Version: 2022-11-28", ...args], { env: selectedEnvironment, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
     const chunks: Buffer[] = []; let bytes = 0, failed = false;
     let fallback: NodeJS.Timeout | undefined;
     const fail = () => {
@@ -25,6 +33,7 @@ function ghRequest(environment: NodeJS.ProcessEnv): Request {
     });
     child.stdin.end(input);
   });
+  };
 }
 function object(value: unknown): Record<string, unknown> { if (!value || typeof value !== "object" || Array.isArray(value)) throw new CoordError("PUBLICATION_STALE", "Invalid GitHub record"); return value as Record<string, unknown>; }
 
@@ -32,9 +41,10 @@ function object(value: unknown): Record<string, unknown> { if (!value || typeof 
 export class GitHubReviewAdapter implements ReviewHostAdapter {
   private readonly slug: string;
   private readonly request: Request;
-  constructor(readonly repositoryId: string, environment: NodeJS.ProcessEnv, request?: Request) {
+  constructor(readonly repositoryId: string, environment: NodeJS.ProcessEnv, request?: Request, executable?: string) {
     if (!/^github\.com\/[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_.-]+$/.test(repositoryId)) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "GitHub adapter requires the selected canonical repository");
-    this.slug = repositoryId.slice("github.com/".length); this.request = request ?? ghRequest(environment);
+    if (!request && (!executable || !isAbsolute(executable))) throw new CoordError("UNSUPPORTED_FOR_AUTONOMOUS_EXECUTION", "An explicit canonical trusted GitHub executable is required");
+    this.slug = repositoryId.slice("github.com/".length); this.request = request ?? ghRequest(environment, executable!);
   }
   private lookup(input: ReviewLookup): void {
     if (input.repositoryId !== this.repositoryId || !/^[A-Za-z0-9_-]{1,100}$/.test(input.publicationId) || !/^coord\/reviews\/[A-Za-z0-9_-]+\/e[1-9][0-9]*\/[A-Za-z0-9_-]+$/.test(input.headRef) || !input.headRef.endsWith(`/${input.publicationId}`) || !input.baseRef || /[\x00-\x20~^:?*\[\\]/.test(input.baseRef)) throw new CoordError("FORBIDDEN", "PR operation differs from selected immutable publication routing");

@@ -7,6 +7,7 @@ import { canonicalJson } from "./canonical.js";
 import { approvedWorkerEnvironment, readWrapperEvidence, receiptDigest, writeWrapperEvidence, type WrapperOutcome, type WrapperSpec } from "./launch-wrapper.js";
 import { LaunchJournalStore, type LaunchEffects, type LaunchJournal } from "./launch.js";
 import { CoordError, DEFAULTS, requireCapability, type CapabilityEvidence, type CapabilityKey, type HarnessAdapter, type LaunchReceipt, type StopEvidence } from "./protocol.js";
+import type { CgroupControl, CgroupWrapperSpec } from "./containment.js";
 
 export { readNativeBootId, nativeProcessIdentity } from "./launch-wrapper.js";
 export interface WrapperObservation { wrapperExited: boolean; wrapperExitCode: number | null; outcome?: WrapperOutcome; receiptPath: string; outcomePath: string }
@@ -22,6 +23,7 @@ export interface SupervisorOptions {
   checkCurrentConfiguration(): Promise<CapabilityKey>;
   adapter: HarnessAdapter; executable: string; prompt: string;
   approvedEnvironment: Record<string, string>; allowedEnvironmentKeys: string[]; stopAdapter: QualifiedStopAdapter;
+  containment?: CgroupControl;
   markStarting(): Promise<void>;
   authorize(receipt: LaunchReceipt): Promise<{ launchId: string; authorized: true; leaseUntil: number }>;
   renew(receipt: LaunchReceipt): Promise<{ runId: string; epoch: number; leaseUntil: number }>;
@@ -61,9 +63,14 @@ export async function createLaunchSupervisor(input: SupervisorOptions): Promise<
     requireCapability(options.capabilityEvidence, options.expectedCapability, "managed");
   };
   await guard();
+  if (options.containment) {
+    if (options.stopAdapter !== options.containment.adapter) throw new CoordError("UNSUPPORTED_FOR_AUTONOMOUS_EXECUTION", "Containment must use its matching kernel stop adapter");
+    await bounded(options.containment.preflight());
+  }
   const argv = options.adapter.launchArgs(options.prompt);
   if (argv.some(arg => typeof arg !== "string" || arg.includes("\0")) || Buffer.byteLength(JSON.stringify(argv)) > 512 * 1024) throw new CoordError("INVALID_INPUT", "Selected harness command exceeds supported launch bounds");
   let child: ChildProcess | undefined, receipt: LaunchReceipt | undefined, directory: string | undefined;
+  let containment: CgroupWrapperSpec | undefined;
   let wrapperExited = false, wrapperExitCode: number | null = null, released = false, spawnCalled = false, stopRequested = false, settled = false;
   let lastConfirmed = performance.now(), releasedAt = 0, leaseUntil = 0, renewing = false;
   let renewTimer: ReturnType<typeof setInterval> | undefined, watchdogTimer: ReturnType<typeof setInterval> | undefined;
@@ -157,7 +164,8 @@ export async function createLaunchSupervisor(input: SupervisorOptions): Promise<
       await guard();
       directory = join(await realpath(options.store.root), options.journal.launchId);
       if (await readWrapperEvidence(directory, "wrapper-receipt.json") || await readWrapperEvidence(directory, "wrapper-outcome.json")) throw new CoordError("LAUNCH_UNCERTAIN", "Prior wrapper evidence exists; no blind replacement");
-      const spec: WrapperSpec = { schemaVersion: 1, launchId: options.journal.launchId, machineId: options.journal.machineId, identity: options.journal.identity, workspace: options.journal.workspace, receiptDirectory: directory, executable: options.executable, argv, environment, allowedEnvironmentKeys: options.allowedEnvironmentKeys, authorizationTimeoutMs, watchdogMs, timeoutMs, stopGraceMs };
+      if (options.containment) containment = await bounded(options.containment.prepare(options.journal.launchId));
+      const spec: WrapperSpec = { schemaVersion: 1, launchId: options.journal.launchId, machineId: options.journal.machineId, identity: options.journal.identity, workspace: options.journal.workspace, receiptDirectory: directory, executable: options.executable, argv, environment, allowedEnvironmentKeys: options.allowedEnvironmentKeys, authorizationTimeoutMs, watchdogMs, timeoutMs, stopGraceMs, ...(containment ? { containment } : {}) };
       const receiptPromise = new Promise<LaunchReceipt>((resolveValue, rejectValue) => { resolveReceipt = resolveValue; rejectReceipt = rejectValue; });
       void receiptPromise.catch(() => {});
       const timeout = setTimeout(() => { rejectReceipt?.(new CoordError("LAUNCH_UNCERTAIN", "Durable wrapper receipt was not acknowledged")); void stop("wrapper_receipt_timeout"); }, receiptTimeoutMs);
@@ -193,6 +201,7 @@ export async function createLaunchSupervisor(input: SupervisorOptions): Promise<
     },
     authorize: async value => {
       await guard(); if (!receipt || !same(receipt, value)) throw new CoordError("LAUNCH_UNCERTAIN", "Authorization receipt differs from the wrapper");
+      if (options.containment) await bounded(options.containment.attach(value));
       const result = await options.authorize(value);
       if (result.launchId !== value.launchId || result.authorized !== true || !Number.isFinite(result.leaseUntil) || result.leaseUntil <= Date.now()) throw new CoordError("LEASE_REVOKED", "Backend did not confirm current exact launch authorization");
       leaseUntil = result.leaseUntil; lastConfirmed = performance.now();
@@ -202,6 +211,7 @@ export async function createLaunchSupervisor(input: SupervisorOptions): Promise<
       if (stopRequested || released || !receipt || !same(receipt, value) || leaseUntil <= Date.now()) throw new CoordError("LAUNCH_UNCERTAIN", "Wrapper cannot be released without its exact current authorization");
       const journal = await options.store.read(options.journal.launchId);
       if (journal?.state !== "authorized" || !journal.receipt || !same(journal.receipt, receipt)) throw new CoordError("LAUNCH_UNCERTAIN", "Backend authorization must be durably journaled before releasing the wrapper");
+      if (options.containment) await bounded(options.containment.attach(value));
       await send({ type: "authorize", launchId: value.launchId, receiptDigest: receiptDigest(value), leaseUntil });
       released = true; beginWatchdog();
     },

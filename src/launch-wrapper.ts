@@ -1,19 +1,21 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, readFile, realpath, rename, rm } from "node:fs/promises";
+import { lstat, open, realpath, rename, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { performance } from "node:perf_hooks";
 import { canonicalJson } from "./canonical.js";
 import { CoordError, type LaunchReceipt, type ProcessIdentity, type RunIdentity } from "./protocol.js";
+import { enterWrapperCgroup, readLinuxBootId, readLinuxProcessIdentity, type CgroupLaunchReceipt, type CgroupWrapperSpec, type WrapperCgroupHandle } from "./containment.js";
 
 const execute = promisify(execFile);
 export interface WrapperSpec {
   schemaVersion: 1; launchId: string; machineId: string; identity: RunIdentity; workspace: string; receiptDirectory: string;
   executable: string; argv: string[]; environment: Record<string, string>; allowedEnvironmentKeys: string[]; authorizationTimeoutMs: number;
   watchdogMs: number; timeoutMs: number; stopGraceMs: number;
+  containment?: CgroupWrapperSpec;
 }
 export interface WrapperOutcome {
   schemaVersion: 1; launchId: string; state: "never_started" | "spawn_attempted" | "running" | "root_exited" | "wrapper_error" | "stop_unconfirmed";
@@ -23,8 +25,7 @@ export const receiptDigest = (receipt: LaunchReceipt): string => createHash("sha
 export async function readNativeBootId(): Promise<string> {
   try {
     if (process.platform === "linux") {
-      const value = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
-      if (/^[a-f0-9-]{36}$/.test(value)) return `linux:${value}`;
+      return await readLinuxBootId();
     } else if (process.platform === "darwin") {
       const { stdout } = await execute("/usr/sbin/sysctl", ["-n", "kern.boottime"], { timeout: 2_000, maxBuffer: 4096, env: {} });
       const match = stdout.match(/sec\s*=\s*(\d+),\s*usec\s*=\s*(\d+)/);
@@ -36,12 +37,10 @@ export async function readNativeBootId(): Promise<string> {
 export async function nativeProcessIdentity(pid: number, launchId: string): Promise<ProcessIdentity> {
   if (!Number.isSafeInteger(pid) || pid < 1 || pid > 2_147_483_647 || !/^[A-Za-z0-9_-]{1,128}$/.test(launchId)) throw new CoordError("INVALID_INPUT", "Invalid process identity request");
   try {
-    const bootId = await readNativeBootId();
     if (process.platform === "linux") {
-      const stat = await readFile(`/proc/${pid}/stat`, "utf8"), close = stat.lastIndexOf(")");
-      const fields = stat.slice(close + 2).trim().split(/\s+/);
-      if (close > 0 && stat.startsWith(`${pid} (`) && /^\d+$/.test(fields[19] ?? "") && /^\d+$/.test(fields[2] ?? "")) return { pid, bootId, startIdentity: `linux-start-ticks:${fields[19]}:pgid:${fields[2]}`, launchId };
+      return await readLinuxProcessIdentity(pid, launchId);
     } else if (process.platform === "darwin") {
+      const bootId = await readNativeBootId();
       const { stdout } = await execute("/bin/ps", ["-p", String(pid), "-o", "lstart=,pgid="], { timeout: 2_000, maxBuffer: 4096, env: {} });
       const value = stdout.trim();
       if (/^[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}\s+\d+$/.test(value)) return { pid, bootId, startIdentity: `darwin-lstart-pgid:${value.replace(/\s+/g, " ")}`, launchId };
@@ -102,7 +101,8 @@ async function validateSpec(spec: WrapperSpec): Promise<void> {
 
 /** Actual child entry point: no backend/supervisor credential is present in its IPC specification or inherited environment. */
 export async function runLaunchWrapper(): Promise<void> {
-  let spec: WrapperSpec | undefined, receipt: LaunchReceipt | undefined, child: ChildProcess | undefined;
+  let spec: WrapperSpec | undefined, receipt: CgroupLaunchReceipt | undefined, child: ChildProcess | undefined;
+  let cgroup: WrapperCgroupHandle | undefined;
   let aborted = false, spawnAttempted = false, spawnRejected = false;
   let release: ((message: unknown) => void) | undefined;
   let lastConfirmed = 0, releasedAt = 0, rootExited = false, stopping = false;
@@ -134,6 +134,7 @@ export async function runLaunchWrapper(): Promise<void> {
     escalationCompletion = new Promise<void>(resolveEscalation => { setTimeout(() => {
         // Evidence I/O may stall: it must never postpone containment signalling.
         void outcome("stop_unconfirmed", { reason: `${reason}_escalated`, childPid: child?.pid }).catch(() => {});
+        if (cgroup) { try { cgroup.kill(); } catch { /* failed kernel stop remains unconfirmed; attempt the owned group below */ } }
         const group = receipt?.process.startIdentity.match(/(?:pgid:|\s)(\d+)$/)?.[1];
         // Best-effort stop only. Group absence is NEVER returned as positive descendant-tree evidence.
         if (process.platform !== "win32" && group === String(process.pid)) { try { process.kill(-process.pid, "SIGKILL"); } catch { /* failed stop remains held */ } }
@@ -146,7 +147,8 @@ export async function runLaunchWrapper(): Promise<void> {
     spec = await started;
     await validateSpec(spec);
     const identity = await nativeProcessIdentity(process.pid, spec.launchId);
-    receipt = { schemaVersion: 1, identity: spec.identity, launchId: spec.launchId, machineId: spec.machineId, workspace: spec.workspace, process: identity, recordedAt: new Date().toISOString() };
+    if (spec.containment) cgroup = await enterWrapperCgroup(spec.containment, identity);
+    receipt = { schemaVersion: 1, identity: spec.identity, launchId: spec.launchId, machineId: spec.machineId, workspace: spec.workspace, process: identity, recordedAt: new Date().toISOString(), ...(spec.containment ? { containment: spec.containment } : {}) };
     await writeWrapperEvidence(spec.receiptDirectory, "wrapper-receipt.json", receipt, true);
     const authorized = new Promise<boolean>(resolveAuthorization => {
       const timer = setTimeout(() => resolveAuthorization(false), spec!.authorizationTimeoutMs);
@@ -188,6 +190,7 @@ export async function runLaunchWrapper(): Promise<void> {
   } finally {
     if (child && !spawnRejected) { void requestStop("wrapper_finally_tree_stop"); await escalationCompletion; }
     if (watchdog) clearInterval(watchdog);
+    if (cgroup) await cgroup.close();
     if (process.connected) process.disconnect();
   }
 }

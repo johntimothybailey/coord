@@ -10,7 +10,7 @@ import { createCoordMcpServer, runStdioMcp, type CoordBackend } from "../src/mcp
 import { CoordError } from "../src/protocol.js";
 
 const identity = { taskId: "task1", runId: "run1", epoch: 2, goalRevision: 1 };
-const checkIn = { task: { id: "task1", epoch: 2, progressRevision: 1, state: "running" }, run: { id: "run1", epoch: 2, goalRevision: 1 }, policyVersion: 1, messages: [], complete: true };
+const checkIn = { task: { id: "task1", epoch: 2, progressRevision: 1, state: "running", dependencies: [] as { taskId: string; mode: string; artifact?: string }[] }, run: { id: "run1", epoch: 2, goalRevision: 1 }, policyVersion: 1, messages: [], complete: true };
 const fixture: CoordBackend = { query: async name => name === "projects:status" ? { project: "fixture", kind: "fixture" } : checkIn, mutation: async () => ({ accepted: true }) };
 
 if (process.argv.includes("--fixture-mcp")) {

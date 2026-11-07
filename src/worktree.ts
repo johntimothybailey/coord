@@ -15,7 +15,7 @@ export interface ResumeWorktreeOptions {
   assertAdmission(): Promise<void>;
 }
 export interface ResumedWorktree { path: string; commonGitDir: string; head: string; tree: string; executionBase: ExecutionBase; sourceHead: string; identity: RunIdentity }
-async function commonGitDir(repo: string): Promise<string> { return realpath(resolve(repo, await gitText(repo, ["rev-parse", "--git-common-dir"]))); }
+async function commonGitDir(repo: string, transport?: CaptureOptions["gitTransport"], metadataIsolation?: CaptureOptions["gitMetadataIsolation"]): Promise<string> { return realpath(resolve(repo, await gitText(repo, ["rev-parse", "--git-common-dir"], { transport, metadataIsolation }))); }
 /** Allocates a fresh admitted branch/receipt. Never resets old directories, starts setup, or launches a harness. */
 export async function createResumeWorktree(options: ResumeWorktreeOptions): Promise<ResumedWorktree> {
   options = { ...options, capture: snapshotCaptureOptions(options.capture), checkpoint: structuredClone(options.checkpoint), identity: structuredClone(options.identity) };
@@ -23,7 +23,7 @@ export async function createResumeWorktree(options: ResumeWorktreeOptions): Prom
   if (!/^[A-Za-z0-9_-]{1,100}$/.test(options.projectId) || !/^[A-Za-z0-9_-]{1,100}$/.test(identity.taskId) || !/^[A-Za-z0-9_-]{1,100}$/.test(identity.runId) || identity.taskId !== checkpoint.identity.taskId || !Number.isSafeInteger(identity.epoch) || identity.epoch < 1 || identity.goalRevision !== checkpoint.identity.goalRevision || !isAbsolute(options.worktreeRoot)) throw new CoordError("INVALID_INPUT", "Invalid destination project/run identity or worktree root");
   requireEnvironment(await options.preflight());
   await options.assertReady();
-  const common = await commonGitDir(capture.repo);
+  const common = await commonGitDir(capture.repo, capture.gitTransport, capture.gitMetadataIsolation);
   if (common !== await realpath(options.trustedCommonGitDir)) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Source common Git directory differs from trusted association");
   await verifyRemoteCheckpoint(capture, checkpoint);
   await options.assertAdmission();
@@ -36,13 +36,13 @@ export async function createResumeWorktree(options: ResumeWorktreeOptions): Prom
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   await options.assertAdmission();
   const branch = `coord/tasks/${identity.taskId}/e${identity.epoch}/${identity.runId}`;
-  await git(capture.repo, ["worktree", "add", "--quiet", "-b", branch, "--", path, checkpoint.commit]);
+  await git(capture.repo, ["worktree", "add", "--quiet", "-b", branch, "--", path, checkpoint.commit], { transport: capture.gitTransport, metadataIsolation: capture.gitMetadataIsolation });
   // Failures after allocation deliberately retain the new checkout as an inspectable orphan.
-  if (await commonGitDir(path) !== common) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Derived worktree does not share the trusted Git directory");
-  await verifySelectedRemote({ repo: path, remote: capture.remote });
-  const head = await gitText(path, ["rev-parse", "HEAD"]), tree = await gitText(path, ["rev-parse", "HEAD^{tree}"]);
-  if (head !== checkpoint.commit || tree !== checkpoint.tree || captureDigest(await gitText(path, ["status", "--porcelain=v1"])) !== captureDigest("")) throw new CoordError("BLOCKED_CHECKPOINT", "Fresh worktree does not match the exact portable checkpoint");
-  if (await gitText(path, ["branch", "--show-current"]) !== branch) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Derived branch differs from admitted run identity");
+  if (await commonGitDir(path, capture.gitTransport, capture.gitMetadataIsolation) !== common) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Derived worktree does not share the trusted Git directory");
+  await verifySelectedRemote({ repo: path, remote: capture.remote, gitTransport: capture.gitTransport, gitMetadataIsolation: capture.gitMetadataIsolation });
+  const head = await gitText(path, ["rev-parse", "HEAD"], { transport: capture.gitTransport, metadataIsolation: capture.gitMetadataIsolation }), tree = await gitText(path, ["rev-parse", "HEAD^{tree}"], { transport: capture.gitTransport, metadataIsolation: capture.gitMetadataIsolation });
+  if (head !== checkpoint.commit || tree !== checkpoint.tree || captureDigest(await gitText(path, ["status", "--porcelain=v1"], { transport: capture.gitTransport, metadataIsolation: capture.gitMetadataIsolation })) !== captureDigest("")) throw new CoordError("BLOCKED_CHECKPOINT", "Fresh worktree does not match the exact portable checkpoint");
+  if (await gitText(path, ["branch", "--show-current"], { transport: capture.gitTransport, metadataIsolation: capture.gitMetadataIsolation }) !== branch) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Derived branch differs from admitted run identity");
   await options.assertAdmission();
   const local = join(path, ".coord-local"); await mkdir(local, { mode: 0o700 });
   const receipt = await open(join(local, "run.json"), "wx", 0o600);

@@ -170,7 +170,7 @@ async function preparedFixture(manual = false) {
   const { canonical } = await import("../convex/auth.js");
   const manifest = { schemaVersion: 1 as const, checkpointId: "checkpoint", identity: { taskId: c.taskId, runId: c.runId, epoch: 1, goalRevision: 1 }, sourceHead: "e".repeat(40), executionBase: { sha: "a".repeat(40), revision: 1, remoteRef: "refs/heads/main" }, remoteParent: "a".repeat(40), tree: "c".repeat(40), commit: "b".repeat(40), ref: "refs/coord/checkpoints/task/e1/checkpoint", files: [{ path: "src/work.ts", mode: "100644", type: "blob" as const, oid: "f".repeat(40) }], exclusions: [], progressHash: await digest(canonical("checkpoint progress")), evidence: [], createdAt: new Date().toISOString(), progressRevision: 1, policyDigest: "d".repeat(64), manifestDigest: "", reusedCommit: false };
   manifest.manifestDigest = await digest(canonical({ identity: manifest.identity, sourceHead: manifest.sourceHead, executionBase: manifest.executionBase, tree: manifest.tree, files: manifest.files, exclusions: manifest.exclusions, progressHash: manifest.progressHash, policyDigest: manifest.policyDigest, progressRevision: manifest.progressRevision }));
-  const checkpoints = await import("../convex/checkpoints.js"); await fixture.call(checkpoints.prepare, { ...identity(c), manifest, summary: "Fixture summary" });
+  const checkpoints = await import("../convex/checkpoints.js"); await fixture.call(checkpoints.prepare, { ...identity(c), manifest, summary: fixture.find("tasks", c.taskId).progress });
   await verifyScanFixture(fixture, c, manifest);
   const readback = { commit: manifest.commit, tree: manifest.tree, parent: manifest.remoteParent, ref: manifest.ref, manifestHash: manifest.manifestDigest, progressHash: manifest.progressHash, policyDigest: manifest.policyDigest, evidenceRef: "synthetic-readback" };
   return { fixture, c, manifest, readback, checkpoints };
@@ -183,6 +183,27 @@ test("T9/T18 ready acceptance requires independent exact-base verification and c
   await fixture.call(tasks.progress, { ...identity(c), expectedRevision: 1, progress: "changed after capture" });
   await assert.rejects(fixture.call(checkpoints.ready, { ...identity(c), token: artifactVerifierToken, checkpointId: manifest.checkpointId }), isCode("CHECKPOINT_INCOMPLETE"));
   assert.equal(fixture.find("tasks", "task").latestCheckpointId, undefined);
+});
+test("checkpoint preparation rejects a summary that differs from the captured progress", async () => {
+  const { fixture, c, manifest, checkpoints } = await preparedFixture();
+  const next = { ...manifest, checkpointId: "summary_check", ref: "refs/coord/checkpoints/task/e1/summary_check" };
+  const before = structuredClone(fixture.rows);
+  await assert.rejects(fixture.call(checkpoints.prepare, { ...identity(c), manifest: next, summary: "Unrelated progress" }), isCode("CHECKPOINT_INCOMPLETE"));
+  assert.deepEqual(fixture.rows, before);
+  await fixture.call(checkpoints.prepare, { ...identity(c), manifest: next, summary: JSON.stringify("checkpoint progress") });
+  assert.equal(fixture.find("checkpoints", "summary_check").summary, JSON.stringify("checkpoint progress"));
+});
+test("ready checkpoint retains matching immutable progress after uncaptured task progress advances", async () => {
+  const { fixture, c, manifest, readback, checkpoints } = await preparedFixture();
+  await fixture.call(checkpoints.verifyCode, { ...identity(c), token: artifactVerifierToken, checkpointId: manifest.checkpointId, readback });
+  await fixture.call(checkpoints.ready, { ...identity(c), token: artifactVerifierToken, checkpointId: manifest.checkpointId });
+  await fixture.call(tasks.progress, { ...identity(c), expectedRevision: 1, progress: "Later uncheckpointed work on the now-offline source" });
+  const selected = await fixture.call(checkpoints.getReady, { ...request(), taskId: c.taskId, checkpointId: manifest.checkpointId }) as { summary: string; task: { progress: string }; manifest: { progressHash: string } | null };
+  assert.equal(selected.summary, "checkpoint progress");
+  assert.notEqual(selected.task.progress, selected.summary);
+  assert.equal(selected.manifest?.progressHash, manifest.progressHash);
+  await fixture.context().db.patch(fixture.find("checkpoints", manifest.checkpointId)._id, { summary: "Corrupted summary" });
+  await assert.rejects(fixture.call(checkpoints.getReady, { ...request(), taskId: c.taskId, checkpointId: manifest.checkpointId }), isCode("BLOCKED_CHECKPOINT"));
 });
 test("T15/T19 accepted verified PR freezes worker writes but retains managed reservation until exit", async () => {
   const { fixture, c, manifest, readback, checkpoints } = await preparedFixture();
@@ -215,7 +236,7 @@ test("T15/T19 accepted verified PR freezes worker writes but retains managed res
 test("T9 unchanged published base records its actual parents, never a self-parent", async () => {
   const { fixture, c, manifest, checkpoints } = await preparedFixture();
   const reused = { ...manifest, checkpointId: "unchanged", commit: manifest.executionBase.sha, reusedCommit: true, ref: "refs/coord/checkpoints/task/e1/unchanged" };
-  await fixture.call(checkpoints.prepare, { ...identity(c), manifest: reused, summary: "Unchanged published base" });
+  await fixture.call(checkpoints.prepare, { ...identity(c), manifest: reused, summary: fixture.find("tasks", c.taskId).progress });
   const readback = { commit: reused.commit, tree: reused.tree, parent: "7".repeat(40), parents: ["7".repeat(40)], ref: reused.ref, manifestHash: reused.manifestDigest, progressHash: reused.progressHash, policyDigest: reused.policyDigest, evidenceRef: "fixture-existing-base" };
   await fixture.call(checkpoints.verifyCode, { ...identity(c), token: artifactVerifierToken, checkpointId: reused.checkpointId, readback });
   await fixture.call(checkpoints.ready, { ...identity(c), token: artifactVerifierToken, checkpointId: reused.checkpointId });
@@ -243,7 +264,7 @@ test("T12 child proposal is atomic and yield releases children only after ready 
   const next = { ...manifest, checkpointId: "yield_checkpoint", ref: "refs/coord/checkpoints/task/e1/yield_checkpoint", progressRevision: 2, manifestDigest: "" };
   const { canonical } = await import("../convex/auth.js");
   next.manifestDigest = await digest(canonical({ identity: next.identity, sourceHead: next.sourceHead, executionBase: next.executionBase, tree: next.tree, files: next.files, exclusions: next.exclusions, progressHash: next.progressHash, policyDigest: next.policyDigest, progressRevision: next.progressRevision }));
-  await fixture.call(checkpoints.prepare, { ...identity(c), manifest: next, summary: "Parent needs helper" });
+  await fixture.call(checkpoints.prepare, { ...identity(c), manifest: next, summary: fixture.find("tasks", c.taskId).progress });
   await verifyScanFixture(fixture, c, next);
   await fixture.call(checkpoints.verifyCode, { ...identity(c), token: artifactVerifierToken, checkpointId: next.checkpointId, readback: { ...readback, ref: next.ref, manifestHash: next.manifestDigest } });
   await fixture.call(checkpoints.ready, { ...identity(c), token: artifactVerifierToken, checkpointId: next.checkpointId });
@@ -449,4 +470,69 @@ test("exact bootstrap replay returns IDs only and rejects changed input, policy,
   const changed = new BackendFixture(); await changed.call(bootstrap, input);
   const metadata = (await changed.context().db.query("metadata").take(1))[0]!; await changed.context().db.patch(metadata._id, { writersPaused: true });
   await assert.rejects(changed.call(bootstrap, input), isCode("FORBIDDEN"));
+});
+
+test("manual expiry clears registration only and permits explicit latest-ready checkpoint recovery", async () => {
+  const { fixture, c, manifest, readback, checkpoints } = await preparedFixture(true);
+  await fixture.call(checkpoints.verifyCode, { ...identity(c), token: artifactVerifierToken, checkpointId: manifest.checkpointId, readback });
+  await fixture.call(checkpoints.ready, { ...identity(c), token: artifactVerifierToken, checkpointId: manifest.checkpointId });
+  await fixture.call(tasks.propose, { ...request(), taskId: "managed_other", goalId: "goal", goalRevision: 1, title: "Other managed reservation", scope: ["src/managed.ts"], dependencies: [], executionBase: manifest.executionBase });
+  const other = claim("managed_other", "managed_run"); await fixture.call(tasks.claim, other);
+  const managed = fixture.find("runs", other.runId), checkpoint = fixture.find("checkpoints", manifest.checkpointId);
+  await fixture.context().db.patch(fixture.find("runs", c.runId)._id, { leaseUntil: 1 });
+  await fixture.call(lifecycle.sweep, {});
+  const task = fixture.find("tasks", c.taskId), expired = fixture.find("runs", c.runId);
+  assert.equal(task.state, "blocked"); assert.equal(task.ownerRunId, undefined); assert.equal(task.leaseUntil, undefined); assert.equal(task.holdRunId, undefined); assert.equal(task.epoch, 1); assert.equal(task.latestCheckpointId, manifest.checkpointId);
+  assert.equal(expired.state, "stopped"); assert.equal(expired.releaseReason, "manual_registration_expired"); assert.equal(expired.stopEvidence, undefined); assert.equal(expired.process, undefined); assert.equal(expired.capacityHeld, false); assert.equal(expired.hold, undefined);
+  assert.equal(typeof fixture.find("credentials", "grant_run").revokedAt, "number"); assert.deepEqual(fixture.find("checkpoints", manifest.checkpointId), checkpoint); assert.deepEqual(fixture.find("runs", other.runId), managed);
+  await assert.rejects(fixture.call(tasks.requestResume, { ...request(), taskId: task.id }), isCode("BLOCKED_CHECKPOINT"));
+  await fixture.call(tasks.requestResume, { ...request(), taskId: task.id, checkpointId: manifest.checkpointId });
+  assert.equal(fixture.find("tasks", task.id).state, "queued");
+  const resumed = claim(task.id, "manual_resumed"); await fixture.call(tasks.registerManual, resumed);
+  assert.equal(fixture.find("tasks", task.id).epoch, 2); assert.equal(fixture.find("tasks", task.id).ownerRunId, resumed.runId);
+});
+
+test("manual expiry without a ready checkpoint stays blocked even when no progress was reported", async () => {
+  const { fixture } = await setup(), c = claim(); await fixture.call(tasks.registerManual, c);
+  await fixture.context().db.patch(fixture.find("runs", c.runId)._id, { leaseUntil: 1 }); await fixture.call(lifecycle.sweep, {});
+  const task = fixture.find("tasks", c.taskId);
+  assert.equal(task.state, "blocked"); assert.equal(task.ownerRunId, undefined); assert.equal(task.holdRunId, undefined); assert.equal(task.progressRevision, 0);
+  await assert.rejects(fixture.call(tasks.requestResume, { ...request(), taskId: task.id }), isCode("BLOCKED_CHECKPOINT"));
+  await assert.rejects(fixture.call(tasks.registerManual, claim(task.id, "unsafe_replacement")), isCode("CAPACITY_EXHAUSTED"));
+});
+
+test("manual expiry preserves paused/cancelled goals, accepted artifacts and newer ownership", async () => {
+  for (const state of ["paused", "cancelled"] as const) {
+    const { fixture } = await setup(), c = claim(); await fixture.call(tasks.registerManual, c);
+    await fixture.call(goals.control, { ...request(humanToken), goalId: "goal", state });
+    const before = fixture.find("tasks", c.taskId); await fixture.context().db.patch(fixture.find("runs", c.runId)._id, { leaseUntil: 1 }); await fixture.call(lifecycle.sweep, {});
+    const task = fixture.find("tasks", c.taskId); assert.equal(task.state, before.state); assert.equal(task.reason, before.reason); assert.equal(task.dispatchHeld, true); assert.equal(task.ownerRunId, undefined); assert.equal(task.holdRunId, undefined); assert.equal(fixture.find("goals", "goal").state, state);
+  }
+  const { fixture } = await setup(), c = claim(); await fixture.call(tasks.registerManual, c);
+  await fixture.context().db.patch(fixture.find("runs", c.runId)._id, { resultAccepted: true, leaseUntil: 1 });
+  await fixture.context().db.patch(fixture.find("tasks", c.taskId)._id, { state: "review_ready", publicationId: "accepted_fixture_artifact" });
+  await fixture.call(lifecycle.sweep, {});
+  assert.equal(fixture.find("tasks", c.taskId).state, "review_ready"); assert.equal(fixture.find("tasks", c.taskId).publicationId, "accepted_fixture_artifact"); assert.equal(fixture.find("runs", c.runId).resultAccepted, true);
+  const newer = await setup(), old = claim(); await newer.fixture.call(tasks.registerManual, old);
+  await newer.fixture.context().db.patch(newer.fixture.find("tasks", old.taskId)._id, { epoch: 2, ownerRunId: "new_run", holdRunId: "new_run", leaseUntil: Date.now() + 60_000 });
+  const newerTask = newer.fixture.find("tasks", old.taskId); await newer.fixture.context().db.patch(newer.fixture.find("runs", old.runId)._id, { leaseUntil: 1 }); await newer.fixture.call(lifecycle.sweep, {});
+  assert.deepEqual(newer.fixture.find("tasks", old.taskId), newerTask); assert.equal(newer.fixture.find("runs", old.runId).releaseReason, "manual_registration_expired");
+});
+
+test("paused recovery intent survives uncertain stop and explicit ready-checkpoint resume", async () => {
+  const { fixture, c, manifest, readback, checkpoints } = await preparedFixture();
+  await fixture.call(checkpoints.verifyCode, { ...identity(c), token: artifactVerifierToken, checkpointId: manifest.checkpointId, readback });
+  await fixture.call(checkpoints.ready, { ...identity(c), token: artifactVerifierToken, checkpointId: manifest.checkpointId });
+  const checkpoint = fixture.find("checkpoints", manifest.checkpointId), process = fixture.find("runs", c.runId).process!;
+  await fixture.call(goals.control, { ...request(humanToken), goalId: "goal", state: "paused" });
+  await fixture.call(lifecycle.reportUncertain, { ...identity(c), token: supervisorToken, reason: "Stop confirmation is temporarily unavailable" });
+  assert.equal(fixture.find("tasks", c.taskId).state, "blocked"); assert.equal(fixture.find("tasks", c.taskId).reason, "goal_paused"); assert.equal(fixture.find("tasks", c.taskId).holdRunId, c.runId); assert.equal(fixture.find("runs", c.runId).capacityHeld, true);
+  await fixture.call(lifecycle.confirmStopped, { ...identity(c), token: supervisorToken, evidence: { kind: "observed_tree_exit", process, launchId: c.launchId, machineId: c.machineId, observedAt: new Date().toISOString(), evidenceRef: "synthetic-positive-paused-tree-exit" } });
+  const stopped = fixture.find("runs", c.runId), task = fixture.find("tasks", c.taskId);
+  assert.equal(stopped.state, "stopped"); assert.equal(stopped.capacityHeld, false); assert.equal(task.state, "blocked"); assert.equal(task.reason, "goal_paused"); assert.equal(task.ownerRunId, undefined); assert.equal(task.holdRunId, undefined); assert.equal(task.dispatchHeld, true); assert.deepEqual(fixture.find("checkpoints", manifest.checkpointId), checkpoint);
+  await assert.rejects(fixture.call(tasks.requestResume, { ...request(), taskId: c.taskId, checkpointId: manifest.checkpointId }), isCode("GOAL_NOT_APPROVED"));
+  const goal = fixture.find("goals", "goal"); await fixture.call(goals.resume, { ...request(humanToken), goalId: goal.id, revision: goal.revision, hash: goal.hash });
+  await fixture.call(tasks.requestResume, { ...request(), taskId: c.taskId, checkpointId: manifest.checkpointId });
+  assert.equal(fixture.find("tasks", c.taskId).state, "queued"); assert.equal(fixture.find("tasks", c.taskId).ownerRunId, undefined); assert.equal(fixture.find("tasks", c.taskId).epoch, 1); assert.deepEqual(fixture.find("runs", c.runId), stopped);
+  await assert.rejects(fixture.call(tasks.renew, identity(c)), isCode("UNAUTHORIZED"));
 });

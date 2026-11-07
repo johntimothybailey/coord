@@ -1,10 +1,12 @@
 import { v } from "convex/values";
+import { progressHash } from "./artifacts.js";
+import type { Manifest } from "./artifacts.js";
 import { DEFAULTS, requireCapability } from "../src/protocol.js";
 import { boundedRecords } from "./messages.js";
 import { base, dependency, capabilityKey } from "./schema.js";
 import { mutation, query } from "./server.js";
 import type { Doc, MutationCtx, QueryCtx } from "./server.js";
-import { identityArgs, runArgs, authenticate, replay, fail, stableId, bounded, paths, overlaps, boundRun, approvedGoal, liveRun, digest, tokenFormat } from "./auth.js";
+import { identityArgs, runArgs, authenticate, replay, fail, stableId, bounded, paths, overlaps, boundRun, approvedGoal, liveRun, digest, tokenFormat, canonical } from "./auth.js";
 
 export function validateScope(project: Doc<"projects">, scope: string[]): void {
   paths(scope);
@@ -15,13 +17,35 @@ export async function taskById(ctx: Pick<QueryCtx, "db">, id: string, projectId:
   if (!task || task.projectId !== projectId) fail("NOT_FOUND", "Task not found");
   return task;
 }
+export async function dependencyInput(ctx: Pick<QueryCtx, "db">, project: Doc<"projects">, parent: Doc<"tasks">, dependencyTaskId: string, includeManifest: boolean) {
+  const dependency = parent.dependencies.find(input => input.taskId === dependencyTaskId);
+  if (!dependency) fail("FORBIDDEN", "Only an explicitly declared dependency can be inspected");
+  const child = await taskById(ctx, dependency.taskId, project.id); validateScope(project, child.scope);
+  const task = { id: child.id, title: child.title, state: child.state, reason: child.reason };
+  if (dependency.mode === "merged") return { dependency, task, availability: "unverified_merge" as const, code: null };
+  if (!dependency.artifact) return { dependency, task, availability: "unavailable" as const, code: null };
+  const checkpoint = await ctx.db.query("checkpoints").withIndex("by_stable_id", q => q.eq("id", dependency.artifact!)).unique();
+  if (!checkpoint || checkpoint.projectId !== project.id || checkpoint.taskId !== child.id || checkpoint.state !== "ready") return { dependency, task, availability: "unavailable" as const, code: null };
+  let manifest: Manifest;
+  try { manifest = JSON.parse(checkpoint.manifestJson) as Manifest; } catch { fail("BLOCKED_CHECKPOINT", "Dependency manifest is not valid immutable metadata"); }
+  if (manifest?.schemaVersion !== 1 || manifest.identity?.taskId !== child.id || manifest.identity?.runId !== checkpoint.runId || manifest.identity?.epoch !== checkpoint.epoch || manifest.checkpointId !== checkpoint.id || canonical(manifest.executionBase) !== canonical(checkpoint.executionBase) || manifest.remoteParent !== checkpoint.executionBase.sha || manifest.sourceHead !== checkpoint.sourceHead || manifest.commit !== checkpoint.commit || manifest.tree !== checkpoint.tree || manifest.ref !== checkpoint.ref || manifest.progressHash !== checkpoint.progressHash || manifest.progressRevision !== checkpoint.progressRevision || manifest.manifestDigest !== checkpoint.manifestHash || !project.capturePolicyDigest || manifest.policyDigest !== project.capturePolicyDigest || await progressHash(checkpoint.summary) !== checkpoint.progressHash) fail("BLOCKED_CHECKPOINT", "Dependency artifact no longer matches immutable code/progress or current sharing policy");
+  const core = { identity: manifest.identity, sourceHead: manifest.sourceHead, executionBase: manifest.executionBase, tree: manifest.tree, files: manifest.files, exclusions: manifest.exclusions, progressHash: manifest.progressHash, policyDigest: manifest.policyDigest, progressRevision: manifest.progressRevision };
+  if (await digest(canonical(core)) !== checkpoint.manifestHash) fail("BLOCKED_CHECKPOINT", "Dependency manifest digest does not match its immutable capture");
+  const code = { checkpointId: checkpoint.id, ref: checkpoint.ref, commit: checkpoint.commit, tree: checkpoint.tree, executionBase: checkpoint.executionBase, manifestHash: checkpoint.manifestHash, progressHash: checkpoint.progressHash, ...(includeManifest ? { summary: checkpoint.summary, manifest } : {}) };
+  const result = { dependency, task, availability: "published" as const, code };
+  if (new TextEncoder().encode(canonical(result)).length > (includeManifest ? 600 : 64) * 1024) fail("COVERAGE_INCOMPLETE", "Dependency detail exceeds the supported individual response bound");
+  return result;
+}
 export async function dependenciesReady(ctx: Pick<QueryCtx, "db">, task: Doc<"tasks">): Promise<void> {
+  if (!task.dependencies.length) return;
+  const project = await ctx.db.query("projects").withIndex("by_stable_id", q => q.eq("id", task.projectId)).unique();
+  if (!project || !project.sharingApproved) fail("FORBIDDEN", "Dependency inputs require current project sharing approval");
+  validateScope(project, task.scope);
   for (const dep of task.dependencies) {
-    const other = await taskById(ctx, dep.taskId, task.projectId);
-    if (dep.mode === "merged") fail("BLOCKED_CHECKPOINT", "Merged dependency requires independently observed integration evidence; unsupported until configured");
-    if (!dep.artifact) fail("BLOCKED_CHECKPOINT", "Dependency needs an exact ready published checkpoint");
-    const checkpoint = await ctx.db.query("checkpoints").withIndex("by_stable_id", q => q.eq("id", dep.artifact!)).unique();
-    if (!checkpoint || checkpoint.projectId !== task.projectId || checkpoint.taskId !== other.id || checkpoint.state !== "ready") fail("BLOCKED_CHECKPOINT", "Dependency code is unavailable");
+    const input = await dependencyInput(ctx, project, task, dep.taskId, false);
+    if (input.task.state === "failed" || input.task.state === "cancelled") fail("BLOCKED_CHECKPOINT", "Terminal dependency failure requires bounded replanning before ordinary admission");
+    if (input.availability === "unverified_merge") fail("BLOCKED_CHECKPOINT", "Merged dependency requires independently observed integration evidence; unsupported until configured");
+    if (input.availability !== "published") fail("BLOCKED_CHECKPOINT", "Dependency needs an exact authorized ready published checkpoint");
   }
 }
 export async function noConflicts(ctx: Pick<QueryCtx, "db">, task: Doc<"tasks">, admission = false): Promise<void> {
@@ -91,6 +115,11 @@ export const renew = mutation({ args: runArgs, handler: async (ctx, args) => {
     await ctx.db.patch(task._id, { leaseUntil }); await ctx.db.patch(run._id, { leaseUntil }); return { runId: run.id, epoch: run.epoch, leaseUntil };
   });
 } });
+// Status facts are not execution/renewal authority; post-result native check-in remains blocked.
+export const sessionStatus = query({ args: runArgs, handler: async (ctx, args) => {
+  const { actor } = await authenticate(ctx, args, ["run"]); const { task, run } = await boundRun(ctx, args, actor);
+  return { taskState: task.state, runState: run.state, resultAccepted: run.resultAccepted, requestedOutcome: run.requestedOutcome, leaseUntil: run.leaseUntil, deadline: run.deadline, currentOwner: task.ownerRunId === run.id && task.epoch === run.epoch };
+} });
 export const checkIn = query({ args: runArgs, handler: async (ctx, args) => {
   const { actor, project } = await authenticate(ctx, args, ["run"]); const { task, run, goal } = await liveRun(ctx, args, actor, ["reserved", "starting", "running"]);
   const messages = await ctx.db.query("messages").withIndex("by_recipient", q => q.eq("projectId", project.id).eq("recipientTaskId", task.id)).take(101);
@@ -147,23 +176,34 @@ export const proposeSubtasks = mutation({ args: { ...runArgs, rationale: v.strin
 export async function refreshWaiting(ctx: MutationCtx, waiting: Doc<"tasks">[]) {
     const changed: Array<{ taskId: string; state: string }> = [];
     for (const task of waiting) {
-      if (task.ownerRunId || task.holdRunId || task.dispatchHeld) continue;
+      if (!["queued", "waiting_dependencies"].includes(task.state) || task.ownerRunId || task.holdRunId || task.dispatchHeld || (task.state === "queued" && !task.dependencies.length)) continue;
       try { await approvedGoal(ctx, task); } catch { continue; }
-      const dependencies: Doc<"tasks">["dependencies"] = []; let terminalFailure = false; let allReady = true;
+      const project = await ctx.db.query("projects").withIndex("by_stable_id", q => q.eq("id", task.projectId)).unique();
+      if (!project || !project.sharingApproved) continue;
+      try { validateScope(project, task.scope); } catch { continue; }
+      const dependencies: Doc<"tasks">["dependencies"] = []; let terminalFailure = false; let allReady = true; let dependenciesChanged = false;
       for (const dep of task.dependencies) {
         const child = await taskById(ctx, dep.taskId, task.projectId);
         if (child.state === "failed" || child.state === "cancelled") terminalFailure = true;
         if (dep.mode !== "published" || !(dep.artifact ?? child.latestCheckpointId)) { allReady = false; dependencies.push(dep); continue; }
         const checkpoint = await ctx.db.query("checkpoints").withIndex("by_stable_id", q => q.eq("id", (dep.artifact ?? child.latestCheckpointId)!)).unique();
         if (!checkpoint || checkpoint.state !== "ready" || checkpoint.taskId !== child.id || checkpoint.projectId !== task.projectId) { allReady = false; dependencies.push(dep); continue; }
-        dependencies.push({ ...dep, artifact: dep.artifact ?? checkpoint.id });
+        const candidate = dep.artifact ? dep : { ...dep, artifact: checkpoint.id };
+        try {
+          const input = await dependencyInput(ctx, project, { ...task, dependencies: task.dependencies.map(current => current.taskId === dep.taskId ? candidate : current) }, dep.taskId, false);
+          if (input.availability !== "published") { allReady = false; dependencies.push(dep); continue; }
+        } catch { allReady = false; dependencies.push(dep); continue; }
+        if (!dep.artifact) dependenciesChanged = true;
+        dependencies.push(candidate);
       }
       if (terminalFailure) {
         const exhausted = task.replanAttempts >= DEFAULTS.replanLimit;
         await ctx.db.patch(task._id, { state: exhausted ? "blocked" : "replan_requested", reason: exhausted ? "NEEDS_HUMAN: replan_limit" : "terminal_dependency_failure", dispatchHeld: exhausted });
         changed.push({ taskId: task.id, state: exhausted ? "blocked" : "replan_requested" });
-      } else if (allReady) {
+      } else if (allReady && (task.state !== "queued" || dependenciesChanged)) {
         await ctx.db.patch(task._id, { state: "queued", dependencies, reason: "dependencies_published" }); changed.push({ taskId: task.id, state: "queued" });
+      } else if (dependenciesChanged) {
+        await ctx.db.patch(task._id, { dependencies }); changed.push({ taskId: task.id, state: task.state });
       }
     }
     return { changed, complete: true };
@@ -174,8 +214,9 @@ export const refreshDependencies = mutation({ args: identityArgs, handler: async
   const { actor } = await authenticate(ctx, args, ["agent", "human"]);
   return replay(ctx, actor, "tasks.refreshDependencies", args, async () => {
     const waiting = await ctx.db.query("tasks").withIndex("by_project_state", q => q.eq("projectId", args.projectId).eq("state", "waiting_dependencies")).take(101);
-    if (waiting.length > 100) fail("COVERAGE_INCOMPLETE", "Waiting dependency batch exceeds project limit");
-    return refreshWaiting(ctx, waiting);
+    const queued = await ctx.db.query("tasks").withIndex("by_project_state", q => q.eq("projectId", args.projectId).eq("state", "queued")).take(101);
+    if (waiting.length > 100 || queued.length > 100) fail("COVERAGE_INCOMPLETE", "Dependency batch exceeds bounded project state limits");
+    return refreshWaiting(ctx, [...waiting, ...queued]);
   });
 } });
 export const finishReplan = mutation({ args: { ...runArgs, result: v.union(v.literal("revised"), v.literal("blocked"), v.literal("failed")), dependencies: v.array(dependency), rationale: v.string() }, handler: async (ctx, args) => {

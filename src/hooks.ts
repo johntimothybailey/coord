@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { canonicalJson } from "./canonical.js";
 import { buildContext, type ContextSource } from "./context.js";
 import { CoordError, DEFAULTS, type Harness, type RunIdentity } from "./protocol.js";
 import type { CoordBackend, RunConnection } from "./mcp.js";
@@ -7,7 +8,7 @@ export function backendFailure(error: unknown): CoordError {
   if (error instanceof CoordError) return error;
   const data = error && typeof error === "object" && "data" in error ? error.data : undefined;
   if (data && typeof data === "object" && "code" in data && typeof data.code === "string") {
-    const known = ["LEASE_REVOKED", "STALE_EPOCH", "UNAUTHORIZED", "FORBIDDEN", "CONFLICT_UNRESOLVED", "COVERAGE_INCOMPLETE", "GOAL_NOT_APPROVED", "BLOCKED_ENV", "INVALID_INPUT", "IDEMPOTENCY_CONFLICT", "UNSUPPORTED_FOR_AUTONOMOUS_EXECUTION", "CAPACITY_EXHAUSTED", "NOT_FOUND"];
+    const known = ["LEASE_REVOKED", "STALE_EPOCH", "UNAUTHORIZED", "FORBIDDEN", "CONFLICT_UNRESOLVED", "COVERAGE_INCOMPLETE", "GOAL_NOT_APPROVED", "BLOCKED_ENV", "INVALID_INPUT", "IDEMPOTENCY_CONFLICT", "UNSUPPORTED_FOR_AUTONOMOUS_EXECUTION", "CAPACITY_EXHAUSTED", "NOT_FOUND", "PROTOCOL_INCOMPATIBLE", "UNTRUSTED_WORKSPACE_CONFIG", "LAUNCH_UNCERTAIN", "CHECKPOINT_INCOMPLETE", "BLOCKED_CHECKPOINT", "PUBLICATION_STALE", "NEEDS_HUMAN"];
     if (known.includes(data.code)) return new CoordError(data.code as CoordError["code"], `Coord backend rejected operation: ${data.code}`);
   }
   // Never return raw backend/network errors: they can contain request credentials.
@@ -24,7 +25,15 @@ export function renderCheckIn(value: unknown, identity: RunIdentity): CheckInOff
   const response = record(value), task = record(response.task), run = record(response.run);
   if (task.id !== identity.taskId || task.epoch !== identity.epoch || run.id !== identity.runId || run.epoch !== identity.epoch || run.goalRevision !== identity.goalRevision || !Array.isArray(response.messages) || typeof response.complete !== "boolean") throw new CoordError("STALE_EPOCH", "Check-in identity or coverage differs from the admitted run");
   let blocked = !response.complete || response.conflictBlocked === true;
-  const sources: ContextSource[] = [{ id: "current-run", kind: "task", revision: `${identity.epoch}:${task.progressRevision}`, status: "available", text: JSON.stringify({ ...identity, state: task.state, policyVersion: response.policyVersion, complete: response.complete }) }];
+  if (!Array.isArray(task.dependencies) || task.dependencies.length > 20) throw new CoordError("COVERAGE_INCOMPLETE", "Declared dependency metadata is missing or invalid");
+  const dependencies = task.dependencies.map(value => {
+    const dependency = record(value);
+    if (typeof dependency.taskId !== "string" || dependency.taskId.length > 128 || !["published", "merged"].includes(String(dependency.mode)) || (dependency.artifact !== undefined && (typeof dependency.artifact !== "string" || dependency.artifact.length > 128))) throw new CoordError("COVERAGE_INCOMPLETE", "Declared dependency identity is invalid");
+    return { taskId: dependency.taskId, mode: dependency.mode, ...(dependency.artifact === undefined ? {} : { artifact: dependency.artifact }) };
+  });
+  const encodedDependencies = canonicalJson(dependencies);
+  const dependencyInfo = Buffer.byteLength(encodedDependencies) <= 512 ? { complete: true, items: dependencies } : { complete: false, count: dependencies.length, digest: createHash("sha256").update(encodedDependencies).digest("hex"), expand: "coord_context lists exact pins; coord_dependency_input reads a declared input. Neighbor latest pointers never replace pins." };
+  const sources: ContextSource[] = [{ id: "current-run", kind: "task", revision: `${identity.epoch}:${task.progressRevision}`, status: "available", text: JSON.stringify({ ...identity, state: task.state, policyVersion: response.policyVersion, complete: response.complete, dependencies: dependencyInfo }) }];
   const pending: string[] = [];
   for (const item of response.messages) {
     const message = record(item);

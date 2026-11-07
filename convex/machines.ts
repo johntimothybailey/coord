@@ -1,8 +1,18 @@
 import { v } from "convex/values";
 import { requireCapability } from "../src/protocol.js";
 import { capabilityKey, capabilityCheck } from "./schema.js";
-import { internalMutation } from "./server.js";
-import { stableId, tokenFormat, digest, fail, bounded, integer } from "./auth.js";
+import { internalMutation, query } from "./server.js";
+import { stableId, tokenFormat, digest, fail, bounded, integer, authenticate, identityArgs } from "./auth.js";
+
+/** Read owner-provisioned evidence; a local runtime file cannot manufacture passing checks. */
+export const runtime = query({ args: { ...identityArgs, machineId: v.string() }, handler: async (ctx, args) => {
+  const { actor, project } = await authenticate(ctx, args, ["agent", "human", "supervisor", "artifact_verifier"]);
+  stableId(args.machineId);
+  const machine = await ctx.db.query("machines").withIndex("by_id_project", q => q.eq("id", args.machineId).eq("projectId", project.id)).unique();
+  if (!machine) fail("UNSUPPORTED_FOR_AUTONOMOUS_EXECUTION", "No owner-provisioned qualification exists for this machine/project");
+  if (actor.role !== "human" && (actor.memberId !== machine.memberId || ((actor.role === "supervisor" || actor.role === "artifact_verifier") && actor.machineId !== machine.id))) fail("FORBIDDEN", "Machine evidence is outside this credential's scope");
+  return { machineId: machine.id, memberId: machine.memberId, configVersion: machine.configVersion ?? null, projectConfigVersion: project.configVersion ?? null, qualifiedModes: machine.qualifiedModes, qualificationExpiresAt: machine.qualificationExpiresAt, capabilityKey: machine.capabilityKey ?? null, capabilityChecks: machine.capabilityChecks ?? [], qualificationEvidenceRef: machine.qualificationEvidenceRef ?? null };
+} });
 
 // Qualification is an operator/owner operation, never an agent-reported PASS endpoint.
 // Real host evidence still has to be gathered and independently qualified outside Convex.

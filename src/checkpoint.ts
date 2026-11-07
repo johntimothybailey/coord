@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdtemp, open, readFile, readlink, realpath, rm } from "node:fs/promises";
@@ -6,6 +5,8 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CoordError, DEFAULTS, type CheckpointManifest, type ExecutionBase, type FileEntry, type RunIdentity } from "./protocol.js";
 import { canonicalJson } from "./canonical.js";
+import { runGit, type GitOptions, type GitResult, type GitTransport, type GitMetadataIsolation } from "./git-transport.js";
+export type { GitOptions, GitResult } from "./git-transport.js";
 
 export interface CapturePolicy {
   allowedUntracked: string[];
@@ -21,6 +22,8 @@ export interface CaptureOptions {
   repo: string; remote: { name: string; url: string }; checkpointId: string; identity: RunIdentity;
   executionBase: ExecutionBase; progress: unknown; progressRevision: number; createdAt: string;
   commitMessage: string; policy: CapturePolicy;
+  gitTransport?: GitTransport;
+  gitMetadataIsolation?: GitMetadataIsolation;
   /** Must read current authoritative backend state, not cached model claims. Backend ready acceptance rechecks independently. */
   readAuthority(phase: string): Promise<CaptureAuthority>;
   quietBoundary(): Promise<void>;
@@ -31,37 +34,15 @@ export interface PreparedCheckpoint extends CheckpointManifest {
 }
 export interface RemoteCheckpointReadback { commit: string; tree: string; parent: string | null; parents: string[]; ref: string; manifestHash: string; progressHash: string; policyDigest: string; verifiedAt: string }
 interface Snapshot { files: FileEntry[]; exclusions: { path: string; reason: string }[]; stamp: string }
-interface GitOptions { env?: NodeJS.ProcessEnv; input?: Buffer | string; allowFailure?: boolean; maxBytes?: number; timeoutMs?: number }
-export interface GitResult { code: number; stdout: Buffer }
 
 /** Fixed argv, no shell, no command output in errors, bounded time/output and descendant cleanup. */
 export async function git(repo: string, args: string[], options: GitOptions = {}): Promise<GitResult> {
-  const env: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
-  Object.assign(env, options.env, { GIT_TERMINAL_PROMPT: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null" });
-  return new Promise((resolveResult, reject) => {
-    const child = spawn("git", ["--no-optional-locks", "-c", `core.hooksPath=${process.platform === "win32" ? "NUL" : "/dev/null"}`, "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", ...args], { cwd: repo, env, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
-    const chunks: Buffer[] = []; let bytes = 0, failed = false, settled = false;
-    let fallback: ReturnType<typeof setTimeout> | undefined;
-    const finish = (code: number) => {
-      if (settled) return; settled = true; clearTimeout(timer); if (fallback) clearTimeout(fallback);
-      if (failed || (code !== 0 && !options.allowFailure)) reject(new CoordError("BLOCKED_CHECKPOINT", "Bounded Git operation did not complete successfully; command output withheld"));
-      else resolveResult({ code, stdout: Buffer.concat(chunks) });
-    };
-    const stop = () => {
-      failed = true;
-      try { if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* already exited */ }
-      fallback ??= setTimeout(() => { child.stdout.destroy(); child.stderr.destroy(); child.unref(); finish(-1); }, 250);
-    };
-    const timer = setTimeout(stop, options.timeoutMs ?? 30_000);
-    child.stdout.on("data", (chunk: Buffer) => { bytes += chunk.length; if (bytes > (options.maxBytes ?? 16 * 1024 * 1024)) stop(); else chunks.push(chunk); });
-    child.stderr.on("data", (chunk: Buffer) => { bytes += chunk.length; if (bytes > (options.maxBytes ?? 16 * 1024 * 1024)) stop(); });
-    child.stdin.on("error", () => { /* process exit is authoritative */ });
-    child.on("error", () => { failed = true; finish(-1); });
-    child.on("close", code => finish(code ?? -1));
-    child.stdin.end(options.input);
-  });
+  return runGit(repo, args, options);
 }
 export async function gitText(repo: string, args: string[], options: GitOptions = {}): Promise<string> { return (await git(repo, args, options)).stdout.toString("utf8").trim(); }
+type GitContext = Pick<CaptureOptions, "repo" | "gitTransport" | "gitMetadataIsolation">;
+const captureGit = (options: GitContext, args: string[], extra: GitOptions = {}): Promise<GitResult> => git(options.repo, args, { ...extra, transport: options.gitTransport, metadataIsolation: options.gitMetadataIsolation });
+const captureGitText = async (options: GitContext, args: string[], extra: GitOptions = {}): Promise<string> => (await captureGit(options, args, extra)).stdout.toString("utf8").trim();
 function canonical(value: unknown): string {
   try { return canonicalJson(value); } catch { throw new CoordError("INVALID_INPUT", "Capture data must contain finite plain JSON records"); }
 }
@@ -74,6 +55,7 @@ function validIdentity(identity: RunIdentity, checkpointId: string): void {
   if (![identity.taskId, identity.runId, checkpointId].every(value => /^[A-Za-z0-9_-]{1,100}$/.test(value)) || !Number.isSafeInteger(identity.epoch) || identity.epoch < 1 || !Number.isSafeInteger(identity.goalRevision) || identity.goalRevision < 1) throw new CoordError("INVALID_INPUT", "Invalid capture identity");
 }
 function validateOptions(options: CaptureOptions): void {
+  if (options.gitTransport && options.gitTransport.url !== options.remote.url) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Capture destination differs from its fixed Git transport");
   validIdentity(options.identity, options.checkpointId);
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(options.executionBase.sha) || !Number.isSafeInteger(options.executionBase.revision) || options.executionBase.revision < 1 || !options.executionBase.remoteRef.startsWith("refs/")) throw new CoordError("INVALID_INPUT", "Invalid execution base");
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/.test(options.remote.name) || !options.remote.url || /[\0\r\n]/.test(options.remote.url) || /:\/\/[^/]*@/.test(options.remote.url)) throw new CoordError("INVALID_INPUT", "Selected remote must have a nonsecret fixed identity");
@@ -86,31 +68,31 @@ function validateOptions(options: CaptureOptions): void {
 }
 export function snapshotCaptureOptions(options: CaptureOptions): CaptureOptions {
   validateOptions(options);
-  return { ...options, remote: { ...options.remote }, identity: structuredClone(options.identity), executionBase: structuredClone(options.executionBase), policy: structuredClone(options.policy), progress: structuredClone(options.progress) };
+  return { ...options, remote: { ...options.remote }, identity: structuredClone(options.identity), executionBase: structuredClone(options.executionBase), policy: structuredClone(options.policy), progress: structuredClone(options.progress), ...(options.gitTransport ? { gitTransport: { ...options.gitTransport } } : {}), ...(options.gitMetadataIsolation ? { gitMetadataIsolation: structuredClone(options.gitMetadataIsolation) } : {}) };
 }
 async function authority(options: CaptureOptions, phase: string): Promise<void> {
   const current = await options.readAuthority(phase);
   const expected: CaptureAuthority = { identity: options.identity, executionBase: options.executionBase, progressRevision: options.progressRevision, progressHash: captureDigest(options.progress), policyDigest: captureDigest(options.policy) };
   if (captureDigest(current) !== captureDigest(expected)) throw new CoordError("STALE_EPOCH", "Capture authority, execution base, progress or sharing policy changed");
 }
-export async function verifySelectedRemote(options: Pick<CaptureOptions, "repo" | "remote">): Promise<void> {
-  const urls = (await gitText(options.repo, ["remote", "get-url", "--all", options.remote.name])).split("\n");
-  const pushUrls = (await gitText(options.repo, ["remote", "get-url", "--push", "--all", options.remote.name])).split("\n");
+export async function verifySelectedRemote(options: Pick<CaptureOptions, "repo" | "remote" | "gitTransport" | "gitMetadataIsolation">): Promise<void> {
+  const urls = (await captureGitText(options, ["remote", "get-url", "--all", options.remote.name])).split("\n");
+  const pushUrls = (await captureGitText(options, ["remote", "get-url", "--push", "--all", options.remote.name])).split("\n");
   if (urls.length !== 1 || pushUrls.length !== 1 || urls[0] !== options.remote.url || pushUrls[0] !== options.remote.url) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Selected remote does not match its approved fetch/push identity");
 }
 async function verifyBase(options: CaptureOptions, sourceHead: string): Promise<void> {
   await verifySelectedRemote(options);
-  if (await gitText(options.repo, ["rev-parse", "--is-shallow-repository"]) !== "false") throw new CoordError("BLOCKED_CHECKPOINT", "Shallow source provenance requires a full verified history before capture");
-  const grafts = resolve(options.repo, await gitText(options.repo, ["rev-parse", "--git-path", "info/grafts"]));
+  if (await captureGitText(options, ["rev-parse", "--is-shallow-repository"]) !== "false") throw new CoordError("BLOCKED_CHECKPOINT", "Shallow source provenance requires a full verified history before capture");
+  const grafts = resolve(options.repo, await captureGitText(options, ["rev-parse", "--git-path", "info/grafts"]));
   try { if ((await lstat(grafts)).size) throw new CoordError("BLOCKED_CHECKPOINT", "Legacy Git grafts prevent trustworthy remote ancestry verification"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  await git(options.repo, ["check-ref-format", options.executionBase.remoteRef]);
+  await captureGit(options, ["check-ref-format", options.executionBase.remoteRef]);
   const fetchRef = `refs/coord/internal/${randomUUID()}`;
   try {
-    await git(options.repo, ["fetch", "--no-tags", "--no-write-fetch-head", options.remote.name, `${options.executionBase.remoteRef}:${fetchRef}`]);
-    const remoteContains = await git(options.repo, ["merge-base", "--is-ancestor", options.executionBase.sha, fetchRef], { allowFailure: true });
-    const sourceContains = await git(options.repo, ["merge-base", "--is-ancestor", options.executionBase.sha, sourceHead], { allowFailure: true });
+    await captureGit(options, ["fetch", "--no-tags", "--no-write-fetch-head", options.remote.name, `${options.executionBase.remoteRef}:${fetchRef}`]);
+    const remoteContains = await captureGit(options, ["merge-base", "--is-ancestor", options.executionBase.sha, fetchRef], { allowFailure: true });
+    const sourceContains = await captureGit(options, ["merge-base", "--is-ancestor", options.executionBase.sha, sourceHead], { allowFailure: true });
     if (remoteContains.code !== 0 || sourceContains.code !== 0) throw new CoordError("BLOCKED_CHECKPOINT", "Exact execution base is not present on selected remote or incorporated by source HEAD");
-  } finally { await git(options.repo, ["update-ref", "-d", fetchRef]); }
+  } finally { await captureGit(options, ["update-ref", "-d", fetchRef]); }
 }
 function parseTree(output: Buffer): FileEntry[] {
   return output.toString("utf8").split("\0").filter(Boolean).map(row => {
@@ -120,7 +102,7 @@ function parseTree(output: Buffer): FileEntry[] {
     return { path, mode: fields[0]!, type: fields[0] === "120000" ? "symlink" as const : "blob" as const, oid: fields[2]! };
   }).sort((a, b) => compare(a.path, b.path));
 }
-export async function readTree(repo: string, tree: string): Promise<FileEntry[]> { return parseTree((await git(repo, ["ls-tree", "-rz", "--full-tree", tree])).stdout); }
+export async function readTree(repo: string, tree: string, transport?: GitTransport, metadataIsolation?: GitMetadataIsolation): Promise<FileEntry[]> { return parseTree((await git(repo, ["ls-tree", "-rz", "--full-tree", tree], { transport, metadataIsolation })).stdout); }
 function auditContent(content: Buffer, policy: CapturePolicy): void {
   const text = content.toString("utf8");
   if ((policy.forbiddenContent ?? []).some(value => text.includes(value)) || /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9]{32,})\b/.test(text)) throw new CoordError("BLOCKED_CHECKPOINT", "Required portable content failed the selected credential screening policy; values withheld");
@@ -129,12 +111,12 @@ function auditPath(path: string): void {
   const name = path.split("/").at(-1)!;
   if (path.split("/").includes(".coord-local") || /^\.env(?:\.(?:local|production|development|test)(?:\.local)?)?$/.test(name) || /^(?:id_rsa|id_ed25519|credentials\.json|auth\.json)$/.test(name) || /\.(?:pem|p12|pfx)$/.test(name)) throw new CoordError("BLOCKED_CHECKPOINT", "Reserved coordinator credential directory or suspected local credential file requires an explicit selected exclusion; no content published");
 }
-async function attributes(repo: string, paths: string[]): Promise<string> {
-  const autocrlf = await gitText(repo, ["config", "--get", "core.autocrlf"], { allowFailure: true });
+async function attributes(options: CaptureOptions, paths: string[]): Promise<string> {
+  const autocrlf = await captureGitText(options, ["config", "--get", "core.autocrlf"], { allowFailure: true });
   if (autocrlf && autocrlf !== "false") throw new CoordError("BLOCKED_CHECKPOINT", "Git EOL normalization is unsupported by this capture implementation");
   let observation = autocrlf;
   for (let start = 0; start < paths.length; start += 100) {
-    const data = (await git(repo, ["--literal-pathspecs", "check-attr", "-z", "filter", "text", "eol", "working-tree-encoding", "--", ...paths.slice(start, start + 100)])).stdout.toString("utf8").split("\0");
+    const data = (await captureGit(options, ["--literal-pathspecs", "check-attr", "-z", "filter", "text", "eol", "working-tree-encoding", "--", ...paths.slice(start, start + 100)])).stdout.toString("utf8").split("\0");
     for (let index = 0; index + 2 < data.length; index += 3) {
       if (!["unspecified", "unset"].includes(data[index + 2]!)) throw new CoordError("BLOCKED_CHECKPOINT", "Git filters, LFS, explicit text conversion or encoded worktrees are unsupported");
     }
@@ -143,21 +125,21 @@ async function attributes(repo: string, paths: string[]): Promise<string> {
   return observation;
 }
 async function snapshot(options: CaptureOptions, sourceHead: string): Promise<Snapshot> {
-  const original = await readTree(options.repo, sourceHead);
-  const staged = (await git(options.repo, ["ls-files", "--stage", "-z"])).stdout.toString("utf8").split("\0").filter(Boolean).map(row => {
+  const original = await readTree(options.repo, sourceHead, options.gitTransport, options.gitMetadataIsolation);
+  const staged = (await captureGit(options, ["ls-files", "--stage", "-z"])).stdout.toString("utf8").split("\0").filter(Boolean).map(row => {
     const tab = row.indexOf("\t"), fields = row.slice(0, tab).split(" ");
     if (fields[2] !== "0" || fields[0] === "160000") throw new CoordError("BLOCKED_CHECKPOINT", "Unmerged indexes and submodules are unsupported");
     return row.slice(tab + 1);
   });
-  const untracked = (await git(options.repo, ["ls-files", "--others", "--exclude-standard", "-z"])).stdout.toString("utf8").split("\0").filter(Boolean);
+  const untracked = (await captureGit(options, ["ls-files", "--others", "--exclude-standard", "-z"])).stdout.toString("utf8").split("\0").filter(Boolean);
   const names = [...new Set([...original.map(file => file.path), ...staged, ...untracked])].sort();
   names.forEach(validPath);
   const excluded = new Map(options.policy.exclusions.map(item => [item.path, item.reason]));
   for (const path of untracked) if (!options.policy.allowedUntracked.includes(path) && !excluded.has(path)) excluded.set(path, "Untracked file not permitted by selected sharing policy");
   const selected = names.filter(path => !excluded.has(path));
   for (const required of options.policy.requiredPaths) if (!selected.includes(required)) throw new CoordError("BLOCKED_CHECKPOINT", "Required source/asset is excluded, ignored or unavailable");
-  const attributeState = await attributes(options.repo, selected);
-  const indexPath = await gitText(options.repo, ["rev-parse", "--git-path", "index"]);
+  const attributeState = await attributes(options, selected);
+  const indexPath = await captureGitText(options, ["rev-parse", "--git-path", "index"]);
   let indexHash = "absent";
   try { indexHash = createHash("sha256").update(await readFile(resolve(options.repo, indexPath))).digest("hex"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   const files: FileEntry[] = [], stamps: unknown[] = [];
@@ -190,7 +172,7 @@ async function snapshot(options: CaptureOptions, sourceHead: string): Promise<Sn
     const stamp = (info: typeof before) => [info.ino, info.size, info.mode, info.mtimeNs, info.ctimeNs].map(String);
     if (canonical(stamp(before)) !== canonical(stamp(after))) throw new CoordError("CHECKPOINT_INCOMPLETE", "Source changed during manifest read");
     auditPath(path); auditContent(content, options.policy);
-    const oid = await gitText(options.repo, ["hash-object", "-w", "--no-filters", "--stdin"], { input: content });
+    const oid = await captureGitText(options, ["hash-object", "-w", "--no-filters", "--stdin"], { input: content });
     files.push({ path, mode: before.isSymbolicLink() ? "120000" : (before.mode & 0o111n) !== 0n ? "100755" : "100644", type: before.isSymbolicLink() ? "symlink" : "blob", oid });
     stamps.push([path, ...stamp(after), oid]);
   }
@@ -206,17 +188,17 @@ function snapshotMessage(options: CaptureOptions, manifest: PreparedCheckpoint):
 async function snapshotCommit(options: CaptureOptions, manifest: PreparedCheckpoint): Promise<string> {
   const message = snapshotMessage(options, manifest);
   auditContent(Buffer.from(message), options.policy);
-  return gitText(options.repo, ["commit-tree", manifest.tree, "-p", options.executionBase.sha], { input: message, env: { GIT_AUTHOR_NAME: "Coord", GIT_AUTHOR_EMAIL: "coord@localhost", GIT_COMMITTER_NAME: "Coord", GIT_COMMITTER_EMAIL: "coord@localhost", GIT_AUTHOR_DATE: options.createdAt, GIT_COMMITTER_DATE: options.createdAt } });
+  return captureGitText(options, ["commit-tree", manifest.tree, "-p", options.executionBase.sha], { input: message, env: { GIT_AUTHOR_NAME: "Coord", GIT_AUTHOR_EMAIL: "coord@localhost", GIT_COMMITTER_NAME: "Coord", GIT_COMMITTER_EMAIL: "coord@localhost", GIT_AUTHOR_DATE: options.createdAt, GIT_COMMITTER_DATE: options.createdAt } });
 }
 async function auditTree(options: CaptureOptions, tree: string, expected: Snapshot): Promise<void> {
-  const files = await readTree(options.repo, tree);
+  const files = await readTree(options.repo, tree, options.gitTransport, options.gitMetadataIsolation);
   if (captureDigest(files) !== captureDigest(expected.files)) throw new CoordError("CHECKPOINT_INCOMPLETE", "Candidate tree does not equal the intended complete portable manifest");
   if (options.policy.requiredPaths.some(path => !files.some(file => file.path === path)) || files.some(file => options.policy.exclusions.some(item => item.path === file.path))) throw new CoordError("BLOCKED_CHECKPOINT", "Actual candidate violates required-path or explicit-exclusion policy");
   for (const file of files) {
     auditPath(file.path);
-    const size = Number(await gitText(options.repo, ["cat-file", "-s", file.oid]));
+    const size = Number(await captureGitText(options, ["cat-file", "-s", file.oid]));
     if (!Number.isSafeInteger(size) || size > (options.policy.maxFileBytes ?? DEFAULTS.fileBytes)) throw new CoordError("BLOCKED_CHECKPOINT", "Candidate tree contains oversized content");
-    const content = (await git(options.repo, ["cat-file", "blob", file.oid], { maxBytes: (options.policy.maxFileBytes ?? DEFAULTS.fileBytes) + 1024 })).stdout;
+    const content = (await captureGit(options, ["cat-file", "blob", file.oid], { maxBytes: (options.policy.maxFileBytes ?? DEFAULTS.fileBytes) + 1024 })).stdout;
     auditContent(content, options.policy);
     if (file.type === "symlink") {
       const target = content.toString("utf8"), targetRelative = relative(options.repo, resolve(options.repo, dirname(file.path), target));
@@ -230,9 +212,9 @@ async function auditTree(options: CaptureOptions, tree: string, expected: Snapsh
 export async function captureCheckpoint(options: CaptureOptions): Promise<PreparedCheckpoint> {
   options = snapshotCaptureOptions(options);
   const repo = await realpath(options.repo);
-  if (repo !== await gitText(repo, ["rev-parse", "--show-toplevel"])) throw new CoordError("INVALID_INPUT", "Capture must target the canonical repository root");
+  if (repo !== await captureGitText(options, ["rev-parse", "--show-toplevel"])) throw new CoordError("INVALID_INPUT", "Capture must target the canonical repository root");
   options = { ...options, repo };
-  const lockPath = resolve(repo, await gitText(repo, ["rev-parse", "--git-path", "coord-capture.lock"]));
+  const lockPath = resolve(repo, await captureGitText(options, ["rev-parse", "--git-path", "coord-capture.lock"]));
   const lock = await open(lockPath, "wx", 0o600).catch(() => { throw new CoordError("CHECKPOINT_INCOMPLETE", "Another capture owns this worktree; stale locks require explicit recovery"); });
   let directory: string | undefined;
   try {
@@ -243,24 +225,24 @@ export async function captureCheckpoint(options: CaptureOptions): Promise<Prepar
       const env = { GIT_INDEX_FILE: index };
       try {
         await authority(options, "capture.start");
-        const sourceHead = await gitText(repo, ["rev-parse", "--verify", "HEAD^{commit}"]);
+        const sourceHead = await captureGitText(options, ["rev-parse", "--verify", "HEAD^{commit}"]);
         await verifyBase(options, sourceHead);
         const before = await snapshot(options, sourceHead);
         await options.fault?.("capture.after-manifest");
-        await git(repo, ["read-tree", sourceHead], { env });
-        const sourceFiles = await readTree(repo, sourceHead);
-        for (const path of sourceFiles.map(file => file.path).filter(path => !before.files.some(file => file.path === path))) await git(repo, ["--literal-pathspecs", "update-index", "--force-remove", "--", path], { env });
-        for (const file of before.files) await git(repo, ["update-index", "--add", "--cacheinfo", `${file.mode},${file.oid},${file.path}`], { env });
-        const tree = await gitText(repo, ["write-tree"], { env });
+        await captureGit(options, ["read-tree", sourceHead], { env });
+        const sourceFiles = await readTree(repo, sourceHead, options.gitTransport, options.gitMetadataIsolation);
+        for (const path of sourceFiles.map(file => file.path).filter(path => !before.files.some(file => file.path === path))) await captureGit(options, ["--literal-pathspecs", "update-index", "--force-remove", "--", path], { env });
+        for (const file of before.files) await captureGit(options, ["update-index", "--add", "--cacheinfo", `${file.mode},${file.oid},${file.path}`], { env });
+        const tree = await captureGitText(options, ["write-tree"], { env });
         await options.fault?.("capture.after-index");
         await auditTree(options, tree, before);
         await options.fault?.("capture.before-final-validation");
         const after = await snapshot(options, sourceHead);
-        if (before.stamp !== after.stamp || await gitText(repo, ["rev-parse", "HEAD"]) !== sourceHead) throw new CoordError("CHECKPOINT_INCOMPLETE", "Source changed during capture; progress must match stable code");
+        if (before.stamp !== after.stamp || await captureGitText(options, ["rev-parse", "HEAD"]) !== sourceHead) throw new CoordError("CHECKPOINT_INCOMPLETE", "Source changed during capture; progress must match stable code");
         await authority(options, "capture.validated");
         const prepared: PreparedCheckpoint = { schemaVersion: 1, checkpointId: options.checkpointId, identity: { ...options.identity }, sourceHead, executionBase: { ...options.executionBase }, remoteParent: options.executionBase.sha, tree, commit: "", ref: `refs/coord/checkpoints/${options.identity.taskId}/e${options.identity.epoch}/${options.checkpointId}`, files: before.files, exclusions: before.exclusions, progressHash: captureDigest(options.progress), evidence: [], createdAt: options.createdAt, progressRevision: options.progressRevision, policyDigest: captureDigest(options.policy), manifestDigest: "", reusedCommit: false };
         prepared.manifestDigest = manifestDigest(prepared);
-        const baseTree = await gitText(repo, ["rev-parse", `${options.executionBase.sha}^{tree}`]);
+        const baseTree = await captureGitText(options, ["rev-parse", `${options.executionBase.sha}^{tree}`]);
         if (baseTree === tree) { prepared.commit = options.executionBase.sha; prepared.reusedCommit = true; }
         else {
           prepared.commit = await snapshotCommit(options, prepared);
@@ -277,7 +259,7 @@ export async function captureCheckpoint(options: CaptureOptions): Promise<Prepar
 export async function validatePreparedCheckpoint(options: CaptureOptions, manifest: PreparedCheckpoint): Promise<void> {
   options = snapshotCaptureOptions(options); manifest = structuredClone(manifest);
   validateManifestBinding(options, manifest);
-  const rawCommit = (await git(options.repo, ["cat-file", "-p", manifest.commit])).stdout;
+  const rawCommit = (await captureGit(options, ["cat-file", "-p", manifest.commit])).stdout;
   auditContent(rawCommit, options.policy);
   const commit = rawCommit.toString("utf8");
   const headers = commit.split("\n\n")[0]!;
@@ -297,12 +279,12 @@ export async function verifyRemoteCheckpoint(options: CaptureOptions, manifest: 
   await verifySelectedRemote(options);
   const fetched = `refs/coord/internal/${randomUUID()}`;
   try {
-    await git(options.repo, ["fetch", "--no-tags", "--no-write-fetch-head", options.remote.name, `${ref}:${fetched}`]);
-    if (await gitText(options.repo, ["rev-parse", fetched]) !== manifest.commit) throw new CoordError("BLOCKED_CHECKPOINT", "Remote checkpoint ref does not match exact prepared commit");
+    await captureGit(options, ["fetch", "--no-tags", "--no-write-fetch-head", options.remote.name, `${ref}:${fetched}`]);
+    if (await captureGitText(options, ["rev-parse", fetched]) !== manifest.commit) throw new CoordError("BLOCKED_CHECKPOINT", "Remote checkpoint ref does not match exact prepared commit");
     await validatePreparedCheckpoint(options, manifest);
-    const parents = (await gitText(options.repo, ["cat-file", "-p", manifest.commit])).split("\n\n")[0]!.split("\n").filter(line => line.startsWith("parent ")).map(line => line.slice(7));
+    const parents = (await captureGitText(options, ["cat-file", "-p", manifest.commit])).split("\n\n")[0]!.split("\n").filter(line => line.startsWith("parent ")).map(line => line.slice(7));
     return { commit: manifest.commit, tree: manifest.tree, parent: parents.length === 1 ? parents[0]! : null, parents, ref, manifestHash: manifest.manifestDigest, progressHash: manifest.progressHash, policyDigest: manifest.policyDigest, verifiedAt: new Date().toISOString() };
-  } finally { await git(options.repo, ["update-ref", "-d", fetched]); }
+  } finally { await captureGit(options, ["update-ref", "-d", fetched]); }
 }
 /** Immutable ref publication with same-ID reconciliation. Backend ready acceptance is a separate authenticated operation. */
 export async function publishCheckpoint(options: CaptureOptions, manifest: PreparedCheckpoint): Promise<PreparedCheckpoint> {
@@ -318,13 +300,13 @@ export async function pushImmutableSnapshot(options: CaptureOptions, manifest: P
   await authority(options, "publish.start");
   await validatePreparedCheckpoint(options, manifest);
   await verifyBase(options, manifest.sourceHead);
-  const existing = await git(options.repo, ["ls-remote", "--refs", options.remote.name, ref]);
+  const existing = await captureGit(options, ["ls-remote", "--refs", options.remote.name, ref]);
   const line = existing.stdout.toString("utf8").trim();
   if (line && line.split(/\s+/)[0] !== manifest.commit) throw new CoordError("IDEMPOTENCY_CONFLICT", "Immutable checkpoint ref already contains different content");
   if (!line) {
     await authority(options, "publish.before-push");
     // Empty expected old ref is an atomic create-only lease: it cannot replace even an ancestor.
-    const pushed = await git(options.repo, ["-c", "push.followTags=false", "-c", `remote.${options.remote.name}.mirror=false`, "push", "--porcelain", "--no-verify", "--no-follow-tags", `--force-with-lease=${ref}:`, options.remote.name, `${manifest.commit}:${ref}`], { allowFailure: true });
+    const pushed = await captureGit(options, ["-c", "push.followTags=false", "-c", `remote.${options.remote.name}.mirror=false`, "push", "--porcelain", "--no-verify", "--no-follow-tags", `--force-with-lease=${ref}:`, options.remote.name, `${manifest.commit}:${ref}`], { allowFailure: true });
     // A failed/lost push response is reconciled by exact remote read-back, never a forced retry.
     if (pushed.code !== 0) await verifyRemoteCheckpoint(options, manifest, ref);
     await options.fault?.("publish.after-push");

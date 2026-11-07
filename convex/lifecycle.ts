@@ -1,9 +1,9 @@
 import { v } from "convex/values";
 import { makeFunctionReference } from "convex/server";
 import { processIdentity, stopEvidence } from "./schema.js";
-import { internalMutation, mutation } from "./server.js";
+import { internalMutation, mutation, query } from "./server.js";
 import type { Doc, QueryCtx } from "./server.js";
-import { authenticate, replay, runArgs, identityArgs, liveRun, fail, revokeGrant, bounded, canonical, boundRun } from "./auth.js";
+import { authenticate, replay, runArgs, identityArgs, liveRun, fail, revokeGrant, bounded, canonical, boundRun, digest } from "./auth.js";
 import { taskById, refreshWaiting } from "./tasks.js";
 
 export async function supervisedRun(ctx: Pick<QueryCtx, "db">, args: { projectId: string; taskId: string; runId: string; epoch: number; goalRevision: number }, actor: Doc<"credentials">) {
@@ -12,6 +12,11 @@ export async function supervisedRun(ctx: Pick<QueryCtx, "db">, args: { projectId
   if (actor.role !== "supervisor" || actor.machineId !== run.machineId || actor.memberId !== run.memberId || run.mode === "manual") fail("FORBIDDEN", "Supervisor is not authorized for this managed run");
   return { run, task: await taskById(ctx, args.taskId, args.projectId) };
 }
+export const status = query({ args: runArgs, handler: async (ctx, args) => {
+  const { actor } = await authenticate(ctx, args, ["supervisor"]);
+  const { task, run } = await supervisedRun(ctx, args, actor);
+  return { taskState: task.state, runState: run.state, resultAccepted: run.resultAccepted, requestedOutcome: run.requestedOutcome, leaseUntil: run.leaseUntil, deadline: run.deadline, capacityHeld: run.capacityHeld, releaseReceipt: run.releaseReceipt, process: run.process };
+} });
 export const starting = mutation({ args: runArgs, handler: async (ctx, args) => {
   const { actor } = await authenticate(ctx, args, ["run"]); const { run } = await liveRun(ctx, args, actor, ["reserved", "starting"]);
   return replay(ctx, actor, "lifecycle.starting", args, async () => {
@@ -37,7 +42,12 @@ export const reportUncertain = mutation({ args: { ...runArgs, reason: v.string()
     bounded(args.reason, 2048, "uncertainty reason");
     if (run.releasedAt !== undefined) fail("FORBIDDEN", "Released reservation cannot become uncertain again");
     await revokeGrant(ctx, run); await ctx.db.patch(run._id, { hold: args.reason, state: "finalizing", requestedOutcome: "stopped" });
-    if (task.ownerRunId === run.id && task.epoch === run.epoch && task.state !== "cancelled") await ctx.db.patch(task._id, { state: "launch_uncertain", holdRunId: run.id, dispatchHeld: true, reason: args.reason, leaseUntil: undefined });
+    if (task.ownerRunId === run.id && task.epoch === run.epoch) {
+      const goal = await ctx.db.query("goals").withIndex("by_stable_id", q => q.eq("id", task.goalId)).unique();
+      const active = goal?.state === "active" && goal.projectId === task.projectId && goal.revision === task.goalRevision && goal.approvedHash === goal.hash;
+      const preserveTask = !active || run.resultAccepted || !["reserved", "running", "yielding", "launch_uncertain"].includes(task.state);
+      await ctx.db.patch(task._id, { state: preserveTask ? task.state : "launch_uncertain", holdRunId: task.holdRunId ?? run.id, dispatchHeld: true, reason: preserveTask ? task.reason : args.reason, leaseUntil: undefined });
+    }
     return { runId: run.id, capacityHeld: run.capacityHeld, hold: args.reason };
   });
 } });
@@ -49,7 +59,7 @@ export const requestFinalization = mutation({ args: { ...runArgs, outcome: v.uni
     if (args.outcome === "succeeded" && !run.resultAccepted) fail("PUBLICATION_STALE", "Successful code run requires an accepted verified publication");
     if (run.requestedOutcome && run.requestedOutcome !== args.outcome) fail("IDEMPOTENCY_CONFLICT", "Run already has another terminal outcome request");
     await ctx.db.patch(run._id, { state: "finalizing", finalizationKind: "normal", requestedOutcome: args.outcome, hold: run.capacityHeld ? "stop_confirmation_required" : undefined });
-    if (args.outcome !== "succeeded") await ctx.db.patch(task._id, { state: args.outcome === "failed" ? "failed" : "blocked", reason: args.reason, dispatchHeld: true, holdRunId: run.capacityHeld ? run.id : undefined });
+    if (args.outcome !== "succeeded" && !run.resultAccepted) await ctx.db.patch(task._id, { state: args.outcome === "failed" ? "failed" : "blocked", reason: args.reason, dispatchHeld: true, holdRunId: run.capacityHeld ? run.id : undefined });
     // Manual registration cannot claim to supervise or stop its parent harness.
     if (run.mode === "manual") {
       await revokeGrant(ctx, run);
@@ -59,19 +69,32 @@ export const requestFinalization = mutation({ args: { ...runArgs, outcome: v.uni
     return { runId: run.id, state: run.mode === "manual" ? args.outcome : "finalizing", capacityHeld: run.capacityHeld };
   });
 } });
-export const confirmStopped = mutation({ args: { ...runArgs, evidence: stopEvidence }, handler: async (ctx, args) => {
+const terminalLaunchReceipt = v.object({ schemaVersion: v.literal(1), identity: v.object({ taskId: v.string(), runId: v.string(), epoch: v.number(), goalRevision: v.number() }), launchId: v.string(), machineId: v.string(), workspace: v.string(), process: processIdentity, recordedAt: v.string() });
+export const confirmStopped = mutation({ args: { ...runArgs, evidence: stopEvidence, launchReceipt: v.optional(terminalLaunchReceipt) }, handler: async (ctx, args) => {
   const { actor } = await authenticate(ctx, args, ["supervisor"]); const { run, task } = await supervisedRun(ctx, args, actor);
   return replay(ctx, actor, "lifecycle.confirmStopped", args, async () => {
     const evidence = args.evidence; bounded(evidence.evidenceRef, 2048, "stop evidence");
     if (evidence.machineId !== run.machineId || evidence.launchId !== run.launchId || !Number.isFinite(Date.parse(evidence.observedAt)) || Date.parse(evidence.observedAt) > Date.now()) fail("INVALID_INPUT", "Stop evidence does not bind this run");
-    if (evidence.kind === "observed_tree_exit" && (!run.process || !evidence.process || canonical(run.process) !== canonical(evidence.process))) fail("LAUNCH_UNCERTAIN", "Positive exit evidence must identify the registered process tree");
-    if (evidence.kind === "proven_never_started" && run.process) fail("LAUNCH_UNCERTAIN", "A registered process cannot be declared never started");
-    if (evidence.kind === "verified_reboot" && (!run.process || !evidence.process || evidence.process.bootId === run.process.bootId || evidence.process.launchId !== run.launchId)) fail("LAUNCH_UNCERTAIN", "Reboot evidence requires a changed verified machine boot identity");
+    let recordedProcess = run.process, processReceiptHash = run.processReceiptHash;
+    if (args.launchReceipt) {
+      const receipt = args.launchReceipt, recordedAt = Date.parse(receipt.recordedAt);
+      bounded(receipt.workspace, 8192, "launch receipt workspace"); bounded(receipt.process.bootId, 4096, "launch receipt boot identity"); bounded(receipt.process.startIdentity, 4096, "launch receipt process identity");
+      if (receipt.schemaVersion !== 1 || receipt.identity.taskId !== run.taskId || receipt.identity.runId !== run.id || receipt.identity.epoch !== run.epoch || receipt.identity.goalRevision !== run.goalRevision || !Number.isSafeInteger(receipt.identity.epoch) || receipt.identity.epoch < 1 || !Number.isSafeInteger(receipt.identity.goalRevision) || receipt.identity.goalRevision < 1 || receipt.launchId !== run.launchId || receipt.machineId !== run.machineId || receipt.process.launchId !== run.launchId || !Number.isSafeInteger(receipt.process.pid) || receipt.process.pid <= 0 || /[\0\r\n]/.test(receipt.workspace) || !(receipt.workspace.startsWith("/") || /^[A-Za-z]:[\\/]/.test(receipt.workspace)) || !Number.isFinite(recordedAt) || recordedAt > Date.now() || recordedAt > Date.parse(evidence.observedAt)) fail("INVALID_INPUT", "Launch receipt must bind the exact reserved run and a valid prior process identity");
+      const receiptHash = await digest(canonical(receipt));
+      if (processReceiptHash && processReceiptHash !== receiptHash) fail("LAUNCH_UNCERTAIN", "Terminal launch receipt was already recorded with different metadata");
+      if (run.process && canonical(run.process) !== canonical(receipt.process)) fail("LAUNCH_UNCERTAIN", "Terminal launch receipt differs from the registered process identity");
+      if (!run.process && !["reserved", "starting", "finalizing"].includes(run.state)) fail("LAUNCH_UNCERTAIN", "A terminal receipt cannot adopt a process outside failed-start settlement");
+      if (evidence.kind === "proven_never_started") fail("LAUNCH_UNCERTAIN", "A durable process receipt cannot prove execution never started");
+      recordedProcess = run.process ?? receipt.process; processReceiptHash = receiptHash;
+    }
+    if (evidence.kind === "observed_tree_exit" && (!recordedProcess || !evidence.process || canonical(recordedProcess) !== canonical(evidence.process))) fail("LAUNCH_UNCERTAIN", "Positive exit evidence must identify the registered process tree");
+    if (evidence.kind === "proven_never_started" && recordedProcess) fail("LAUNCH_UNCERTAIN", "A registered process cannot be declared never started");
+    if (evidence.kind === "verified_reboot" && (!recordedProcess || !evidence.process || evidence.process.bootId === recordedProcess.bootId || evidence.process.launchId !== run.launchId)) fail("LAUNCH_UNCERTAIN", "Reboot evidence requires a changed verified machine boot identity");
     if (run.releaseReceipt) return { runId: run.id, receipt: run.releaseReceipt, releasedAt: run.releasedAt! };
     if (run.requestedOutcome === "succeeded" && !run.resultAccepted) fail("PUBLICATION_STALE", "No accepted successful result");
     const outcome = run.requestedOutcome ?? "stopped"; const receipt = `release_${run.id}`; const releasedAt = Date.now();
     await revokeGrant(ctx, run);
-    await ctx.db.patch(run._id, { state: outcome, capacityHeld: false, hold: undefined, stopEvidence: evidence, releasedAt, releaseReason: evidence.kind, releaseReceipt: receipt, leaseUntil: Number.MAX_SAFE_INTEGER });
+    await ctx.db.patch(run._id, { state: outcome, capacityHeld: false, hold: undefined, process: recordedProcess, processReceiptHash, stopEvidence: evidence, releasedAt, releaseReason: evidence.kind, releaseReceipt: receipt, leaseUntil: Number.MAX_SAFE_INTEGER });
     // Late evidence settles only this reservation. Cancellation and a newer epoch always win.
     if (task.ownerRunId === run.id && task.epoch === run.epoch) {
       const goal = await ctx.db.query("goals").withIndex("by_stable_id", q => q.eq("id", task.goalId)).unique();
@@ -109,6 +132,16 @@ export const sweep = internalMutation({ args: {}, handler: async ctx => {
   for (const credential of expiredCredentials) await ctx.db.patch(credential._id, { revokedAt: credential.revokedAt ?? now, expiresAt: Number.MAX_SAFE_INTEGER });
   const expiredRuns = await ctx.db.query("runs").withIndex("by_lease", q => q.lte("leaseUntil", now)).take(100);
   for (const run of expiredRuns) {
+    if (run.mode === "manual") {
+      const task = await taskById(ctx, run.taskId, run.projectId); await revokeGrant(ctx, run);
+      // Revoking a manual registration says nothing about its parent harness or managed slots.
+      await ctx.db.patch(run._id, { state: ["succeeded", "failed", "stopped"].includes(run.state) ? run.state : "stopped", hold: undefined, leaseUntil: Number.MAX_SAFE_INTEGER, releasedAt: run.releasedAt ?? now, releaseReason: run.releaseReason ?? "manual_registration_expired", releaseReceipt: run.releaseReceipt ?? `manual_expired_${run.id}` });
+      if (task.ownerRunId === run.id && task.epoch === run.epoch) {
+        const block = ["queued", "reserved", "running", "yielding", "launch_uncertain"].includes(task.state);
+        await ctx.db.patch(task._id, { ownerRunId: undefined, leaseUntil: undefined, holdRunId: task.holdRunId === run.id ? undefined : task.holdRunId, state: block ? "blocked" : task.state, reason: block ? "manual_registration_expired_checkpoint_required" : task.reason, dispatchHeld: block || task.state === "blocked" ? true : task.dispatchHeld });
+      }
+      continue;
+    }
     if (["succeeded", "failed", "stopped"].includes(run.state) && !run.capacityHeld) { await ctx.db.patch(run._id, { leaseUntil: Number.MAX_SAFE_INTEGER }); continue; }
     const task = await taskById(ctx, run.taskId, run.projectId); await revokeGrant(ctx, run);
     // No inference that an absent receipt or timed-out stop proves execution ended.
@@ -143,9 +176,12 @@ export const requestYield = mutation({ args: { ...runArgs, checkpointId: v.strin
   });
 } });
 
-export const sweepDependencies = internalMutation({ args: { cursor: v.optional(v.string()) }, handler: async (ctx, args) => {
-  const page = await ctx.db.query("tasks").withIndex("by_state", q => q.eq("state", "waiting_dependencies")).paginate({ cursor: args.cursor ?? null, numItems: 25 });
+export const sweepDependencies = internalMutation({ args: { cursor: v.optional(v.string()), state: v.optional(v.union(v.literal("waiting_dependencies"), v.literal("queued"))) }, handler: async (ctx, args) => {
+  const state = args.state ?? "waiting_dependencies";
+  const page = await ctx.db.query("tasks").withIndex("by_state", q => q.eq("state", state)).paginate({ cursor: args.cursor ?? null, numItems: 25 });
   const result = await refreshWaiting(ctx, page.page);
-  if (!page.isDone) await ctx.scheduler.runAfter(0, makeFunctionReference<"mutation", { cursor: string }>("lifecycle:sweepDependencies"), { cursor: page.continueCursor });
-  return { ...result, complete: page.isDone };
+  const continuation = makeFunctionReference<"mutation", { cursor?: string; state: "waiting_dependencies" | "queued" }>("lifecycle:sweepDependencies");
+  if (!page.isDone) await ctx.scheduler.runAfter(0, continuation, { state, cursor: page.continueCursor });
+  else if (state === "waiting_dependencies") await ctx.scheduler.runAfter(0, continuation, { state: "queued" });
+  return { ...result, state, complete: page.isDone && state === "queued" };
 } });
