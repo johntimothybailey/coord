@@ -5,8 +5,7 @@ import { constants } from "node:fs";
 import { tmpdir, platform, release, arch } from "node:os";
 import { delimiter, join } from "node:path";
 import { PROBE_VERSION, PROTOCOL_VERSION, REQUIRED_CHECKS, type CapabilityEvidence, type EvidenceStatus, type ExecutionMode, type Harness, type ProbeEvidence } from "./protocol.js";
-import { codexAdapter } from "./adapters/codex.js";
-import { antigravityAdapter } from "./adapters/antigravity.js";
+import { HARNESSES, harnessAdapter } from "./adapters/registry.js";
 
 export interface DoctorOptions { timeoutMs?: number; outputLimit?: number; fixtures?: boolean }
 export interface CommandResult {
@@ -93,9 +92,9 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
   };
   const host = { os: platform(), release: release(), arch: arch(), node: process.version };
   const capabilities: CapabilityEvidence[] = [];
-  for (const harness of ["codex", "antigravity"] as const) {
-    const binary = harness === "codex" ? "codex" : "agy";
-    const adapterVersion = harness === "codex" ? codexAdapter.version : antigravityAdapter.version;
+  for (const harness of HARNESSES) {
+    const adapter = harnessAdapter(harness);
+    const binary = adapter.binary, adapterVersion = adapter.version;
     const v = await run([binary, "--version"]);
     const detectedVersion = succeeded(v) ? version(v.output) : undefined;
     const help = await run([binary, "--help"]);

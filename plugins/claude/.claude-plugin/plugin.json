@@ -1,0 +1,9 @@
+{
+  "name": "coord",
+  "displayName": "Coord",
+  "version": "0.1.0",
+  "author": {
+    "name": "John Bailey"
+  },
+  "description": "Cooperative coordination through approved tasks and explicit check-ins."
+}

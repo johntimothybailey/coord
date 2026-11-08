@@ -62,13 +62,13 @@ export async function recordOffer(client: CoordBackend, identity: RunIdentity, m
 
 export interface HookOptions { harness: Harness; event: string; run?: RunConnection; input?: unknown }
 export async function runCoordHook(options: HookOptions): Promise<Record<string, unknown>> {
-  const events = options.harness === "codex" ? ["SessionStart", "PreToolUse"] : ["SessionStart", "PreInvocation", "PreToolUse"];
+  const events = options.harness === "antigravity" ? ["SessionStart", "PreInvocation", "PreToolUse"] : ["SessionStart", "PreToolUse"];
   if (!events.includes(options.event)) throw new CoordError("INVALID_INPUT", "Unsupported Coord hook event");
   let text = "Coord session is not registered. Use the Coord skill and register an approved task before substantive modification. Advisory reads and proposals remain available.";
   let blocked = false;
   const input = record(options.input ?? {});
-  const tool = options.harness === "codex" ? input.tool_name : input.toolCall && record(input.toolCall).name;
-  const nativeMutation = typeof tool !== "string" || /^(Bash|apply_patch|Edit|Write|run_command|edit_file|write_to_file|replace_file_content|multi_replace_file_content)$/.test(tool);
+  const tool = options.harness === "antigravity" ? input.toolCall && record(input.toolCall).name : input.tool_name;
+  const nativeMutation = typeof tool !== "string" || /^(Bash|apply_patch|Edit|Write|NotebookEdit|run_command|edit_file|write_to_file|replace_file_content|multi_replace_file_content)$/.test(tool);
   if (options.run) {
     try {
       const offer = await fetchCheckIn(options.run);
@@ -78,7 +78,7 @@ export async function runCoordHook(options: HookOptions): Promise<Record<string,
   } else if (options.event === "PreToolUse") blocked = nativeMutation;
   // Keep diagnostic and conflict-resolution tools usable while disputed edits are blocked.
   const deny = blocked && nativeMutation;
-  if (options.harness === "codex") return { hookSpecificOutput: { hookEventName: options.event, additionalContext: text, ...(options.event === "PreToolUse" && deny ? { permissionDecision: "deny", permissionDecisionReason: text } : {}) } };
+  if (options.harness !== "antigravity") return { hookSpecificOutput: { hookEventName: options.event, additionalContext: text, ...(options.event === "PreToolUse" && deny ? { permissionDecision: "deny", permissionDecisionReason: text } : {}) } };
   if (options.event === "PreToolUse") return { decision: deny ? "deny" : "allow", reason: text };
   return { injectSteps: [{ ephemeralMessage: text }] };
 }

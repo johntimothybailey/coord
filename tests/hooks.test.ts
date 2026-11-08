@@ -53,6 +53,35 @@ test("declined and escalated conflicts still deny native tools; accepted decisio
   }
 });
 
+test("an unregistered Claude session is denied on its own mutation tools and advised on others", async () => {
+  for (const tool of ["Bash", "Edit", "Write", "NotebookEdit"]) {
+    const output = await runCoordHook({ harness: "claude", event: "PreToolUse", input: { tool_name: tool } });
+    const specific = output.hookSpecificOutput as Record<string, unknown>;
+    assert.equal(specific.hookEventName, "PreToolUse");
+    assert.equal(specific.permissionDecision, "deny", `${tool} must be denied without a registration`);
+    assert.match(String(specific.permissionDecisionReason), /not registered/);
+  }
+  // A read tool still receives advisory context but is never denied.
+  const read = await runCoordHook({ harness: "claude", event: "PreToolUse", input: { tool_name: "Read" } });
+  const readSpecific = read.hookSpecificOutput as Record<string, unknown>;
+  assert.equal(readSpecific.permissionDecision, undefined);
+  assert.match(String(readSpecific.additionalContext), /not registered/);
+  // An absent or non-string tool name must fail closed rather than allow.
+  const unknown = await runCoordHook({ harness: "claude", event: "PreToolUse", input: {} });
+  assert.equal((unknown.hookSpecificOutput as Record<string, unknown>).permissionDecision, "deny");
+});
+
+test("Claude SessionStart injects context, cannot deny, and rejects foreign events", async () => {
+  const startup = await runCoordHook({ harness: "claude", event: "SessionStart" });
+  const specific = startup.hookSpecificOutput as Record<string, unknown>;
+  assert.equal(specific.hookEventName, "SessionStart");
+  assert.match(String(specific.additionalContext), /not registered/);
+  assert.equal(specific.permissionDecision, undefined, "SessionStart cannot block in Claude Code");
+  assert.equal(startup.injectSteps, undefined, "Claude must not receive the Antigravity envelope");
+  // PreInvocation is an Antigravity-only event.
+  await assert.rejects(runCoordHook({ harness: "claude", event: "PreInvocation" }), { code: "INVALID_INPUT" });
+});
+
 test("missing registration blocks known native edit paths without pretending to register", async () => {
   const output = await runCoordHook({ harness: "codex", event: "PreToolUse", input: { tool_name: "apply_patch" } });
   assert.equal((output.hookSpecificOutput as Record<string, unknown>).permissionDecision, "deny");

@@ -11,7 +11,7 @@ async function withBinaries(body: string, run: () => Promise<void>): Promise<voi
   const directory = await mkdtemp(join(tmpdir(), "coord-doctor-test-"));
   const oldPath = process.env.PATH;
   try {
-    for (const name of ["codex", "agy"]) {
+    for (const name of ["codex", "agy", "claude"]) {
       const path = join(directory, name);
       await writeFile(path, `#!/bin/sh\n${body}\n`); await chmod(path, 0o700);
     }
@@ -31,7 +31,7 @@ login) echo 'Logged in using ${canary}';;
 esac`, async () => {
     const report = await runDoctor({ fixtures: false });
     assert.equal(report.schemaVersion, 1);
-    assert.equal(report.capabilities.length, 2);
+    assert.equal(report.capabilities.length, 3);
     assert(!JSON.stringify(report).includes(canary));
     assert(report.gates.every(gate => gate.status === "BLOCKED"));
     for (const capability of report.capabilities) {

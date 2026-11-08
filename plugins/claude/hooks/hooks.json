@@ -1,0 +1,6 @@
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "coord hook claude SessionStart", "timeout": 10}]}],
+    "PreToolUse": [{"matcher": "Bash|Edit|Write|NotebookEdit", "hooks": [{"type": "command", "command": "coord hook claude PreToolUse", "timeout": 10, "onFailure": "block"}]}]
+  }
+}

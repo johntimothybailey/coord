@@ -9,8 +9,7 @@ import { captureDigest } from "./checkpoint.js";
 import { checkStoreDirectory, readSmallFile, writeNewPrivateFile } from "./credentials.js";
 import { BackendClient } from "./client.js";
 import { CLIENT_VERSION, CoordError, PROBE_VERSION, requireCapability, requireHandshake } from "./protocol.js";
-import { codexAdapter } from "./adapters/codex.js";
-import { antigravityAdapter } from "./adapters/antigravity.js";
+import { harnessAdapter } from "./adapters/registry.js";
 import type { CapabilityEvidence, CapabilityKey, ExecutionMode, VersionHandshake } from "./protocol.js";
 import type { WorkspaceConfig } from "./config.js";
 import { checkEnvironment, inspectSetup, requireEnvironment } from "./environment.js";
@@ -61,7 +60,7 @@ export function requireRuntime(config: RuntimeConfig, mode: ExecutionMode): void
 export async function verifyRuntime(config: RuntimeConfig, mode: ExecutionMode): Promise<CapabilityKey> {
   requireRuntime(config, mode);
   for (const home of [config.policy.workerHome, config.policy.githubHome]) if (await realpath(home).catch(() => "") !== home) throw new CoordError("UNSUPPORTED_FOR_AUTONOMOUS_EXECUTION", "Selected worker/provider HOME must be a canonical existing directory");
-  const adapter = config.harness.kind === "codex" ? codexAdapter : antigravityAdapter;
+  const adapter = harnessAdapter(config.harness.kind);
   if (config.capability.key.os !== `${platform()}/${release()}/${arch()}` || config.capability.key.adapterVersion !== adapter.version || config.capability.key.probeVersion !== PROBE_VERSION || await realpath(config.harness.executable) !== config.harness.executable) throw new CoordError("UNSUPPORTED_FOR_AUTONOMOUS_EXECUTION", "Actual OS, executable or adapter/probe differs from qualified configuration");
   const observed = await new Promise<string>((resolveVersion, reject) => {
     const child = spawn(config.harness.executable, adapter.versionArgs, { env: { HOME: config.policy.workerHome, PATH: config.policy.searchPath }, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });

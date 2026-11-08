@@ -25,7 +25,7 @@ import { createLaunchSupervisor, readNativeBootId } from "./supervisor.js";
 import { startDaemon } from "./daemon.js";
 import type { DispatchCandidate, DispatchSnapshot } from "./daemon.js";
 import { codexAdapter } from "./adapters/codex.js";
-import { antigravityAdapter } from "./adapters/antigravity.js";
+import { harnessAdapter } from "./adapters/registry.js";
 import { createCgroupControl } from "./containment.js";
 import { runVerification } from "./verification-runner.js";
 import { canonicalJson } from "./canonical.js";
@@ -50,7 +50,9 @@ const identityPayload = (run: RunBinding): Record<string, Value> => ({ ...run.id
 function projectClient(ctx: Context): BackendClient { if (!ctx.agent) throw new CoordError("FORBIDDEN", "Recovery cannot create project execution authority"); return ctx.agent; }
 const parseProgress = (progress: string): unknown => { try { return JSON.parse(progress) as unknown; } catch { return progress; } };
 function selectedAdapter(runtime: RuntimeConfig, replan: boolean) {
-  if (!replan) return runtime.harness.kind === "codex" ? codexAdapter : antigravityAdapter;
+  // Claude is deliberately absent from the runtime harness enum: its permission modes are
+  // not the proven sandbox contract and it has no qualified protected startup binding.
+  if (!replan) return harnessAdapter(runtime.harness.kind);
   const checks = runtime.capability.checks.filter(check => check.checkId === "harness.replan-readonly"), check = checks[0];
   const observed = check ? Date.parse(check.observedAt) : NaN;
   if (runtime.harness.kind !== "codex" || checks.length !== 1 || !check || check.kind !== "real" || check.status !== "PASS" || check.mode !== "managed" || check.configurationDigest !== runtimeDigest(runtime) || !check.evidenceRef || !Number.isFinite(observed) || observed > Date.now() || Date.now() - observed > 86400_000) throw new CoordError("UNSUPPORTED_FOR_AUTONOMOUS_EXECUTION", "Replanning requires current owner-provisioned all-tool read-only Codex qualification; Antigravity mode is unsupported");
@@ -63,7 +65,7 @@ function requireRuntimeActions(runtime: RuntimeConfig, mode: "manual" | "managed
 function runtimeAdapter(ctx: Context, run: RunBinding, replan: boolean) {
   requireRuntimeActions(ctx.runtime, ctx.mode);
   const adapter = selectedAdapter(ctx.runtime, replan);
-  if (adapter.harness !== "codex") return adapter; // Antigravity uses the already qualified installed plugin and bound nonsecret environment.
+  if (adapter.harness !== "codex") return adapter; // Antigravity uses the already qualified installed plugin and bound nonsecret environment; Claude never reaches here.
   const cli = fileURLToPath(new URL("./cli.js", import.meta.url));
   return { ...adapter, launchArgs: (prompt: string) => ["-c", `mcp_servers.coord.command=${JSON.stringify(process.execPath)}`, "-c", `mcp_servers.coord.args=${JSON.stringify([cli, "mcp", "--runtime", ctx.runtimePath, "--session", run.sessionId!])}`, ...adapter.launchArgs(prompt)] };
 }

@@ -5,7 +5,7 @@ export const CAPABILITIES = ["auth-v1", "run-grants-v1", "safe-snapshot-v1", "fi
 export const DEFAULTS = Object.freeze({ leaseMs: 90_000, renewMs: 20_000, watchdogMs: 60_000, sweepMs: 60_000, machineCapacity: 1, projectCapacity: 2, taskCap: 20, runTimeoutMs: 1_800_000, replanLimit: 2, captureAttempts: 3, fileBytes: 5 * 1024 * 1024, contextBytes: 12 * 1024, expansionBytes: 4 * 1024, updateBytes: 2 * 1024, scanPaths: 500, scanBytes: 100 * 1024 });
 export type EvidenceStatus = "PASS" | "FAIL" | "BLOCKED";
 export type ExecutionMode = "advisory" | "manual" | "managed";
-export type Harness = "codex" | "antigravity";
+export type Harness = "codex" | "antigravity" | "claude";
 export interface CapabilityKey { os: string; harness: Harness; harnessVersion: string; adapterVersion: string; probeVersion: string; configurationDigest: string; gitPolicyDigest: string }
 export interface ProbeEvidence { schemaVersion: 1; checkId: string; status: EvidenceStatus; mode: ExecutionMode; observedAt: string; configurationDigest: string; command: string[]; summary: string; evidenceRef?: string; kind: "real" | "fixture"; }
 export interface CapabilityEvidence { key: CapabilityKey; checks: ProbeEvidence[]; }
