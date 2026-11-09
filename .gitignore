@@ -5,6 +5,11 @@ dist/
 .env*
 !.env.example
 *.tsbuildinfo
-# Verification records, documentation and the specification are local only.
+# Local only: verification records, our build process, and pilot specifics.
+# User-facing docs (commands, hosts, contracts, operations...) are published.
 evidence/
-docs/
+docs/execution.md
+docs/verification.md
+docs/spec-v2.5.md
+docs/onboarding.md
+docs/setup/
