@@ -5,3 +5,5 @@ dist/
 .env*
 !.env.example
 *.tsbuildinfo
+# Internal verification records are retained locally, not published.
+evidence/
