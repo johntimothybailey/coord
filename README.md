@@ -30,8 +30,8 @@ Do not manually synthesize human approval or qualification records to make admis
 
 ## Continuing the release
 
-The selected source repository is `johntimothybailey/coord` (public). Source publication has not been performed. The private pilot app is [johntimothybailey/coord-pilot-taskboard](https://github.com/johntimothybailey/coord-pilot-taskboard); its source is also retained in `tests/pilot/taskboard`.
+Coord is bring-your-own-backend: provision your own Convex deployment, then run the protected operator bootstrap and connect steps in your own terminal. An agent must never perform bootstrap, hold the approver vault, or handle a passphrase.
 
-The approved cloud development backend is deployed under `<team>/coord` as `dev/coord`: [<dev-deployment>](https://dashboard.convex.dev/t/<team>/coord/<dev-deployment>). The operator completed protected bootstrap/connect for the private pilot, and live project-agent access is verified. Host qualification and approved goals are still required before worker execution. A VM is planned for validation; its OS, harness and access are not configured yet. This Mac plus a separate VM can support the pilot if they have distinct machine identities and independently qualified execution environments. Two worktrees on this Mac are only a rehearsal.
+Host qualification and an approved goal are required before any worker execution. Two worktrees on one machine are a rehearsal, not a two-machine result: each machine needs a distinct identity and an independently qualified execution environment.
 
 Read [host integration](docs/hosts.md), [backend contracts](docs/backend.md), [checkpoint contracts](docs/checkpoints.md), [shared contracts](docs/contracts.md), [containment](docs/containment.md), [supervision](docs/supervision.md), [verification runtime](docs/verification-runtime.md), [host evidence](docs/doctor.md) and [setup and recovery](docs/operations.md). The specification, execution ledger and verification records are maintained by the maintainer and are not published here. A1–A7 remain mandatory. Package publication, license selection, production deployment, merge and protected approvals remain operator decisions.
