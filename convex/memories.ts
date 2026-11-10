@@ -1,10 +1,11 @@
 import { v } from "convex/values";
 import type { Doc, QueryCtx } from "./server.js";
 import { mutation, query } from "./server.js";
-import { authenticate, liveRun, replay, runArgs, identityArgs, stableId, bounded, integer, path, fail, digest, canonical } from "./auth.js";
+import { authenticate, liveRun, replay, runArgs, identityArgs, stableId, bounded, integer, path, overlaps, fail, digest, canonical } from "./auth.js";
 import { taskById } from "./tasks.js";
 import { boundedRecords } from "./messages.js";
 import { approveExactRule } from "./ruleApproval.js";
+import { repositoryMemorySource } from "./schema.js";
 const source = v.object({ taskId: v.string(), revision: v.string(), evidenceRef: v.string() });
 export const record = mutation({ args: { ...runArgs, memoryId: v.string(), kind: v.union(v.literal("lesson"), v.literal("decision"), v.literal("rule")), content: v.string(), sources: v.array(source), applicability: v.array(v.string()), confidence: v.string() }, handler: async (ctx, args) => {
   const { actor } = await authenticate(ctx, args, ["run"]); await liveRun(ctx, args, actor);
@@ -19,6 +20,33 @@ export const record = mutation({ args: { ...runArgs, memoryId: v.string(), kind:
     await ctx.db.insert("memories", { id: args.memoryId, projectId: args.projectId, kind: args.kind, content: args.content, revision: 1, hash, sources: args.sources, applicability: args.applicability, confidence: args.confidence, status });
     return { memoryId: args.memoryId, revision: 1, hash, status };
   });
+} });
+/** Advisory declaration only: fixed repository evidence is reviewed by the caller/human, not fetched by this mutation. */
+export const proposeRule = mutation({ args: { ...identityArgs, memoryId: v.string(), content: v.string(), sources: v.array(repositoryMemorySource), applicability: v.array(v.string()), confidence: v.string() }, handler: async (ctx, args) => {
+  const { actor, project } = await authenticate(ctx, args, ["agent", "human"]);
+  const id = await replay(ctx, actor, "memories.proposeRule", args, async () => {
+    stableId(args.memoryId); bounded(args.content, 4096, "rule"); bounded(args.confidence, 64, "confidence");
+    if (!args.content.trim() || !args.confidence.trim() || !args.sources.length || args.sources.length > 20 || !args.applicability.length || args.applicability.length > 50) fail("INVALID_INPUT", "Rule provenance/applicability bounds exceeded");
+    if (!project.sharingApproved) fail("FORBIDDEN", "Repository sharing is not approved");
+    const sharedPath = (value: string) => {
+      path(value);
+      if (/[\x00-\x1f\x7f]/u.test(value)) fail("INVALID_INPUT", "Invalid source/applicability path");
+      if (!project.allowedPaths.some(allowed => value === allowed || value.startsWith(`${allowed}/`)) || project.excludedPaths.some(excluded => overlaps(excluded, value))) fail("FORBIDDEN", "Source/applicability is outside approved sharing paths");
+    };
+    for (const value of args.applicability) sharedPath(value);
+    for (const source of args.sources) {
+      bounded(source.repository, 2048, "repository"); sharedPath(source.path);
+      if (source.repository !== project.repository || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(source.revision) || !/^[a-f0-9]{64}$/.test(source.contentHash)) fail("INVALID_INPUT", "Source must bind this repository, an immutable commit and file digest");
+    }
+    const value = { kind: "rule" as const, content: args.content, sources: args.sources, applicability: args.applicability, confidence: args.confidence };
+    bounded(canonical(value), 32 * 1024, "rule source envelope");
+    if (await ctx.db.query("memories").withIndex("by_stable_id", q => q.eq("id", args.memoryId)).unique()) fail("IDEMPOTENCY_CONFLICT", "Memory identity already used");
+    await ctx.db.insert("memories", { id: args.memoryId, projectId: project.id, ...value, revision: 1, hash: await digest(canonical(value)), status: "proposed" });
+    return args.memoryId;
+  });
+  const memory = await ctx.db.query("memories").withIndex("by_stable_id", q => q.eq("id", id)).unique();
+  if (!memory || memory.projectId !== project.id || memory.kind !== "rule") fail("NOT_FOUND", "Proposed rule is unavailable");
+  return { memoryId: memory.id, revision: memory.revision, hash: memory.hash, status: memory.status, receipt: "proposal_only" as const, authorityGranted: false, sourceVerification: "declared_not_server_verified" as const };
 } });
 /** Protected exact read: proposed rules are deliberately absent from approved-rule briefings. */
 export const ruleForApproval = query({ args: { ...identityArgs, memoryId: v.string() }, handler: async (ctx, args) => {

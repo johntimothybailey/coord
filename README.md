@@ -34,7 +34,7 @@ Ask “show me rules to review,” “show lessons learned” or “show details
 
 After reviewing an exact proposed rule, ask “approve this rule” to prepare a [durable approval request](docs/commands.md#conversational-rule-approval-requests), or ask to check/cancel that request. Open the protected approval link, authenticate with your enrolled passkey to review, then explicitly approve or deny the exact request with a fresh passkey interaction. Preparing a request or accepting a host URL prompt never approves the rule. Requests bind exact source/routing and expire without renewal on retry. One-time enrollment uses the protected operator procedure; routine approval stays in the chat/browser flow.
 
-Agents can record evidence-linked lessons and decisions for later retrieval, or explicitly propose a rule through `coord_record_memory`. A proposed rule becomes mandatory project guidance only when a human approves its exact revision and content/provenance hash through the [chat/passkey workflow](docs/commands.md#conversational-rule-approval-requests), or the explicitly selected [protected CLI fallback](docs/commands.md#rule-approval). This keeps useful experience available without letting an agent turn its own suggestion into policy.
+Before task admission, ask “propose a rule from this repository evidence.” `coord_propose_rule` records declared sources pinned to immutable commits and file digests, after the agent verifies the actual files. It grants no approval or execution authority. Participating agents can still record task-derived lessons, decisions and rules through `coord_record_memory`. A proposed rule becomes mandatory project guidance only when a human approves its exact revision and content/provenance hash through the [chat/passkey workflow](docs/commands.md#conversational-rule-approval-requests), or the explicitly selected [protected CLI fallback](docs/commands.md#rule-approval). This keeps useful experience available without letting an agent turn its own suggestion into policy.
 
 ```mermaid
 flowchart TD
@@ -42,6 +42,8 @@ flowchart TD
     K -->|Lesson or decision| L["Evidence-linked ordinary memory"]
     L --> C["Related tasks retrieve nonmandatory source context"]
     K -->|Explicit proposed rule| P["Proposed rule with ID, revision and hash"]
+    NP["Ask chat to propose a rule from repository evidence"] --> RP["Verify fixed-commit files; coord_propose_rule"]
+    RP --> P
     Q["Ask in chat to review rules or lessons"] --> V["Read-only project-scoped review summaries"]
     P --> V
     L -->|Lessons only| V

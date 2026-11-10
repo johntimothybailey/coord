@@ -442,3 +442,27 @@ test("an applied rule approval with incomplete reply or conflicting readback pri
     }
   } finally { console.log = log; }
 });
+
+test("protected CLI approves repository-source rules and refuses malformed or foreign provenance", async () => {
+  const f = await fixture();
+  const source = { kind: "repository" as const, repository: f.plan.config.repository, revision: "b".repeat(40), path: "src/app.ts", contentHash: "a".repeat(64) };
+  const data = { kind: "rule" as const, content: "Preserve the existing task control during completion updates.", sources: [source], applicability: ["src"], confidence: "source reviewed" };
+  const rowId = await f.backend.context().db.insert("memories", { ...data, id: "repo_rule", projectId: "project", revision: 1, hash: captureDigest(data), status: "proposed" });
+  try {
+    await wire(f, async calls => {
+      const session = await openOperatorSession({ plan: f.planPath, vault: f.vault }, operator("").io);
+      for (const corrupt of [{ repository: "github.com/foreign/project" }, { revision: "main" }, { path: "../outside" }, { contentHash: "not-a-hash" }]) {
+        const changed = { ...data, sources: [{ ...source, ...corrupt }] }, hash = captureDigest(changed);
+        await f.backend.context().db.patch(rowId, { sources: changed.sources, hash });
+        await assert.rejects(approveRule(session, { memoryId: "repo_rule", revision: 1, hash }), /unreadable rule record/);
+      }
+      assert.equal(calls.filter(call => call.path === "memories:approveRule").length, 0);
+      const hash = captureDigest(data), terminal = operator(`approve rule project repo_rule 1 ${hash}`);
+      await f.backend.context().db.patch(rowId, { sources: data.sources, hash });
+      const approved = await approveRule({ ...session, ...terminal.io }, { memoryId: "repo_rule", revision: 1, hash });
+      assert.equal(approved.status, "active"); assert.equal(approved.hash, hash);
+      assert(terminal.shown.join("").includes(source.path)); assert(terminal.shown.join("").includes(source.contentHash));
+      assert.equal(calls.filter(call => call.path === "memories:approveRule").length, 1);
+    });
+  } finally { await rm(f.directory, { recursive: true, force: true }); }
+});

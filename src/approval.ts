@@ -30,7 +30,14 @@ export interface OperatorSession {
 }
 export interface GoalApproval { goalId: string; revision: number; hash: string; state: string; approvedBy: string; approvedAt: number; mutated: boolean }
 export interface RuleApproval { memoryId: string; revision: number; hash: string; status: "active"; approvedBy: string; policyVersion: number; mutated: boolean }
-interface RuleView { id: string; projectId: string; kind: "rule"; revision: number; hash: string; status: string; content: string; sources: { taskId: string; revision: string; evidenceRef: string }[]; applicability: string[]; confidence: string; approvedHash?: string; approvedBy?: string; policyVersion?: number }
+type RuleSource = { taskId: string; revision: string; evidenceRef: string } | { kind: "repository"; repository: string; revision: string; path: string; contentHash: string };
+interface RuleView { id: string; projectId: string; kind: "rule"; revision: number; hash: string; status: string; content: string; sources: RuleSource[]; applicability: string[]; confidence: string; approvedHash?: string; approvedBy?: string; policyVersion?: number }
+function validRuleSource(value: unknown, repository: string): value is RuleSource {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const source = value as Record<string, unknown>;
+  if (source.kind === undefined) return Object.keys(source).every(key => ["taskId", "revision", "evidenceRef"].includes(key)) && [source.taskId, source.revision, source.evidenceRef].every(field => typeof field === "string" && field.length > 0);
+  return source.kind === "repository" && Object.keys(source).every(key => ["kind", "repository", "revision", "path", "contentHash"].includes(key)) && source.repository === repository && typeof source.revision === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(source.revision) && typeof source.contentHash === "string" && /^[a-f0-9]{64}$/.test(source.contentHash) && typeof source.path === "string" && source.path.length > 0 && source.path.length <= 8192 && !source.path.startsWith("/") && !/[\\\x00-\x1f\x7f]/u.test(source.path) && source.path.split("/").every(part => part && part !== "." && part !== ".." && part.toLowerCase() !== ".git");
+}
 export interface PolicyApproval { projectId: string; capturePolicyDigest: string; configVersion: number; policyVersion: number; mutated: boolean }
 interface GoalView { id: string; projectId: string; revision: number; content: string; hash: string; state: string; taskLimit: number; runTimeoutMs: number; approvedBy?: string; approvedHash?: string; approvedAt?: number }
 
@@ -187,7 +194,7 @@ async function readExactRule(session: OperatorSession, target: { memoryId: strin
   try { response = await session.client.query("memories:ruleForApproval", { memoryId: target.memoryId }); }
   catch (error) { throw backendFailure(error); }
   const value = response as { rule?: RuleView; policyVersion?: number } | null, rule = value?.rule;
-  if (!rule || typeof rule !== "object" || rule.id !== target.memoryId || rule.kind !== "rule" || typeof rule.content !== "string" || !rule.content || typeof rule.confidence !== "string" || !Array.isArray(rule.applicability) || rule.applicability.some(path => typeof path !== "string") || !Array.isArray(rule.sources) || !rule.sources.length || rule.sources.some(source => !source || typeof source.taskId !== "string" || typeof source.revision !== "string" || typeof source.evidenceRef !== "string") || !timestamp(value?.policyVersion) || typeof rule.status !== "string") throw new CoordError("BLOCKED_ENV", "Coord backend returned an unreadable rule record");
+  if (!rule || typeof rule !== "object" || rule.id !== target.memoryId || rule.kind !== "rule" || typeof rule.content !== "string" || !rule.content || typeof rule.confidence !== "string" || !Array.isArray(rule.applicability) || rule.applicability.some(path => typeof path !== "string") || !Array.isArray(rule.sources) || !rule.sources.length || rule.sources.some(source => !validRuleSource(source, session.plan.config.repository)) || !timestamp(value?.policyVersion) || typeof rule.status !== "string") throw new CoordError("BLOCKED_ENV", "Coord backend returned an unreadable rule record");
   if (rule.projectId !== session.plan.config.projectId) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Rule belongs to a different project than the protected plan");
   if (rule.revision !== target.revision || rule.hash !== target.hash || captureDigest({ kind: rule.kind, content: rule.content, sources: rule.sources, applicability: rule.applicability, confidence: rule.confidence }) !== target.hash) throw new CoordError("FORBIDDEN", "The stated revision and hash do not bind this exact rule content and provenance");
   return { rule, policyVersion: value.policyVersion };

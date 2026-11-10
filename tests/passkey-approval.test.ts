@@ -169,7 +169,7 @@ test("revoked key, expired human credential and foreign project cannot authentic
 
 test("HTTP rejects cross-origin, oversized and model-authority inputs without exposing private source",async()=>{
  const {f}=await fixture();const before=structuredClone(f.rows);
- const shell=await http(f,"/approval"),html=await shell.text();assert.equal(shell.headers.get("Cache-Control"),"no-store");
+ const shell=await http(f,"/approval"),html=await shell.text();assert.equal(shell.headers.get("Cache-Control"),"no-store");assert(html.includes("Repository references and file digests are declarations; check them against the actual revision before approving."));
  for(const [path,source] of [["/approval/app.js",approvalJs],["/approval/style.css",approvalCss]]){const hash=await bytesHash(new TextEncoder().encode(source));const version=Array.from(hash,b=>b.toString(16).padStart(2,"0")).join("");const integrity="sha256-"+btoa(String.fromCharCode(...hash));assert(html.includes('"'+path+'?v='+version+'" integrity="'+integrity+'"'));assert.equal(await (await http(f,path!)).text(),source);}
  for(const headers of [{Origin:"https://evil.example","Content-Type":"application/json"},{"Content-Type":"application/json"}] as Record<string,string>[]){const response=await http(f,"/approval/decide",{approved:true,memberId:"human",token:human},headers);assert.equal(response.status,403);assert(!(await response.text()).includes(human));}
  const huge=await http(f,"/approval/challenge",{padding:"x".repeat(33000)});assert.equal(huge.status,403);assert.deepEqual(f.rows,before);
