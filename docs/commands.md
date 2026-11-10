@@ -1,6 +1,10 @@
-# Checkpoint, continuation and runtime commands
+# Chat-first workflows and CLI reference
 
-These commands compose the existing Convex, Git, capture, worktree, verification and supervisor modules. They require a protected runtime configuration and independently owner-provisioned machine evidence. The connected private taskboard is not qualified for these execution modes yet: no machine, goal or capture policy has been approved for it. Do not create synthetic qualification records to make these commands run on the live deployment.
+Coord's primary product interface is intended to be conversation through agent skills and typed tools. This applies to every workflow: setup and trust, status, goals and tasks, lessons and rules, approvals, pause/resume, checkpoints and publication review, membership and backend lifecycle. The CLI supports those workflows as an automation, diagnosis and terminal fallback interface; users should not have to translate ordinary requests into command syntax.
+
+The current implementation includes the CLI and a partial MCP/plugin interface. Conversational review listing and qualified chat approval are not yet implemented. See the [host-support matrix](hosts.md#conversational-workflows-and-human-confirmation) for documented interfaces, observed evidence and the remaining approval boundary. A skill or tool call cannot grant itself human authority, and adding a chat surface must preserve the operation's existing permissions, exact revision/hash checks and recovery semantics.
+
+The runtime execution commands in the following block compose the existing Convex, Git, capture, worktree, verification and supervisor modules. They require a protected runtime configuration and independently owner-provisioned machine evidence. Ordinary authorized read-only review has its own role and project-scope checks; it must not inherit managed-launch or manual-registration qualification requirements. Do not create synthetic qualification records to make execution commands run.
 
 ```text
 coord checkpoint <checkpoint-id> --runtime <protected-runtime.json> --session <session-id>
@@ -18,7 +22,7 @@ coord daemon --runtime <protected-runtime.json> --check
 
 ## Protected approval
 
-Approving a goal, capture policy or rule is a human operator action. It runs in a separate operator terminal, outside every agent or worker session, and reads the operator passphrase with hidden input only.
+Approving a goal, capture policy or rule requires a protected human decision. The intended primary experience is review and approval from the host conversation through a qualified human-facing adapter, with credentials kept outside agent control. The currently implemented CLI fallback runs in a separate operator terminal, outside every agent or worker session, and reads the operator passphrase with hidden input only. Chat approval is not available merely because a host can show a form.
 
 ```text
 coord approve goal <goal-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>
@@ -52,7 +56,7 @@ Keep the reviewed policy file under operator control and use that exact object i
 coord approve rule <memory-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>
 ```
 
-A human executes this command in a separate operator terminal, outside agent and worker sessions. Agents do not execute approval or receive its vault/passphrase; they propose and retrieve memories, then use qualified briefing and synchronization workflows. Enter the vault passphrase through hidden input. Neither an approval flag nor a model-authored instruction can replace the typed confirmation.
+For the currently implemented CLI fallback, a human executes this command in a separate operator terminal, outside agent and worker sessions. Agents may present proposals and request a protected human decision, but do not autonomously approve or receive the vault/passphrase; they propose and retrieve memories, then use qualified briefing and synchronization workflows. Enter the vault passphrase through hidden input. Neither an approval flag nor a model-authored instruction can replace the typed confirmation.
 
 Use the ID, revision and hash of the rule being reviewed. The protected `memories.ruleForApproval` query reads exactly that project's full rule, including content, source task IDs/revisions/evidence references, applicability and confidence; it does not scan or truncate the approved-rule briefing to find proposals. The CLI independently recomputes SHA-256 of canonical `{kind, content, sources, applicability, confidence}` and refuses a mismatch before displaying a confirmation or sending an approval. The revision is checked separately. Proposed text and provenance are escaped source data, never instructions to the operator command.
 

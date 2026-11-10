@@ -4,6 +4,12 @@ Private implementation of Shared Agent Coordination v2.5: a TypeScript CLI, dire
 
 **Not release-qualified.** Local tests do not establish live Convex concurrency, protected human approval, credential isolation, actual supervised harness behavior or two-machine continuation. The full scope includes autonomous dispatch and both directions of portable continuation; it has not been reduced to shared memory.
 
+## Chat-first workflows
+
+Coord is being built for conversation-first use: ask the agent to inspect work, review lessons, propose or approve a goal/rule, continue a task, manage membership or operate the backend. Plugins, skills and typed tools should carry every supported workflow; the CLI remains the supporting automation, diagnosis and terminal fallback interface.
+
+Today the CLI and part of the MCP/plugin interface are implemented. Conversational review listing and a qualified chat approval adapter are still missing. Protected actions always require authenticated human authority, whether presented in chat or a terminal. See [host support and remaining evidence](docs/hosts.md#conversational-workflows-and-human-confirmation) and the [workflow/CLI reference](docs/commands.md).
+
 ## Local development
 
 Node 24 or newer is required. Dependencies are pinned in `package-lock.json`.
@@ -31,7 +37,7 @@ flowchart TD
     L --> C["Related tasks retrieve nonmandatory source context"]
     K -->|Explicit proposed rule| P["Proposed rule with ID, revision and hash"]
     P --> H["Human reviews content, provenance and applicability"]
-    H --> T["Human runs coord approve rule in a protected terminal"]
+    H --> T["Protected human approval: current CLI fallback is coord approve rule"]
     T --> D{"Exact confirmation typed?"}
     D -->|No| N["Rule remains proposed"]
     D -->|Yes| B["Backend checks human authority, exact revision/hash and complete rule budget"]
@@ -42,7 +48,7 @@ flowchart TD
     S --> W["Update approved managed blocks; preserve human text outside them"]
 ```
 
-The human runs approval in a separate operator terminal; agents use the record, query and qualified synchronization surfaces. Approval does not synchronize files, update every checkout or automatically convert a lesson into a rule. `coord rules sync` is a separate operation for the current qualified participating session and preserves human-authored text outside its managed blocks.
+The diagram follows the currently implemented approval primitive. Its CLI fallback requires a separate operator terminal; the intended conversational adapter must preserve the same protected human decision without requiring manual command entry. Agents use the record, query and qualified synchronization surfaces. Approval does not synchronize files, update every checkout or automatically convert a lesson into a rule. `coord rules sync` is a separate operation for the current qualified participating session and preserves human-authored text outside its managed blocks.
 
 ## Implementation map
 
