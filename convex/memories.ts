@@ -19,18 +19,25 @@ export const record = mutation({ args: { ...runArgs, memoryId: v.string(), kind:
     return { memoryId: args.memoryId, revision: 1, hash, status };
   });
 } });
+/** Protected exact read: proposed rules are deliberately absent from approved-rule briefings. */
+export const ruleForApproval = query({ args: { ...identityArgs, memoryId: v.string() }, handler: async (ctx, args) => {
+  const { project } = await authenticate(ctx, args, ["human"]);
+  const memory = await ctx.db.query("memories").withIndex("by_stable_id", q => q.eq("id", args.memoryId)).unique();
+  if (!memory || memory.projectId !== project.id || memory.kind !== "rule") fail("NOT_FOUND", "Rule is unavailable in this project");
+  return { rule: memory, policyVersion: project.policyVersion };
+} });
 export const approveRule = mutation({ args: { ...identityArgs, memoryId: v.string(), revision: v.number(), hash: v.string() }, handler: async (ctx, args) => {
   const { actor, project } = await authenticate(ctx, args, ["human"]);
   return replay(ctx, actor, "memories.approveRule", args, async () => {
     const memory = await ctx.db.query("memories").withIndex("by_stable_id", q => q.eq("id", args.memoryId)).unique();
-    if (!memory || memory.projectId !== project.id || memory.kind !== "rule" || memory.status !== "proposed" || memory.hash !== args.hash || memory.revision !== args.revision) fail("FORBIDDEN", "Approval must bind the exact proposed rule revision/hash");
+    if (!memory || memory.projectId !== project.id || memory.kind !== "rule" || memory.status !== "proposed" || memory.hash !== args.hash || memory.revision !== args.revision || await digest(canonical({ kind: memory.kind, content: memory.content, sources: memory.sources, applicability: memory.applicability, confidence: memory.confidence })) !== args.hash) fail("FORBIDDEN", "Approval must bind the exact proposed rule revision/hash");
     const records = await ctx.db.query("memories").withIndex("by_project_kind_status", q => q.eq("projectId", project.id).eq("kind", "rule").eq("status", "active")).take(201);
     const approved = records.filter(r => r.kind === "rule" && r.status === "active");
     const result = boundedRecords([...approved, { ...memory, status: "active", approvedBy: actor.memberId, approvedHash: memory.hash, policyVersion: project.policyVersion + 1 }], 12 * 1024);
     if (records.length > 200 || !result.complete) fail("COVERAGE_INCOMPLETE", "Approved rules exceed bounded complete briefing capacity");
     const policyVersion = project.policyVersion + 1;
     await ctx.db.patch(memory._id, { status: "active", approvedBy: actor.memberId, approvedHash: memory.hash, policyVersion }); await ctx.db.patch(project._id, { policyVersion });
-    return { memoryId: memory.id, policyVersion, hash: memory.hash };
+    return { memoryId: memory.id, revision: memory.revision, policyVersion, hash: memory.hash, approvedBy: actor.memberId };
   });
 } });
 async function approvedRuleProjection(ctx: Pick<QueryCtx, "db">, project: Doc<"projects">) {

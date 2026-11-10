@@ -10,8 +10,9 @@ import { BackendFixture } from "./backend.fixture.js";
 import * as auth from "../convex/auth.js";
 import * as goals from "../convex/goals.js";
 import * as projects from "../convex/projects.js";
+import * as memories from "../convex/memories.js";
 import { bootstrapArguments, createBundle, parseSetupPlan } from "../src/onboarding.js";
-import { approveCapturePolicy, approveCommand, approveGoal, openOperatorSession } from "../src/approval.js";
+import { approveCapturePolicy, approveCommand, approveGoal, approveRule, openOperatorSession } from "../src/approval.js";
 import type { OperatorSession } from "../src/approval.js";
 import { captureDigest } from "../src/checkpoint.js";
 import { BackendClient } from "../src/client.js";
@@ -39,7 +40,7 @@ async function fixture() {
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-const handlers: Record<string, typeof auth.handshake> = { "auth:handshake": auth.handshake, "projects:status": projects.status as unknown as typeof auth.handshake, "goals:approve": goals.approve as unknown as typeof auth.handshake, "projects:configure": projects.configure as unknown as typeof auth.handshake };
+const handlers: Record<string, typeof auth.handshake> = { "memories:ruleForApproval": memories.ruleForApproval as unknown as typeof auth.handshake, "memories:approveRule": memories.approveRule as unknown as typeof auth.handshake, "auth:handshake": auth.handshake, "projects:status": projects.status as unknown as typeof auth.handshake, "goals:approve": goals.approve as unknown as typeof auth.handshake, "projects:configure": projects.configure as unknown as typeof auth.handshake };
 async function wire(f: Fixture, run: (calls: Array<{ path: string; args: Record<string, unknown> }>) => Promise<void>, reply: (path: string, value: Value) => Value = (_path, value) => value): Promise<void> {
   const original = globalThis.fetch, calls: Array<{ path: string; args: Record<string, unknown> }> = [];
   globalThis.fetch = async (input, init) => {
@@ -307,4 +308,137 @@ test("concurrent configuration changes are preserved and uncertain policy readba
       return { ...status, project: { ...status.project, capturePolicyDigest: "0".repeat(64) } };
     });
   } finally { console.log = log; await rm(f.directory, { recursive: true, force: true }); }
+});
+
+// Rule rows are synthetic proposed-memory fixtures; this slice exercises approval, not recording a live run.
+async function ruleInput(f: Fixture) {
+  const data = { kind: "rule" as const, content: "Prefer source-backed reuse \u001b[31m", sources: [{ taskId: "source_task", revision: "exact-source-revision", evidenceRef: "fixture-evidence" }], applicability: ["src"], confidence: "reviewed" };
+  const hash = await auth.digest(auth.canonical(data));
+  await f.backend.context().db.insert("memories", { ...data, id: "rule", projectId: "project", revision: 1, hash, status: "proposed" });
+  return { hash, argv: ["rule", "rule", "--plan", f.planPath, "--vault", f.vault, "--revision", "1", "--hash", hash], target: { memoryId: "rule", revision: 1, hash }, phrase: `approve rule project rule 1 ${hash}` };
+}
+
+test("rule approval displays exact provenance and preserves vault/plan; retries retain their recorded approver and policy version", async () => {
+  const f = await fixture(), input = await ruleInput(f), before = f.backend.find("projects", "project"), vault = await readFile(f.vault), plan = await readFile(f.planPath);
+  const printed: string[] = [], log = console.log;
+  console.log = (...values: unknown[]) => { printed.push(values.map(String).join(" ")); };
+  try {
+    await wire(f, async calls => {
+      const terminal = operator(input.phrase), prompt = terminal.io.prompt;
+      terminal.io.prompt = async (label, hidden) => {
+        if (!hidden) {
+          const shown = terminal.shown.join("");
+          for (const expected of [input.hash, "exact-source-revision", "fixture-evidence", '"applicability"', '"confidence"', "mandatory"]) assert(shown.includes(expected));
+          assert(!shown.includes("\u001b"));
+        }
+        return prompt(label, hidden);
+      };
+      await approveCommand(input.argv, terminal.io);
+      const stored = f.backend.find("memories", "rule"), project = f.backend.find("projects", "project");
+      const result = { memoryId: "rule", revision: 1, hash: input.hash, status: "active", approvedBy: stored.approvedBy, policyVersion: stored.policyVersion, mutated: true };
+      assert.deepEqual(JSON.parse(printed.at(-1)!), result);
+      assert.equal(stored.approvedBy, "human"); assert.equal(stored.approvedHash, input.hash);
+      assert.equal(project.policyVersion, before.policyVersion + 1); assert.equal(project.configVersion, before.configVersion);
+      const mutation = calls.find(call => call.path === "memories:approveRule")!;
+      assert.deepEqual({ memoryId: mutation.args.memoryId, revision: mutation.args.revision, hash: mutation.args.hash }, input.target);
+      const replay = operator(input.phrase);
+      await approveCommand(input.argv, replay.io);
+      assert.deepEqual(JSON.parse(printed.at(-1)!), { ...result, mutated: false });
+      assert.deepEqual(replay.asked.map(ask => ask.hidden), [true]);
+      assert.equal(calls.filter(call => call.path === "memories:approveRule").length, 1);
+      const owner = await openOperatorSession({ plan: f.planPath, vault: f.vault }, terminal.io), count = printed.length;
+      await assert.rejects(approveRule({ ...owner, plan: { ...owner.plan, humanId: "other-human" } }, input.target), error => (error as { code?: string }).code === "IDEMPOTENCY_CONFLICT");
+      assert.equal(printed.length, count); assert.equal(calls.filter(call => call.path === "memories:approveRule").length, 1);
+      assert.deepEqual(await readFile(f.vault), vault); assert.deepEqual(await readFile(f.planPath), plan);
+      for (const value of [...printed, ...terminal.shown, ...terminal.asked.map(ask => ask.label)]) assert(!value.includes(f.bundle.humanToken) && !value.includes(f.bundle.agentToken) && !value.includes(passphrase));
+    });
+  } finally { console.log = log; await rm(f.directory, { recursive: true, force: true }); }
+});
+
+test("wrong rule revision/hash, altered content and declined confirmation never approve", async () => {
+  const f = await fixture(), input = await ruleInput(f);
+  try {
+    await wire(f, async calls => {
+      const terminal = operator(input.phrase);
+      for (const argv of [input.argv.map((value, index) => index === 7 ? "2" : value), [...input.argv.slice(0, -1), "0".repeat(64)]]) {
+        await assert.rejects(approveCommand(argv, terminal.io), /do not bind this exact rule/);
+      }
+      const row = f.backend.find("memories", "rule");
+      await f.backend.context().db.patch(row._id, { content: "Changed after hashing" });
+      await assert.rejects(approveCommand(input.argv, terminal.io), /do not bind this exact rule/);
+      assert.deepEqual(terminal.shown, []); assert(terminal.asked.every(ask => ask.hidden));
+      await f.backend.context().db.patch(row._id, { content: row.content });
+      await assert.rejects(approveCommand(input.argv, operator("no").io), /confirmation did not match/);
+      assert.equal(calls.filter(call => call.path === "memories:approveRule").length, 0);
+      assert.equal(f.backend.find("memories", "rule").status, "proposed");
+    });
+  } finally { await rm(f.directory, { recursive: true, force: true }); }
+});
+
+test("nonhuman credentials cannot read rules for approval or approve them and errors withhold credentials", async () => {
+  const f = await fixture(), input = await ruleInput(f);
+  try {
+    await wire(f, async calls => {
+      const client = new BackendClient(f.plan.config, f.bundle.agentToken), terminal = operator(input.phrase);
+      const session: OperatorSession = { plan: f.plan, client, status: {}, write: terminal.io.write, prompt: terminal.io.prompt };
+      await assert.rejects(approveRule(session, input.target), error => {
+        assert.equal((error as { code?: string }).code, "FORBIDDEN");
+        assert(!String(error).includes(f.bundle.agentToken) && !String(error).includes(f.bundle.humanToken)); return true;
+      });
+      await assert.rejects(f.backend.call(memories.approveRule, { ...request(f.bundle.agentToken), ...input.target }), error => (error as { data?: { code?: string } }).data?.code === "FORBIDDEN");
+      assert.equal(calls.filter(call => call.path === "memories:approveRule").length, 0); assert.deepEqual(terminal.shown, []);
+      assert.equal(f.backend.find("memories", "rule").status, "proposed");
+    });
+  } finally { await rm(f.directory, { recursive: true, force: true }); }
+});
+
+test("a changed proposed rule and an oversized complete rule set fail without promotion or policy-version churn", async () => {
+  const f = await fixture(), input = await ruleInput(f), before = f.backend.find("projects", "project");
+  try {
+    await wire(f, async calls => {
+      const terminal = operator(input.phrase), prompt = terminal.io.prompt, row = f.backend.find("memories", "rule");
+      terminal.io.prompt = async (label, hidden) => {
+        if (!hidden) await f.backend.context().db.patch(row._id, { revision: 2 });
+        return prompt(label, hidden);
+      };
+      await assert.rejects(approveCommand(input.argv, terminal.io), error => (error as { code?: string }).code === "FORBIDDEN");
+      assert.equal(f.backend.find("memories", "rule").status, "proposed");
+      await f.backend.context().db.patch(row._id, { revision: 1 });
+      for (let index = 0; index < 3; index++) {
+        const { _id: _id, _creationTime: _created, ...data } = row;
+        const large = { kind: data.kind, content: "x".repeat(4096), sources: data.sources, applicability: data.applicability, confidence: data.confidence }, hash = captureDigest(large);
+        await f.backend.context().db.insert("memories", { ...data, ...large, id: `large_${index}`, hash, status: "active", approvedBy: "human", approvedHash: hash, policyVersion: 1 });
+      }
+      await assert.rejects(approveCommand(input.argv, operator(input.phrase).io), error => (error as { code?: string }).code === "COVERAGE_INCOMPLETE");
+      assert.equal(calls.filter(call => call.path === "memories:approveRule").length, 2);
+      assert.equal(f.backend.find("memories", "rule").status, "proposed"); assert.deepEqual(f.backend.find("projects", "project"), before);
+    });
+  } finally { await rm(f.directory, { recursive: true, force: true }); }
+});
+
+test("an applied rule approval with incomplete reply or conflicting readback prints no success", async () => {
+  const printed: string[] = [], log = console.log;
+  console.log = (...values: unknown[]) => { printed.push(values.map(String).join(" ")); };
+  try {
+    for (const corrupt of ["reply", "readback"]) {
+      const f = await fixture(), input = await ruleInput(f);
+      try {
+        await wire(f, async () => {
+          const before = printed.length;
+          await assert.rejects(approveCommand(input.argv, operator(input.phrase).io), error => ["BLOCKED_ENV", "IDEMPOTENCY_CONFLICT"].includes((error as { code: string }).code));
+          assert.equal(printed.length, before);
+          assert.equal(f.backend.find("memories", "rule").status, "active", "an uncertain response does not undo an applied approval");
+        }, (path, value) => {
+          if (corrupt === "reply" && path === "memories:approveRule") {
+            const { approvedBy: _approvedBy, ...rest } = value as Record<string, Value>; return rest;
+          }
+          if (corrupt === "readback" && path === "memories:ruleForApproval") {
+            const result = value as { rule: Record<string, Value> };
+            if (result.rule.status === "active") return { ...result, rule: { ...result.rule, approvedBy: "other-human" } };
+          }
+          return value;
+        });
+      } finally { await rm(f.directory, { recursive: true, force: true }); }
+    }
+  } finally { console.log = log; }
 });

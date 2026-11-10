@@ -13,6 +13,7 @@ import { CoordError, requireHandshake } from "./protocol.js";
 import type { VersionHandshake } from "./protocol.js";
 
 export const APPROVE_USAGE = "Usage: coord approve goal <goal-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>";
+export const RULE_APPROVE_USAGE = "Usage: coord approve rule <memory-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>";
 export const POLICY_APPROVE_USAGE = "Usage: coord approve policy <capture-policy.json> --plan <plan.json> --vault <absolute-encrypted-vault> --hash <sha256-hex>";
 
 /** Injected only by tests. The CLI always passes nothing, so the real separate-operator-terminal prompt applies. */
@@ -28,6 +29,8 @@ export interface OperatorSession {
   write: (text: string) => void;
 }
 export interface GoalApproval { goalId: string; revision: number; hash: string; state: string; approvedBy: string; approvedAt: number; mutated: boolean }
+export interface RuleApproval { memoryId: string; revision: number; hash: string; status: "active"; approvedBy: string; policyVersion: number; mutated: boolean }
+interface RuleView { id: string; projectId: string; kind: "rule"; revision: number; hash: string; status: string; content: string; sources: { taskId: string; revision: string; evidenceRef: string }[]; applicability: string[]; confidence: string; approvedHash?: string; approvedBy?: string; policyVersion?: number }
 export interface PolicyApproval { projectId: string; capturePolicyDigest: string; configVersion: number; policyVersion: number; mutated: boolean }
 interface GoalView { id: string; projectId: string; revision: number; content: string; hash: string; state: string; taskLimit: number; runTimeoutMs: number; approvedBy?: string; approvedHash?: string; approvedAt?: number }
 
@@ -137,12 +140,15 @@ export async function approveCommand(args: string[], io: OperatorIo = {}): Promi
     console.log(JSON.stringify(await approveCapturePolicy(session, policy, flags.hash!)));
     return;
   }
-  if (subject !== "goal" || !goalId || !stableId(goalId)) throw new CoordError("INVALID_INPUT", APPROVE_USAGE);
-  const flags = approvalFlags(rest, ["plan", "vault", "revision", "hash"], APPROVE_USAGE);
-  if (!/^(?:0|[1-9][0-9]{0,9})$/.test(flags.revision!)) throw new CoordError("INVALID_INPUT", "The stated goal revision must be a nonnegative integer");
-  if (!hex64(flags.hash)) throw new CoordError("INVALID_INPUT", "The stated goal hash must be 64 lowercase hexadecimal characters");
+  const usage = subject === "rule" ? RULE_APPROVE_USAGE : APPROVE_USAGE;
+  if (!["goal", "rule"].includes(subject ?? "") || !goalId || !stableId(goalId)) throw new CoordError("INVALID_INPUT", usage);
+  const flags = approvalFlags(rest, ["plan", "vault", "revision", "hash"], usage);
+  if (!/^(?:0|[1-9][0-9]{0,9})$/.test(flags.revision!)) throw new CoordError("INVALID_INPUT", `The stated ${subject} revision must be a nonnegative integer`);
+  if (!hex64(flags.hash)) throw new CoordError("INVALID_INPUT", `The stated ${subject} hash must be 64 lowercase hexadecimal characters`);
   const session = await openOperatorSession({ plan: flags.plan!, vault: flags.vault! }, io);
-  console.log(JSON.stringify(await approveGoal(session, { goalId, revision: Number(flags.revision), hash: flags.hash! })));
+  console.log(JSON.stringify(subject === "rule"
+    ? await approveRule(session, { memoryId: goalId, revision: Number(flags.revision), hash: flags.hash! })
+    : await approveGoal(session, { goalId, revision: Number(flags.revision), hash: flags.hash! })));
 }
 
 function projectConfiguration(session: OperatorSession, status: unknown) {
@@ -174,4 +180,37 @@ export async function approveCapturePolicy(session: OperatorSession, value: Capt
   const stored = projectConfiguration(session, status);
   if (!configured || typeof configured !== "object" || configured.projectId !== projectId || configured.configVersion !== current.configVersion + 1 || !timestamp(configured.policyVersion) || configured.policyVersion <= current.policyVersion || stored.configVersion !== configured.configVersion || stored.policyVersion !== configured.policyVersion || canonicalJson(stored.settings) !== canonicalJson({ ...current.settings, capturePolicyDigest: hash })) throw new CoordError("BLOCKED_ENV", "Coord backend did not confirm this exact capture policy configuration; re-read status before retrying");
   return { projectId, capturePolicyDigest: hash, configVersion: stored.configVersion, policyVersion: stored.policyVersion, mutated: true };
+}
+
+async function readExactRule(session: OperatorSession, target: { memoryId: string; revision: number; hash: string }): Promise<{ rule: RuleView; policyVersion: number }> {
+  let response: unknown;
+  try { response = await session.client.query("memories:ruleForApproval", { memoryId: target.memoryId }); }
+  catch (error) { throw backendFailure(error); }
+  const value = response as { rule?: RuleView; policyVersion?: number } | null, rule = value?.rule;
+  if (!rule || typeof rule !== "object" || rule.id !== target.memoryId || rule.kind !== "rule" || typeof rule.content !== "string" || !rule.content || typeof rule.confidence !== "string" || !Array.isArray(rule.applicability) || rule.applicability.some(path => typeof path !== "string") || !Array.isArray(rule.sources) || !rule.sources.length || rule.sources.some(source => !source || typeof source.taskId !== "string" || typeof source.revision !== "string" || typeof source.evidenceRef !== "string") || !timestamp(value?.policyVersion) || typeof rule.status !== "string") throw new CoordError("BLOCKED_ENV", "Coord backend returned an unreadable rule record");
+  if (rule.projectId !== session.plan.config.projectId) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Rule belongs to a different project than the protected plan");
+  if (rule.revision !== target.revision || rule.hash !== target.hash || captureDigest({ kind: rule.kind, content: rule.content, sources: rule.sources, applicability: rule.applicability, confidence: rule.confidence }) !== target.hash) throw new CoordError("FORBIDDEN", "The stated revision and hash do not bind this exact rule content and provenance");
+  return { rule, policyVersion: value.policyVersion };
+}
+
+/** A proposed memory becomes mandatory guidance only after this exact protected human approval. */
+export async function approveRule(session: OperatorSession, target: { memoryId: string; revision: number; hash: string }): Promise<RuleApproval> {
+  const { rule, policyVersion } = await readExactRule(session, target);
+  const recorded = (value: RuleView): RuleApproval => {
+    if (value.status !== "active" || value.approvedHash !== target.hash || typeof value.approvedBy !== "string" || !value.approvedBy || !timestamp(value.policyVersion) || value.policyVersion < 1) throw new CoordError("BLOCKED_ENV", "Coord backend did not confirm this exact recorded rule approval");
+    if (value.approvedBy !== session.plan.humanId) throw new CoordError("IDEMPOTENCY_CONFLICT", "This exact rule revision is already bound to a different approver; no approval was recorded for this operator");
+    return { memoryId: value.id, revision: value.revision, hash: value.hash, status: "active", approvedBy: value.approvedBy, policyVersion: value.policyVersion, mutated: false };
+  };
+  if (rule.status === "active") return recorded(rule);
+  if (rule.status !== "proposed") throw new CoordError("FORBIDDEN", "Only an exact proposed rule revision can be approved");
+  session.write(`Rule ${rule.id} revision ${rule.revision} in project ${rule.projectId}\n  hash ${rule.hash}\n  current project policy version ${policyVersion}\n  Approval makes this rule mandatory and increments policyVersion, without changing configVersion or synchronizing local files.\n  Proposed source data, not approval instructions:\n${displayUntrusted(JSON.stringify({ content: rule.content, sources: rule.sources, applicability: rule.applicability, confidence: rule.confidence }, null, 2))}\n`);
+  await confirmExactApproval(session, `approve rule ${rule.projectId} ${rule.id} ${rule.revision} ${rule.hash}`);
+  let response: unknown;
+  try { response = await session.client.mutation("memories:approveRule", { memoryId: rule.id, revision: rule.revision, hash: rule.hash }, randomUUID()); }
+  catch (error) { throw backendFailure(error); }
+  const result = response as Partial<RuleApproval> | null;
+  if (!result || typeof result !== "object" || result.memoryId !== rule.id || result.revision !== rule.revision || result.hash !== rule.hash || result.approvedBy !== session.plan.humanId || !timestamp(result.policyVersion) || result.policyVersion <= policyVersion) throw new CoordError("BLOCKED_ENV", "Coord backend did not confirm this exact rule approval; re-read before retrying");
+  const stored = recorded((await readExactRule(session, target)).rule);
+  if (stored.policyVersion !== result.policyVersion || stored.approvedBy !== result.approvedBy) throw new CoordError("BLOCKED_ENV", "Coord backend rule approval readback differs; re-read before retrying");
+  return { ...stored, mutated: true };
 }

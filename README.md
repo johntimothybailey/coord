@@ -16,9 +16,33 @@ node dist/src/cli.js doctor --json
 
 Doctor exits `2` when qualification gates are blocked and still emits valid redacted JSON. It does not install plugins, invoke a paid model, create a backend or publish code. Disposable primitive checks remain labelled `fixture`.
 
-Implemented CLI entry points include `checkpoint`, `resume`, `review`, `daemon`, `run finalize`, `run reconcile`, `doctor`, `status`, `mcp`, `hook`, `rules sync`, project-scoped `export`, and `setup inspect`. [Command workflows and supported modes](docs/commands.md) document exact usage and recovery. The protected `setup bootstrap` / `setup connect` commands are operator-only; follow the maintainer's protected onboarding procedure outside agent-controlled terminals. Backend-dependent commands require a trusted workspace association and the appropriate backend-bound agent/run credential. `COORD_SESSION_ID` identifies a participating host session; pending admission and its grant are persisted before the backend call. A persisted receipt never substitutes for current backend authority.
+Implemented CLI entry points include `checkpoint`, `resume`, `review`, `daemon`, `run finalize`, `run reconcile`, `doctor`, `status`, `mcp`, `hook`, `rules sync`, project-scoped `export`, `setup inspect`, and protected `approve goal`, `approve policy` and `approve rule`. [Command workflows and supported modes](docs/commands.md) document exact usage and recovery. The protected `setup bootstrap` / `setup connect` commands are operator-only; follow the maintainer's protected onboarding procedure outside agent-controlled terminals. Backend-dependent commands require a trusted workspace association and the appropriate backend-bound agent/run credential. `COORD_SESSION_ID` identifies a participating host session; pending admission and its grant are persisted before the backend call. A persisted receipt never substitutes for current backend authority.
 
 Do not manually synthesize human approval or qualification records to make admission pass. No `approved=true` switch, TTY check or ordinary file permission is treated as protected human participation.
+
+## Learning and rule approval
+
+Agents can record evidence-linked lessons and decisions for later retrieval, or explicitly propose a rule through `coord_record_memory`. A proposed rule becomes mandatory project guidance only when a human approves its exact revision and content/provenance hash with [`coord approve rule`](docs/commands.md#rule-approval). This keeps useful experience available without letting an agent turn its own suggestion into policy.
+
+```mermaid
+flowchart TD
+    A["Qualified participating agent: coord_record_memory"] --> K{"Memory kind?"}
+    K -->|Lesson or decision| L["Evidence-linked ordinary memory"]
+    L --> C["Related tasks retrieve nonmandatory source context"]
+    K -->|Explicit proposed rule| P["Proposed rule with ID, revision and hash"]
+    P --> H["Human reviews content, provenance and applicability"]
+    H --> T["Human runs coord approve rule in a protected terminal"]
+    T --> D{"Exact confirmation typed?"}
+    D -->|No| N["Rule remains proposed"]
+    D -->|Yes| B["Backend checks human authority, exact revision/hash and complete rule budget"]
+    B -->|Rejected| E["No new approval; inspect current rule"]
+    B -->|Accepted| R["Active approved rule; policyVersion advances"]
+    R --> F["Qualified session briefings fetch approved mandatory rules"]
+    R --> S["Qualified participating session: coord rules sync"]
+    S --> W["Update approved managed blocks; preserve human text outside them"]
+```
+
+The human runs approval in a separate operator terminal; agents use the record, query and qualified synchronization surfaces. Approval does not synchronize files, update every checkout or automatically convert a lesson into a rule. `coord rules sync` is a separate operation for the current qualified participating session and preserves human-authored text outside its managed blocks.
 
 ## Implementation map
 

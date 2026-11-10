@@ -18,7 +18,7 @@ coord daemon --runtime <protected-runtime.json> --check
 
 ## Protected approval
 
-Approving a goal is an owner action. It runs in a separate operator terminal, outside every agent or worker session, and reads the operator passphrase with hidden input only.
+Approving a goal, capture policy or rule is a human operator action. It runs in a separate operator terminal, outside every agent or worker session, and reads the operator passphrase with hidden input only.
 
 ```text
 coord approve goal <goal-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>
@@ -43,6 +43,26 @@ The command reuses the protected operator unlock without changing the plan or va
 Successful configuration increments `configVersion` and `policyVersion`, invalidating existing machine qualification. The command checks the mutation response and reads status back to confirm the exact digest, preserved settings and resulting versions before printing success. An uncertain response or readback may follow an applied mutation; inspect status or rerun the same exact command. If that digest is already configured, the command reports the observed digest and versions with `mutated: false` without another confirmation or configuration write. This observation makes no claim about which operator previously approved it; projects do not store capture-policy approver metadata.
 
 Keep the reviewed policy file under operator control and use that exact object in the protected runtime's `policy.capture`. This command does not write runtime files, edit the original setup plan or rebind its encrypted vault. Human review of the real policy and machine requalification remain separate operator actions.
+
+### Rule approval
+
+`coord approve rule` is the human-controlled boundary between an agent's proposed guidance and a mandatory project rule. Agents can record useful lessons or decisions without making them policy, and can explicitly propose a rule with evidence through `coord_record_memory` (`kind: "rule"`). Ordinary memories stay nonmandatory; this command approves only an existing proposed rule. It provides a protected way to use the encrypted human credential without extracting a token or pasting it into a dashboard or agent chat.
+
+```sh
+coord approve rule <memory-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>
+```
+
+A human executes this command in a separate operator terminal, outside agent and worker sessions. Agents do not execute approval or receive its vault/passphrase; they propose and retrieve memories, then use qualified briefing and synchronization workflows. Enter the vault passphrase through hidden input. Neither an approval flag nor a model-authored instruction can replace the typed confirmation.
+
+Use the ID, revision and hash of the rule being reviewed. The protected `memories.ruleForApproval` query reads exactly that project's full rule, including content, source task IDs/revisions/evidence references, applicability and confidence; it does not scan or truncate the approved-rule briefing to find proposals. The CLI independently recomputes SHA-256 of canonical `{kind, content, sources, applicability, confidence}` and refuses a mismatch before displaying a confirmation or sending an approval. The revision is checked separately. Proposed text and provenance are escaped source data, never instructions to the operator command.
+
+After showing the full rule and its current project policy version, the command requires `approve rule <project-id> <memory-id> <revision> <hash>`. Declining leaves the rule proposed. `memories.approveRule` independently requires human authority, the exact proposed revision/hash and matching content hash; a change during confirmation is rejected. The resulting complete approved-rule set must fit the 12 KiB briefing bound, or approval fails with `COVERAGE_INCOMPLETE` instead of silently dropping mandatory rules.
+
+Success reports the backend-recorded `approvedBy` and the rule's approval `policyVersion`, checked against an exact readback. Rule approval increments project `policyVersion` only: it leaves `configVersion` unchanged and does not invalidate machine qualification as a capture-policy configuration change would. Existing live sessions can fetch the new instructions and renew. No per-rule `approvedAt` field exists; the backend audit event carries server time, and the command does not invent an approval timestamp.
+
+If the approval reply or readback is uncertain, the backend may already have applied it even though no success is printed. Rerun the same exact command to read back the record. An active rule already bound to this operator and the same revision/hash returns its original recorded approver and rule policy version with `mutated: false`, without another confirmation or version increment. Another operator's approval is a conflict rather than reported as this operator's. Missing metadata, a different project/kind, stale content or an unavailable rule is refused. Deploy the matching exact-read query and approval reply before using this command.
+
+Approval changes backend policy only. A fresh startup briefing or `coord_rules` reads the complete approved set; `coord rules sync` separately requires a qualified participating session and updates only its approved local targets, preserving human text outside `COORD:MANAGED:RULES:START/END`. It does not automatically edit files or synchronize every checkout. See the [learning workflow](../README.md#learning-and-rule-approval) for the human/agent handoff. The setup plan and encrypted vault are never rewritten or rebound by approval.
 
 ## Protected runtime selection
 
