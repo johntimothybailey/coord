@@ -20,6 +20,7 @@ export interface SetupPlan {
   policy: { allowedPaths: string[]; excludedPaths: string[]; sharingApproved: boolean; capacity: number; taskCap: number; capturePolicyDigest?: string; };
 }
 interface Bundle { schemaVersion: 1; planDigest: string; humanToken: string; agentToken: string; configureRequestId: string; vaultDigest?: string; }
+export interface RecoveredOperatorBundle { schemaVersion: 2; purpose: "operator-recovery"; planDigest: string; humanToken: string; recoveryId: string; credentialId: string; replacedCredentialId: string; expiresAt: number; vaultDigest?: string; }
 interface ProjectView extends WorkspaceConfig { allowedPaths: string[]; excludedPaths: string[]; sharingApproved: boolean; capacity: number; taskCap: number; capturePolicyDigest?: string; }
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
 export const planDigest = (plan: SetupPlan): string => digest(canonicalJson(plan));
@@ -59,6 +60,17 @@ export async function unlockBundle(plan: SetupPlan, vaultPath: string, passphras
   plan = snapshotPlan(plan);
   const encoded = await readSmallFile(vaultPath, true);
   return { ...validateBundle(plan, await decryptVault(encoded, passphrase, binding(plan))), vaultDigest: digest(encoded) };
+}
+export function validateRecoveredOperatorBundle(plan: SetupPlan, value: unknown): RecoveredOperatorBundle {
+  const bundle = record(value);
+  exactKeys(bundle, ["schemaVersion", "purpose", "planDigest", "humanToken", "recoveryId", "credentialId", "replacedCredentialId", "expiresAt"]);
+  if (bundle.schemaVersion !== 2 || bundle.purpose !== "operator-recovery" || bundle.planDigest !== planDigest(plan) || typeof bundle.humanToken !== "string" || !/^[a-f0-9]{64}$/.test(bundle.humanToken) || ![bundle.recoveryId, bundle.credentialId, bundle.replacedCredentialId].every(id => typeof id === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(id)) || bundle.credentialId !== `recovered_${bundle.recoveryId}` || bundle.credentialId === bundle.replacedCredentialId || bundle.expiresAt !== plan.credentialExpiresAt) invalid();
+  return bundle as unknown as RecoveredOperatorBundle;
+}
+/** Approval-only unlock accepts recovered human authority; setup connect/bootstrap still require the original two-token format. */
+export async function unlockOperatorBundle(plan: SetupPlan, vaultPath: string, passphrase: string): Promise<{ humanToken: string }> {
+  const value = await decryptVault(await readSmallFile(vaultPath, true), passphrase, binding(plan));
+  return record(value).schemaVersion === 2 ? validateRecoveredOperatorBundle(plan, value) : validateBundle(plan, value);
 }
 export async function createBundle(plan: SetupPlan, vaultPath: string, passphrase: string): Promise<Bundle> {
   plan = snapshotPlan(plan);
@@ -189,9 +201,12 @@ export async function readProtectedLine(input: typeof process.stdin, write: (tex
   });
 }
 /** The only protected operator input path: a real separate operator terminal, never an argument or environment value. */
-export async function promptProtected(label: string, hidden: boolean): Promise<string> {
+export function requireProtectedTerminal(): void {
   // TTY is an input capability check only. It never certifies human presence or a qualified host.
   if (!process.stdin.isTTY || !process.stderr.isTTY || process.env.COORD_LAUNCH_ID || process.env.COORD_SESSION_ID) throw new CoordError("NEEDS_HUMAN", "Run protected setup in your separate operator terminal, outside every agent/worker session");
+}
+export async function promptProtected(label: string, hidden: boolean): Promise<string> {
+  requireProtectedTerminal();
   process.stderr.write(label);
   return readProtectedLine(process.stdin, text => { process.stderr.write(text); }, hidden);
 }

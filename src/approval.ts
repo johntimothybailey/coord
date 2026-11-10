@@ -7,7 +7,7 @@ import type { CapturePolicy } from "./checkpoint.js";
 import { parseCapturePolicy } from "./command-runtime.js";
 import { readSmallFile } from "./credentials.js";
 import { backendFailure } from "./hooks.js";
-import { inspectPlan, parseSetupPlan, promptProtected, unlockBundle, verifyProject } from "./onboarding.js";
+import { inspectPlan, parseSetupPlan, promptProtected, unlockOperatorBundle, verifyProject } from "./onboarding.js";
 import type { SetupPlan } from "./onboarding.js";
 import { CoordError, requireHandshake } from "./protocol.js";
 import type { VersionHandshake } from "./protocol.js";
@@ -63,7 +63,7 @@ export async function openOperatorSession(selection: { plan: string; vault: stri
   const plan = parseSetupPlan(JSON.parse(await readSmallFile(selection.plan)));
   await inspectPlan(plan);
   // Unlock only: the vault keeps its existing binding and is never rewritten by an approval.
-  const bundle = await unlockBundle(plan, selection.vault, await prompt("Vault passphrase (not cached): ", true));
+  const bundle = await unlockOperatorBundle(plan, selection.vault, await prompt("Vault passphrase (not cached): ", true));
   const client = new BackendClient(plan.config, bundle.humanToken);
   try {
     requireHandshake(await client.query("auth:handshake") as VersionHandshake);

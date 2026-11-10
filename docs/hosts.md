@@ -18,6 +18,8 @@ The maintainer's redacted capability ledger separates host-command support from 
 
 ## Conversational workflows and human confirmation
 
+Lost operator access starts with a conversational recovery request. The agent explains [protected owner recovery](commands.md#lost-operator-passphrase-protected-recovery), preserves the enrollment/approval continuation, and leaves account authentication, new passphrase input and exact credential replacement to the human in an external protected terminal. No host tool receives the vault, replacement token or owner credentials. This fallback requires existing deployment-owner/admin authority and does not qualify that account or host isolation.
+
 Every Coord workflow is intended to start in the host conversation through a plugin/skill and typed tools. The CLI is a supporting interface for automation, diagnosis and terminal fallback. This applies to setup, status, goals, tasks, learning, approvals, pause/resume, checkpoints, review, membership and backend operations. Each conversational action must retain the same backend permissions, exact-revision checks and recovery behavior as its underlying operation. Current plugin support is partial: rule/lesson review and expiring rule approval-request tools/skill are implemented, with passkey-backed human completion through the protected HTTPS page. Actual host delivery and physical authenticator qualification require separate evidence.
 
 The host-support check separates four kinds of evidence: vendor documentation, installed interfaces, an actually negotiated/displayed interaction, and qualification of the protected human decision plus credential isolation. These are not interchangeable.

@@ -53,6 +53,9 @@ flowchart TD
     AR --> RQ["Expiring pending request; no approval authority"]
     RQ --> SC["Inspect or cancel request in chat"]
     RQ --> AA["Passkey authentication in protected HTTPS view"]
+    O["Lost operator passphrase: ask chat for protected recovery"] --> OO["Human owner: new vault, exact credential replacement"]
+    OO --> EN["Human enrolls a new passkey; old credential stays revoked"]
+    EN --> AA
     AA --> RV["Review exact rule, provenance, routing and expiry"]
     RV --> HD{"Human decision"}
     HD -->|Approve| PV["Fresh passkey assertion bound to exact request"]
@@ -70,7 +73,7 @@ flowchart TD
     S --> W["Update approved managed blocks; preserve human text outside them"]
 ```
 
-The diagram includes the complete chat/passkey workflow and existing protected CLI fallback. Enrollment is a one-time operator action; routine approvals require no command entry. Real host delivery and physical authenticator behavior still require evidence on the selected configuration; software fixture signatures do not qualify a device. The CLI fallback requires a separate operator terminal. Agents use the record, query and qualified synchronization surfaces. Approval does not synchronize files, update every checkout or automatically convert a lesson into a rule. `coord rules sync` is a separate operation for the current qualified participating session and preserves human-authored text outside its managed blocks.
+The diagram includes the complete chat/passkey workflow and existing protected CLI fallback. Enrollment is a one-time operator action; routine approvals require no command entry. If the vault passphrase is unavailable, [protected owner recovery](docs/commands.md#lost-operator-passphrase-protected-recovery) creates a separate human-only vault and revokes the selected old credential without resetting the project. Real host delivery and physical authenticator behavior still require evidence on the selected configuration; software fixture signatures do not qualify a device. The CLI fallback requires a separate operator terminal. Agents use the record, query and qualified synchronization surfaces. Approval does not synchronize files, update every checkout or automatically convert a lesson into a rule. `coord rules sync` is a separate operation for the current qualified participating session and preserves human-authored text outside its managed blocks.
 
 ## Implementation map
 

@@ -85,6 +85,30 @@ Revocation/expiry of the underlying human credential also disables its passkeys.
 
 Deploy the matching backend and reconnect upgraded MCP sessions. The HTTP origin comes from the fixed server `CONVEX_SITE_URL`; normal cloud project connections map their `.convex.cloud` API to the paired `.convex.site` page. Arbitrary origins and non-cloud backends are refused. No separate hosting account or service is required. Protected HTML and private JSON responses use no-store, same-origin POST checks, a restrictive CSP and escaped text-only source rendering. Public JavaScript/CSS may be CDN-cached; the HTML references content-hashed URLs with matching integrity checks so stale bytes cannot silently replace its expected UI code. The CLI fallback performs an independent protected approval and does not fulfill these requests. Request history is retained; pruning/volume policy remains deferred. Software test authenticators exercise the end-to-end protocol but do not substitute for live user/device enrollment evidence.
 
+### Lost operator passphrase: protected recovery
+
+Ask “help me recover operator access” in chat. The agent checks the nonsecret project binding and explains the protected human step, then resumes the interrupted enrollment or approval workflow. It never opens the old vault, searches for credentials, runs owner recovery, supplies authentication or treats a chat answer as recovery authority. First check your own password manager privately, or ask another authorized human operator for help. The encrypted vault has no passphrase-reset or recovery key.
+
+If the passphrase is unavailable, a human who can authenticate as the **existing deployment owner/admin** can replace the selected human credential through this supporting command in an external protected terminal:
+
+```text
+coord setup recover-operator <plan.json> <NEW-absolute-vault> --replace <public-old-human-credential-id>
+```
+
+This is needed because bootstrap cannot reset an existing project and ordinary revocation/invitation requires working human authority. The CLI shows exact project/routing, old credential ID, member, expiry and plan digest, plus the revocation effect. Review them and type the displayed exact recovery phrase. Enter a new passphrase twice through hidden input and save it privately. The official Convex CLI handles deployment-owner authentication; do not pass owner keys, passphrases or tokens in arguments, environment values, chat or agent terminals.
+
+Create mode refuses an existing destination without reading it. Use a genuinely new path; the lost vault stays unchanged. Before calling the backend, recovery exclusively creates and fsyncs the new encrypted **human-only** vault with a fresh token and stable recovery ID. Only its digest and public binding reach the owner CLI. The internal owner-only transaction creates a new credential ID for the same member and single-project scope and revokes the selected old credential atomically. Existing passkeys/enrollments linked to the old credential cease to authorize actions. It changes no project policy, approvals, configuration, agent credential or workspace routing. It cannot extend a still-valid grant; reauthorization of expired scope is displayed explicitly with the reviewed new expiry.
+
+Cancel before the remote call to make no backend change. If the reply is lost or uncertain, preserve the new recovery vault and retry the **same** plan, path, old ID and operation, adding `--retry`:
+
+```text
+coord setup recover-operator <plan.json> <same-recovery-vault> --replace <same-old-human-credential-id> --retry
+```
+
+Only explicit retry opens the newly created recovery vault, asks for its new passphrase and reuses its exact stored recovery/token binding. A mismatch, changed routing, conflicting operation, later revocation or expired replacement is refused; retries never revive authority or silently issue another token. Recovery outputs only the recorded public IDs, scope, expiry and server time. An uncertain result is not a rollback. Keep both vaults and inspect/retry through the protected human facility; do not delete the old vault, reset bootstrap or edit backend credential rows.
+
+Use the new recovery vault for `setup passkey` and protected approvals, then resume the original chat review and approval request. It intentionally contains no agent token and is refused by `setup bootstrap` and `setup connect`; existing agent access is preserved. Without deployment-owner/admin access or another working authorized human, this path is blocked on human account recovery. Software tests do not qualify owner-account, terminal or browser isolation.
+
 ## No-effect host confirmation check
 
 Ask “test confirmation” or “check this host's confirmation dialog.” The existing skill calls `coord_confirmation_probe` with no arguments. The tool prepares a synthetic project, `no_effect_check` action, revision, fresh public nonce and canonical hash; none refers to a real goal, rule or project. If the client advertises form elicitation, the default probe requests a form asking for that public nonce. Enter the nonce to test Accept; do not type `decline` or `cancel` into the nonce field. Those words are data, not protocol actions. Never enter a secret or let the agent answer for the user.
