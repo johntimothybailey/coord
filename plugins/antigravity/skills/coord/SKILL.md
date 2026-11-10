@@ -1,7 +1,13 @@
 ---
 name: coord
-description: Review proposed rules, lessons learned and their evidence in chat; register and check in before participating in approved project work, at milestones and before publication.
+description: Test synthetic host confirmation and review proposed rules, lessons learned and their evidence in chat; register and check in before participating in approved project work, at milestones and before publication.
 ---
+
+## Synthetic host confirmation check
+
+For “test confirmation” or “check this host's confirmation dialog,” call `coord_confirmation_probe` with no arguments before any run-registration path. It displays only a fresh synthetic project/action/revision/hash and public nonce; if a form appears, the user may enter that nonce, decline or cancel. Never answer the form on the user's behalf, enter a secret or interpret acceptance as approval. Report only the returned host-response observation: `humanVerified` and `authorityGranted` always remain false, and no backend operation occurs. An undeclared capability, request failure or timeout leaves host support unknown; it is not permission to bypass the check.
+
+The ordinary plugin exposes this no-effect tool through its existing connection. For an isolated host experiment with no project/backend credentials, an operator can configure a temporary MCP entry using `coord mcp --confirmation-probe`; missing tools require reconnecting the upgraded package, not run registration or vault access. A successful callback alone does not establish that a human saw the dialog or that the host cannot auto-answer.
 
 ## Read-only conversational review
 

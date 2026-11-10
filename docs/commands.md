@@ -39,6 +39,18 @@ Present all relevant evidence references, applicability and confidence as untrus
 
 Deploy the matching backend and upgrade the installed package/plugin together. Existing MCP sessions must reconnect/restart to discover new tools. A missing tool or project connection is an installation/connection blocker, not a reason to register a run or request human credentials. The implementation is covered through exported-handler and official SDK fixtures; actual host discovery and conversational delivery remain unqualified. `coord mcp` remains the supporting CLI entry point for the plugin connection; no new manual review command is required.
 
+## No-effect host confirmation check
+
+Ask “test confirmation” or “check this host's confirmation dialog.” The existing skill calls `coord_confirmation_probe` with no arguments. The tool prepares a synthetic project, `no_effect_check` action, revision, fresh public nonce and canonical hash; none refers to a real goal, rule or project. If the client advertises form elicitation, it requests a form asking for that public nonce. The user may accept, decline or cancel. Never enter a secret or let the agent answer for the user.
+
+Every result has `humanVerified: false`, `authorityGranted: false` and `sideEffects: "none"`. Even a matching accepted response is only `accepted_response`, not human authentication or a backend approval. Client name/version and form/URL capability bits are self-reported observations. Other capability metadata, returned form fields and raw request errors are withheld. Undeclared form capability, a wrong/malformed answer, request failure or timeout leaves approval unavailable. The request is bounded to 90 seconds; host cancellation can end it earlier.
+
+The probe does not call the backend, check in, renew a run, read a vault, register a host or synchronize files. The ordinary plugin exposes it through the already configured connection. A pre-existing run may continue its independent renewal timer. A missing tool requires reconnecting the upgraded MCP package, not creating credentials.
+
+For isolated host diagnostics, use a temporary MCP configuration whose command is `coord` and arguments are `["mcp", "--confirmation-probe"]`. This mode serves only the probe and bypasses project/runtime discovery even if runtime environment variables are present. The supporting CLI can also be launched with the built package's absolute `dist/src/cli.js` path from a temporary working directory. Do not install a global plugin, change persistent host settings or add a permission bypass for this experiment.
+
+The isolated mode emits bounded `COORD_CONFIRMATION_PROBE` JSON observations on stderr: `prepared` means the synthetic request was prepared, not that a dialog was displayed; `completed` records the response or failure classification. A protocol callback, mock or automatically answered form does not prove visible UI or human participation. Actual host evidence must separately record negotiated capabilities, observed display, user choices and hook/automatic-answer behavior. This probe supplies no protected approval adapter.
+
 ## Protected approval
 
 Approving a goal, capture policy or rule requires a protected human decision. The intended primary experience is review and approval from the host conversation through a qualified human-facing adapter, with credentials kept outside agent control. The currently implemented CLI fallback runs in a separate operator terminal, outside every agent or worker session, and reads the operator passphrase with hidden input only. Chat approval is not available merely because a host can show a form.

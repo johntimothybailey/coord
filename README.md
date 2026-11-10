@@ -10,6 +10,8 @@ Coord is being built for conversation-first use: ask the agent to inspect work, 
 
 Today the CLI and part of the MCP/plugin interface are implemented, including read-only conversational rule/lesson review. A qualified chat approval adapter is still missing. Protected actions always require authenticated human authority, whether presented in chat or a terminal. See [host support and remaining evidence](docs/hosts.md#conversational-workflows-and-human-confirmation) and the [workflow/CLI reference](docs/commands.md).
 
+Ask “test confirmation” to exercise a synthetic no-effect host form through the Coord skill. The probe never grants approval authority or verifies a human, even when a client accepts. An isolated `coord mcp --confirmation-probe` mode supports temporary host diagnostics without project/backend credentials. See [the check and its evidence limits](docs/commands.md#no-effect-host-confirmation-check).
+
 ## Local development
 
 Node 24 or newer is required. Dependencies are pinned in `package-lock.json`.

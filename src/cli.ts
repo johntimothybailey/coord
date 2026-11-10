@@ -10,6 +10,7 @@ import { exportProject, syncApprovedRules } from "./operations.js";
 import { resolveWorkspace } from "./config.js";
 import { setupCommand } from "./onboarding.js";
 import { approveCommand } from "./approval.js";
+import { runConfirmationProbeStdio } from "./confirmation-probe.js";
 import { connectRuntimeBridge, runCommand } from "./commands.js";
 import type { Readable, Writable } from "node:stream";
 
@@ -45,6 +46,9 @@ export async function main(argv = process.argv.slice(2), io: { mcpStreams?: { st
     console.log(JSON.stringify(await syncApprovedRules(workspace.root, workspace.config.ruleTargets, run))); return;
   }
   if (command === "mcp") {
+    if (args.length === 1 && args[0] === "--confirmation-probe") {
+      await runConfirmationProbeStdio(io.mcpStreams); return;
+    }
     const root = process.cwd();
     let runtimePath = process.env.COORD_RUNTIME_PATH, sessionId = process.env.COORD_SESSION_ID;
     const seen = new Set<string>();
@@ -81,7 +85,7 @@ export async function main(argv = process.argv.slice(2), io: { mcpStreams?: { st
     return;
   }
   if (!command || command === "--help" || command === "help") {
-    console.log("coord — private v2.5 implementation\n\n  doctor [--json] [--no-fixtures]\n  setup inspect <plan.json>\n  setup bootstrap|connect <plan.json> <absolute-encrypted-vault>\n  approve goal <goal-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>\n  approve rule <memory-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>\n  approve policy <capture-policy.json> --plan <plan.json> --vault <absolute-encrypted-vault> --hash <sha256-hex>\n  checkpoint <id> --runtime <file> --session <id>\n  resume <task> --runtime <file> --session <id> [--checkpoint <id>] [--harness codex|antigravity] [--prepare-only]\n  review <publication> --checkpoint <id> --runtime <file> --session <id>\n  run finalize succeeded|failed|stopped --runtime <file> --session <id>\n  run reconcile <launch-id> --runtime <file> [--stop]\n  daemon --runtime <file> [--check]\n  status\n  mcp\n  hook codex|antigravity|claude [event]\n  rules sync\n  export <new-local-file.jsonl>\n  --version\n\nRuntime commands require actual qualified protected configuration. See docs/commands.md. Protected setup must run in a separate operator terminal following the maintainer's onboarding procedure."); return;
+    console.log("coord — private v2.5 implementation\n\n  doctor [--json] [--no-fixtures]\n  setup inspect <plan.json>\n  setup bootstrap|connect <plan.json> <absolute-encrypted-vault>\n  approve goal <goal-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>\n  approve rule <memory-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>\n  approve policy <capture-policy.json> --plan <plan.json> --vault <absolute-encrypted-vault> --hash <sha256-hex>\n  checkpoint <id> --runtime <file> --session <id>\n  resume <task> --runtime <file> --session <id> [--checkpoint <id>] [--harness codex|antigravity] [--prepare-only]\n  review <publication> --checkpoint <id> --runtime <file> --session <id>\n  run finalize succeeded|failed|stopped --runtime <file> --session <id>\n  run reconcile <launch-id> --runtime <file> [--stop]\n  daemon --runtime <file> [--check]\n  status\n  mcp [--confirmation-probe]\n  hook codex|antigravity|claude [event]\n  rules sync\n  export <new-local-file.jsonl>\n  --version\n\nRuntime commands require actual qualified protected configuration. See docs/commands.md. Protected setup must run in a separate operator terminal following the maintainer's onboarding procedure."); return;
   }
   throw new CoordError("INVALID_INPUT", "Unknown command; run coord --help");
 }

@@ -10,6 +10,7 @@ import type { RuntimeActions } from "./commands.js";
 import { CLIENT_VERSION, CoordError, DEFAULTS, type CapabilityKey, type Harness, type RunIdentity } from "./protocol.js";
 import { backendFailure, fetchCheckIn, recordOffer } from "./hooks.js";
 import { buildContext, type ContextSource } from "./context.js";
+import { registerConfirmationProbe } from "./confirmation-probe.js";
 
 export type CoordBackend = Pick<BackendClient, "query" | "mutation">;
 export interface RunConnection { client: CoordBackend; identity: RunIdentity; publicResult?: unknown }
@@ -62,6 +63,7 @@ async function briefing(binding: RunConnection, onlyRules = false, cursor?: stri
 /** No arbitrary backend dispatch, human approval, configuration, merge or deploy tools. */
 export function createCoordMcpServer(options: CoordMcpOptions): McpServer {
   const server = new McpServer({ name: "coord", version: CLIENT_VERSION });
+  registerConfirmationProbe(server);
   let run = options.run;
   let initialized = false;
   let connected = true;
