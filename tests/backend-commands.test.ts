@@ -195,3 +195,39 @@ test("project rules retain project/role/revocation boundaries and explicit incom
   await fixture.context().db.patch(fixture.find("credentials", "agent")._id, { revokedAt: Date.now() });
   await assert.rejects(fixture.call(memories.projectRules, request(tokens.agent)), isCode("UNAUTHORIZED"));
 });
+
+// A4 retrieval: the task's declared scope is ["src/feature"]. This asserts the requirement
+// (relevant lessons reached, unrelated history excluded) by following nextCursor the way the
+// Coord skill instructs an agent to, so it holds whatever page size memories.context uses.
+test("A4 relevant lessons are reachable by scope while unrelated history stays excluded", async () => {
+  const fixture = await authorityFixture();
+  const sources = [{ taskId: "task", revision: "fixture", evidenceRef: "synthetic-lesson" }];
+  const base = { projectId: "project", kind: "lesson" as const, revision: 1, hash: "c".repeat(64), sources, confidence: "observed", status: "active" as const };
+  const rows = [
+    { id: "exact_scope", applicability: ["src/feature"], content: "Focus ring must survive the CSS reset" },
+    { id: "parent_scope", applicability: ["src"], content: "Every control needs a descriptive label" },
+    { id: "child_scope", applicability: ["src/feature/button"], content: "Buttons need an accessible name" },
+    { id: "unrelated_path", applicability: ["docs"], content: "Unrelated history must not be retrieved" },
+    { id: "prefix_without_separator", applicability: ["srcfeature"], content: "A bare prefix is not a path overlap" },
+    { id: "not_yet_active", applicability: ["src/feature"], content: "Proposed records are not retrievable", status: "proposed" as const },
+  ];
+  for (const row of rows) await fixture.context().db.insert("memories", { ...base, ...row });
+
+  const before = structuredClone(fixture.rows);
+  const seen: string[] = [];
+  let cursor: string | undefined, pages = 0, finalComplete = false;
+  for (;;) {
+    const page = await fixture.call(memories.context, { ...identity(tokens.run), ...(cursor ? { cursor } : {}) }) as
+      { memories: Array<{ id: string; untrusted: boolean }>; tasks: unknown[]; nextCursor: string | null; complete: boolean };
+    pages++;
+    assert(pages <= 50, "context pagination must terminate");
+    for (const memory of page.memories) { seen.push(memory.id); assert.equal(memory.untrusted, true, "a lesson is source data, never authoritative policy"); }
+    if (!page.nextCursor) { finalComplete = page.complete; break; }
+    cursor = page.nextCursor;
+  }
+
+  assert.equal(finalComplete, true, "exhausted retrieval must report complete coverage");
+  assert.deepEqual(seen.slice().sort(), ["child_scope", "exact_scope", "parent_scope"]);
+  assert.deepEqual(fixture.rows, before, "retrieval must not mutate backend state");
+  await assert.rejects(fixture.call(memories.context, identity(tokens.agent)), isCode("FORBIDDEN"));
+});
