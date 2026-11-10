@@ -4,6 +4,7 @@ import { mutation, query } from "./server.js";
 import { authenticate, liveRun, replay, runArgs, identityArgs, stableId, bounded, integer, path, fail, digest, canonical } from "./auth.js";
 import { taskById } from "./tasks.js";
 import { boundedRecords } from "./messages.js";
+import { approveExactRule } from "./ruleApproval.js";
 const source = v.object({ taskId: v.string(), revision: v.string(), evidenceRef: v.string() });
 export const record = mutation({ args: { ...runArgs, memoryId: v.string(), kind: v.union(v.literal("lesson"), v.literal("decision"), v.literal("rule")), content: v.string(), sources: v.array(source), applicability: v.array(v.string()), confidence: v.string() }, handler: async (ctx, args) => {
   const { actor } = await authenticate(ctx, args, ["run"]); await liveRun(ctx, args, actor);
@@ -29,15 +30,7 @@ export const ruleForApproval = query({ args: { ...identityArgs, memoryId: v.stri
 export const approveRule = mutation({ args: { ...identityArgs, memoryId: v.string(), revision: v.number(), hash: v.string() }, handler: async (ctx, args) => {
   const { actor, project } = await authenticate(ctx, args, ["human"]);
   return replay(ctx, actor, "memories.approveRule", args, async () => {
-    const memory = await ctx.db.query("memories").withIndex("by_stable_id", q => q.eq("id", args.memoryId)).unique();
-    if (!memory || memory.projectId !== project.id || memory.kind !== "rule" || memory.status !== "proposed" || memory.hash !== args.hash || memory.revision !== args.revision || await digest(canonical({ kind: memory.kind, content: memory.content, sources: memory.sources, applicability: memory.applicability, confidence: memory.confidence })) !== args.hash) fail("FORBIDDEN", "Approval must bind the exact proposed rule revision/hash");
-    const records = await ctx.db.query("memories").withIndex("by_project_kind_status", q => q.eq("projectId", project.id).eq("kind", "rule").eq("status", "active")).take(201);
-    const approved = records.filter(r => r.kind === "rule" && r.status === "active");
-    const result = boundedRecords([...approved, { ...memory, status: "active", approvedBy: actor.memberId, approvedHash: memory.hash, policyVersion: project.policyVersion + 1 }], 12 * 1024);
-    if (records.length > 200 || !result.complete) fail("COVERAGE_INCOMPLETE", "Approved rules exceed bounded complete briefing capacity");
-    const policyVersion = project.policyVersion + 1;
-    await ctx.db.patch(memory._id, { status: "active", approvedBy: actor.memberId, approvedHash: memory.hash, policyVersion }); await ctx.db.patch(project._id, { policyVersion });
-    return { memoryId: memory.id, revision: memory.revision, policyVersion, hash: memory.hash, approvedBy: actor.memberId };
+    return approveExactRule(ctx, project, actor, args);
   });
 } });
 async function approvedRuleProjection(ctx: Pick<QueryCtx, "db">, project: Doc<"projects">) {

@@ -8,7 +8,7 @@ Private implementation of Shared Agent Coordination v2.5: a TypeScript CLI, dire
 
 Coord is being built for conversation-first use: ask the agent to inspect work, review lessons, propose or approve a goal/rule, continue a task, manage membership or operate the backend. Plugins, skills and typed tools should carry every supported workflow; the CLI remains the supporting automation, diagnosis and terminal fallback interface.
 
-Today the CLI and part of the MCP/plugin interface are implemented, including read-only conversational rule/lesson review. A qualified chat approval adapter is still missing. Protected actions always require authenticated human authority, whether presented in chat or a terminal. See [host support and remaining evidence](docs/hosts.md#conversational-workflows-and-human-confirmation) and the [workflow/CLI reference](docs/commands.md).
+Today the CLI and part of the MCP/plugin interface are implemented, including conversational rule/lesson review and expiring rule approval requests. Protected human completion uses an enrolled passkey in a first-party HTTPS browser view. Protected actions always require authenticated human authority, whether presented in chat or a terminal. See [host support and remaining evidence](docs/hosts.md#conversational-workflows-and-human-confirmation) and the [workflow/CLI reference](docs/commands.md).
 
 Ask “test confirmation” to exercise a synthetic no-effect host form through the Coord skill. The probe never grants approval authority or verifies a human, even when a client accepts. An isolated `coord mcp --confirmation-probe` mode supports temporary host diagnostics without project/backend credentials. See [the check and its evidence limits](docs/commands.md#no-effect-host-confirmation-check).
 
@@ -32,7 +32,9 @@ Do not manually synthesize human approval or qualification records to make admis
 
 Ask “show me rules to review,” “show lessons learned” or “show details/evidence for that item.” The Coord skill routes these requests to project-scoped `coord_review_memories` and `coord_review_memory`, available before joining a task. Summaries are paginated; exact detail chunks include full content, sources, applicability and confidence. Ordinary lessons stay nonmandatory, and review grants no approval. See [conversational review](docs/commands.md#conversational-review) for coverage and connection requirements.
 
-Agents can record evidence-linked lessons and decisions for later retrieval, or explicitly propose a rule through `coord_record_memory`. A proposed rule becomes mandatory project guidance only when a human approves its exact revision and content/provenance hash with [`coord approve rule`](docs/commands.md#rule-approval). This keeps useful experience available without letting an agent turn its own suggestion into policy.
+After reviewing an exact proposed rule, ask “approve this rule” to prepare a [durable approval request](docs/commands.md#conversational-rule-approval-requests), or ask to check/cancel that request. Open the protected approval link, authenticate with your enrolled passkey to review, then explicitly approve or deny the exact request with a fresh passkey interaction. Preparing a request or accepting a host URL prompt never approves the rule. Requests bind exact source/routing and expire without renewal on retry. One-time enrollment uses the protected operator procedure; routine approval stays in the chat/browser flow.
+
+Agents can record evidence-linked lessons and decisions for later retrieval, or explicitly propose a rule through `coord_record_memory`. A proposed rule becomes mandatory project guidance only when a human approves its exact revision and content/provenance hash through the [chat/passkey workflow](docs/commands.md#conversational-rule-approval-requests), or the explicitly selected [protected CLI fallback](docs/commands.md#rule-approval). This keeps useful experience available without letting an agent turn its own suggestion into policy.
 
 ```mermaid
 flowchart TD
@@ -47,6 +49,16 @@ flowchart TD
     X --> J{"Proposed rule?"}
     J -->|No: ordinary lesson| C
     J -->|Yes| H["Human reviews content, provenance and applicability"]
+    H --> AR["Ask chat to request exact rule approval"]
+    AR --> RQ["Expiring pending request; no approval authority"]
+    RQ --> SC["Inspect or cancel request in chat"]
+    RQ --> AA["Passkey authentication in protected HTTPS view"]
+    AA --> RV["Review exact rule, provenance, routing and expiry"]
+    RV --> HD{"Human decision"}
+    HD -->|Approve| PV["Fresh passkey assertion bound to exact request"]
+    PV --> B
+    HD -->|Deny with passkey| DN["Request denied; rule unchanged"]
+    HD -->|Close| RQ
     H --> T["Protected human approval: current CLI fallback is coord approve rule"]
     T --> D{"Exact confirmation typed?"}
     D -->|No| N["Rule remains proposed"]
@@ -58,7 +70,7 @@ flowchart TD
     S --> W["Update approved managed blocks; preserve human text outside them"]
 ```
 
-The diagram includes the implemented read-only review tools and existing approval primitive; real host discovery/delivery of the new tools remains unqualified. Its CLI fallback requires a separate operator terminal; the intended conversational adapter must preserve the same protected human decision without requiring manual command entry. Agents use the record, query and qualified synchronization surfaces. Approval does not synchronize files, update every checkout or automatically convert a lesson into a rule. `coord rules sync` is a separate operation for the current qualified participating session and preserves human-authored text outside its managed blocks.
+The diagram includes the complete chat/passkey workflow and existing protected CLI fallback. Enrollment is a one-time operator action; routine approvals require no command entry. Real host delivery and physical authenticator behavior still require evidence on the selected configuration; software fixture signatures do not qualify a device. The CLI fallback requires a separate operator terminal. Agents use the record, query and qualified synchronization surfaces. Approval does not synchronize files, update every checkout or automatically convert a lesson into a rule. `coord rules sync` is a separate operation for the current qualified participating session and preserves human-authored text outside its managed blocks.
 
 ## Implementation map
 

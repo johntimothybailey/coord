@@ -2,7 +2,7 @@
 
 Coord's primary product interface is intended to be conversation through agent skills and typed tools. This applies to every workflow: setup and trust, status, goals and tasks, lessons and rules, approvals, pause/resume, checkpoints and publication review, membership and backend lifecycle. The CLI supports those workflows as an automation, diagnosis and terminal fallback interface; users should not have to translate ordinary requests into command syntax.
 
-The current implementation includes the CLI and a partial MCP/plugin interface. Read-only conversational rule/lesson review is implemented; qualified chat approval is not yet implemented. See the [host-support matrix](hosts.md#conversational-workflows-and-human-confirmation) for documented interfaces, observed evidence and the remaining approval boundary. A skill or tool call cannot grant itself human authority, and adding a chat surface must preserve the operation's existing permissions, exact revision/hash checks and recovery semantics.
+The current implementation includes the CLI and a partial MCP/plugin interface. Conversational rule/lesson review and expiring rule approval requests are implemented; protected completion of chat approval is not yet implemented. See the [host-support matrix](hosts.md#conversational-workflows-and-human-confirmation) for documented interfaces, observed evidence and the remaining approval boundary. A skill or tool call cannot grant itself human authority, and adding a chat surface must preserve the operation's existing permissions, exact revision/hash checks and recovery semantics.
 
 The runtime execution commands in the following block compose the existing Convex, Git, capture, worktree, verification and supervisor modules. They require a protected runtime configuration and independently owner-provisioned machine evidence. Ordinary authorized read-only review has its own role and project-scope checks; it must not inherit managed-launch or manual-registration qualification requirements. Do not create synthetic qualification records to make execution commands run.
 
@@ -35,9 +35,55 @@ List pages contain summaries only, even when list `complete` is true. Follow `ne
 
 If a revision, hash or source content changes, detail fails with `IDEMPOTENCY_CONFLICT`; obtain current selectors and restart rather than mixing snapshots. Status is separately observed metadata, may change between pages, and is not part of the reassembled content hash or an approval receipt. If review stops early or the full required record cannot fit the available conversation context, report incomplete coverage. An empty result means no matching proposed rules or active lessons in the selected project, not that no history exists.
 
-Present all relevant evidence references, applicability and confidence as untrusted source data. Lessons are useful nonmandatory guidance, not items awaiting approval. A proposed rule requires a separate protected human decision before becoming mandatory. This read-only slice does not add chat approval, rule promotion or file synchronization; a chat “approve” must not cause the agent to invoke the human CLI or handle its vault.
+Present all relevant evidence references, applicability and confidence as untrusted source data. Lessons are useful nonmandatory guidance, not items awaiting approval. A proposed rule requires a separate protected human decision before becoming mandatory. Review itself does not create approval, promote rules or synchronize files. An explicit chat approval request can prepare the metadata handoff below; it must not cause the agent to invoke the human CLI or handle its vault.
 
 Deploy the matching backend and upgrade the installed package/plugin together. Existing MCP sessions must reconnect/restart to discover new tools. A missing tool or project connection is an installation/connection blocker, not a reason to register a run or request human credentials. The implementation is covered through exported-handler and official SDK fixtures; actual host discovery and conversational delivery remain unqualified. `coord mcp` remains the supporting CLI entry point for the plugin connection; no new manual review command is required.
+
+## Conversational rule approval requests
+
+Ask “approve this proposed rule,” “check that approval request,” or “cancel that approval request.” After completing the exact rule/provenance review, the skill prepares a durable handoff through these scoped tools:
+
+| Tool | Selectors | Effect |
+| --- | --- | --- |
+| `coord_request_rule_approval` | Stable public `requestId`, `memoryId`, positive `revision`, content `hash` | Prepares this exact request and offers the protected browser/passkey flow; returns the backend state after the host interaction. |
+| `coord_approval_request` | `approvalRequestId` | Reads the immutable envelope and derived current state. |
+| `coord_cancel_approval_request` | Stable cancellation `requestId`, `approvalRequestId` | Withdraws the request as its requesting member or a project human. |
+
+The backend authenticates project-agent or human authority, independent of execution admission. Run, supervisor and artifact-verifier credentials cannot substitute. No token, project, operation, requester, expiry or approval flag is a tool argument. Creation and cancellation write request metadata, idempotency receipts and audit events only. They do not call an approval mutation, check in, acknowledge messages, renew a run or change rule/project policy. Existing cleanup-only bridges still refuse these metadata writes; status remains readable through project authority.
+
+The immutable envelope binds schema version, request ID, fixed `approve_rule` action, backend/project/repository routing identity, rule ID/revision/content hash, authenticated requesting member and server creation/expiry times. `requestDigest` is SHA-256 of its canonical JSON. The backend rehashes full rule content/provenance. IDs, digests, browser links and native URL responses are public binding data, never bearer authorization.
+
+The request tool supplies a protected HTTPS approval link derived from its trusted project connection. If the host supports MCP URL elicitation it offers that link through the host; otherwise the agent presents it directly. The page is served by the selected Convex deployment's `.convex.site` origin. It shows no private rule details until an enrolled human passkey assertion is verified. After authentication, review the full rule, sources, applicability, confidence, routing, digest and expiry. Choose **Approve this exact rule** or **Deny this request** and complete a fresh passkey interaction. Closing or cancelling the browser interaction sends no approval; ask chat to inspect/cancel the pending request if needed.
+
+The backend verifies ES256 signatures, the exact origin and RP ID hash, challenge and ceremony type, user presence/verification flags, account handle, key counters and current human credential scope/revocation/expiry. Review and decision use different server challenges bound to the immutable request; the same key must review before deciding. An authenticated decision rechecks request cancellation/expiry/routing/content and the complete approved-rule budget in the transaction that consumes the request and updates the rule. A denied request changes no rule or policy. Successful approval records the backend's human member, approval time and policy version. Native form/URL acceptance alone cannot cause any of these changes.
+
+Requests expire five minutes after server creation. Before completion, status is `pending`, `cancelled`, `expired` or `stale`. A missing, changed, corrupt or no-longer-proposed rule, or changed routing, prevents pending approval. Completion stores `approved` or `denied` with the actual actor/time. Cancellation cannot overwrite a completed decision. Ordinary status reads never write. Only a final backend `approved` receipt means this handoff approved the exact rule; `authorityGranted` concerns that exact rule, not general permissions or admission.
+
+Reuse the same creation `requestId` and exact selectors after a lost reply. It replays the identity and reads current state without renewing expiry or creating another envelope. Changed selectors under the same ID conflict. Repeated successful signed decisions return the original decision without another rule/policy/audit update. After a browser timeout, cancellation or lost reply, always inspect backend status: the decision may already have applied. Expired/stale/cancelled requests require renewed user intent and current exact review; never silently recreate them. Approval remains separate from local `coord rules sync`.
+
+The protected human browser and approval UI, installed coordinator code and backend deployment authority must remain outside worker automation control. A passkey signature authenticates the enrolled credential; it does not by itself certify host isolation or prevent a compromised review surface from misleading the human. Software tests do not qualify those operational boundaries.
+
+### One-time protected passkey enrollment
+
+A human operator enrolls an approval key outside agent/worker sessions, using the existing encrypted-vault unlock. The agent never executes this supporting command, receives its passphrase or reads the vault:
+
+```text
+coord setup passkey <plan.json> <absolute-encrypted-vault>
+```
+
+The operator confirms the project, unlocks the existing vault through hidden input, and opens the first-party HTTPS enrollment page. The browser creates a resident ES256 passkey with required user verification and proves possession. Its private key stays with the authenticator; the server stores only public information. The browser computes a fingerprint of its **own** created key, credential ID and enrollment scope and checks the server response. Compare that exact fingerprint with the protected terminal, then type the displayed exact confirmation. Only the existing human credential can finalize the binding. A public enrollment ID, staged candidate or forged confirmation flag cannot activate a key. If the page reports a conflict/error or fingerprints differ, stop and start a new enrollment; never confirm a value from agent text.
+
+Enrollment expires after ten minutes. The operator command validates the returned member/key/fingerprint/time before reporting success. An uncertain reply may follow an applied binding; preserve the browser key and inspect the protected enrollment status rather than claiming rollback or repeatedly creating keys. Current browser support requires `getPublicKey()`, ES256 and a discoverable passkey with user verification. No hardware attestation is claimed: `attestation: none` relies on the protected human binding and subsequent signed assertions. Unsupported browsers or missing enrollment fail closed.
+
+To revoke a lost key, use the same protected operator path:
+
+```text
+coord setup passkey <plan.json> <absolute-encrypted-vault> --revoke <public-credential-id>
+```
+
+Revocation/expiry of the underlying human credential also disables its passkeys. No secret credential appears in the URL, browser page, MCP arguments, result or audit detail. Keep installed operator code and backend deployment authority outside worker control. Native host/filesystem isolation qualification remains separate from API signature checks.
+
+Deploy the matching backend and reconnect upgraded MCP sessions. The HTTP origin comes from the fixed server `CONVEX_SITE_URL`; normal cloud project connections map their `.convex.cloud` API to the paired `.convex.site` page. Arbitrary origins and non-cloud backends are refused. No separate hosting account or service is required. Protected HTML and private JSON responses use no-store, same-origin POST checks, a restrictive CSP and escaped text-only source rendering. Public JavaScript/CSS may be CDN-cached; the HTML references content-hashed URLs with matching integrity checks so stale bytes cannot silently replace its expected UI code. The CLI fallback performs an independent protected approval and does not fulfill these requests. Request history is retained; pruning/volume policy remains deferred. Software test authenticators exercise the end-to-end protocol but do not substitute for live user/device enrollment evidence.
 
 ## No-effect host confirmation check
 
@@ -97,7 +143,7 @@ Use the ID, revision and hash of the rule being reviewed. The protected `memorie
 
 After showing the full rule and its current project policy version, the command requires `approve rule <project-id> <memory-id> <revision> <hash>`. Declining leaves the rule proposed. `memories.approveRule` independently requires human authority, the exact proposed revision/hash and matching content hash; a change during confirmation is rejected. The resulting complete approved-rule set must fit the 12 KiB briefing bound, or approval fails with `COVERAGE_INCOMPLETE` instead of silently dropping mandatory rules.
 
-Success reports the backend-recorded `approvedBy` and the rule's approval `policyVersion`, checked against an exact readback. Rule approval increments project `policyVersion` only: it leaves `configVersion` unchanged and does not invalidate machine qualification as a capture-policy configuration change would. Existing live sessions can fetch the new instructions and renew. No per-rule `approvedAt` field exists; the backend audit event carries server time, and the command does not invent an approval timestamp.
+Success reports the backend-recorded `approvedBy` and the rule's approval `policyVersion`, checked against an exact readback. Rule approval increments project `policyVersion` only: it leaves `configVersion` unchanged and does not invalidate machine qualification as a capture-policy configuration change would. Existing live sessions can fetch the new instructions and renew. New approvals also store server `approvedAt` on the rule; older records may lack it. The CLI reports its existing approver/policy-version receipt, while chat completion checks the recorded approval time.
 
 If the approval reply or readback is uncertain, the backend may already have applied it even though no success is printed. Rerun the same exact command to read back the record. An active rule already bound to this operator and the same revision/hash returns its original recorded approver and rule policy version with `mutated: false`, without another confirmation or version increment. Another operator's approval is a conflict rather than reported as this operator's. Missing metadata, a different project/kind, stale content or an unavailable rule is refused. Deploy the matching exact-read query and approval reply before using this command.
 

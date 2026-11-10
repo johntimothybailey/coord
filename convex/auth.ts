@@ -31,6 +31,10 @@ export async function authenticate(ctx: Pick<QueryCtx, "db">, args: Identity, ro
   stableId(args.requestId);
   const tokenDigest = await digest(args.token);
   const actor = await ctx.db.query("credentials").withIndex("by_digest", q => q.eq("digest", tokenDigest)).unique();
+  return authorizeActor(ctx, args, actor, roles);
+}
+export async function authorizeActor(ctx: Pick<QueryCtx, "db">, args: RequestIdentity, actor: Doc<"credentials"> | null, roles: readonly Doc<"credentials">["role"][]): Promise<{ actor: Doc<"credentials">; project: Doc<"projects"> }> {
+  stableId(args.requestId);
   if (!actor || actor.revokedAt !== undefined || actor.expiresAt <= Date.now() || actor.backendId !== args.backendId || !actor.projectIds.includes(args.projectId)) fail("UNAUTHORIZED", "Credential is invalid for this backend/project");
   const metadata = await ctx.db.query("metadata").withIndex("by_backend", q => q.eq("backendId", args.backendId)).unique();
   if (!metadata || args.protocolVersion !== PROTOCOL_VERSION || metadata.protocolVersion !== PROTOCOL_VERSION) fail("PROTOCOL_INCOMPATIBLE", "Client and backend protocol versions differ");
