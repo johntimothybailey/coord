@@ -5,7 +5,7 @@ import { arch, platform, release } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { captureDigest } from "./checkpoint.js";
+import { captureDigest, validateCapturePolicy } from "./checkpoint.js";
 import { checkStoreDirectory, readSmallFile, writeNewPrivateFile } from "./credentials.js";
 import { BackendClient } from "./client.js";
 import { CLIENT_VERSION, CoordError, PROBE_VERSION, requireCapability, requireHandshake } from "./protocol.js";
@@ -39,6 +39,12 @@ const schema = z.object({
   }).strict(),
 }).strict();
 export type RuntimeConfig = z.infer<typeof schema>;
+export function parseCapturePolicy(value: unknown): RuntimeConfig["policy"]["capture"] {
+  const result = schema.shape.policy.shape.capture.safeParse(value);
+  if (!result.success) throw new CoordError("INVALID_INPUT", "Invalid capture policy; values withheld");
+  validateCapturePolicy(result.data);
+  return result.data;
+}
 export function parseRuntime(value: unknown): RuntimeConfig {
   const result = schema.safeParse(value);
   if (!result.success) throw new CoordError("INVALID_INPUT", "Invalid protected runtime configuration; values withheld");

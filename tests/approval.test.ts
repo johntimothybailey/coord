@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { convexToJson } from "convex/values";
@@ -11,8 +11,9 @@ import * as auth from "../convex/auth.js";
 import * as goals from "../convex/goals.js";
 import * as projects from "../convex/projects.js";
 import { bootstrapArguments, createBundle, parseSetupPlan } from "../src/onboarding.js";
-import { approveCommand, approveGoal, openOperatorSession } from "../src/approval.js";
+import { approveCapturePolicy, approveCommand, approveGoal, openOperatorSession } from "../src/approval.js";
 import type { OperatorSession } from "../src/approval.js";
+import { captureDigest } from "../src/checkpoint.js";
 import { BackendClient } from "../src/client.js";
 import { CAPABILITIES, CLIENT_VERSION, requireHandshake } from "../src/protocol.js";
 import type { VersionHandshake } from "../src/protocol.js";
@@ -38,7 +39,7 @@ async function fixture() {
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-const handlers: Record<string, typeof auth.handshake> = { "auth:handshake": auth.handshake, "projects:status": projects.status as unknown as typeof auth.handshake, "goals:approve": goals.approve as unknown as typeof auth.handshake };
+const handlers: Record<string, typeof auth.handshake> = { "auth:handshake": auth.handshake, "projects:status": projects.status as unknown as typeof auth.handshake, "goals:approve": goals.approve as unknown as typeof auth.handshake, "projects:configure": projects.configure as unknown as typeof auth.handshake };
 async function wire(f: Fixture, run: (calls: Array<{ path: string; args: Record<string, unknown> }>) => Promise<void>, reply: (path: string, value: Value) => Value = (_path, value) => value): Promise<void> {
   const original = globalThis.fetch, calls: Array<{ path: string; args: Record<string, unknown> }> = [];
   globalThis.fetch = async (input, init) => {
@@ -202,4 +203,108 @@ test("an applied approval with missing or mismatched reply metadata never prints
       } finally { await rm(f.directory, { recursive: true, force: true }); }
     }
   } finally { console.log = log; }
+});
+
+const capturePolicy = { allowedUntracked: ["src/new.ts"], exclusions: [{ path: "private", reason: "Local only\u001b[31m" }], requiredPaths: ["src"], forbiddenContent: ["synthetic-forbidden-content"], maxFileBytes: 1024 };
+async function policyInput(f: Fixture) {
+  const path = join(f.directory, "capture-policy.json"), hash = captureDigest(capturePolicy);
+  await writeFile(path, JSON.stringify(capturePolicy));
+  return { path, hash, argv: ["policy", path, "--plan", f.planPath, "--vault", f.vault, "--hash", hash], phrase: `approve policy project ${hash}` };
+}
+
+test("capture approval preserves current project settings and vault bytes, then retries without configuration churn", async () => {
+  const f = await fixture(), input = await policyInput(f);
+  await f.backend.call(projects.configure, { ...request(f.bundle.humanToken), repository: f.plan.config.repository, remote: f.plan.config.remote, defaultBranch: f.plan.config.defaultBranch, allowedPaths: ["src", "tests"], excludedPaths: ["private"], ruleTargets: ["CLAUDE.md"], sharingApproved: true, capacity: 3, taskCap: 21 });
+  const before = f.backend.find("projects", "project"), vault = await readFile(f.vault), plan = await readFile(f.planPath), printed: string[] = [], log = console.log;
+  console.log = (...values: unknown[]) => { printed.push(values.map(String).join(" ")); };
+  try {
+    await wire(f, async calls => {
+      const terminal = operator(input.phrase), prompt = terminal.io.prompt;
+      terminal.io.prompt = async (label, hidden) => {
+        if (!hidden) {
+          const display = terminal.shown.join("");
+          assert(display.includes(input.hash) && display.includes('"allowedUntracked"') && display.includes('"tests"') && display.includes("invalidates machine qualification"));
+          assert(display.includes("\\u001b") && !display.includes("\u001b"));
+        }
+        return prompt(label, hidden);
+      };
+      await approveCommand(input.argv, terminal.io);
+      const call = calls.find(call => call.path === "projects:configure")!;
+      assert.equal(call.args.expectedConfigVersion, before.configVersion);
+      const stored = f.backend.find("projects", "project");
+      assert.deepEqual(stored, { ...before, capturePolicyDigest: input.hash, configVersion: before.configVersion! + 1, policyVersion: before.policyVersion + 1 });
+      assert.deepEqual(JSON.parse(printed.at(-1)!), { projectId: "project", capturePolicyDigest: input.hash, configVersion: stored.configVersion, policyVersion: stored.policyVersion, mutated: true });
+      assert.deepEqual(terminal.asked.map(ask => ask.hidden), [true, false]);
+      const replay = operator(input.phrase);
+      await approveCommand(input.argv, replay.io);
+      assert.equal(calls.filter(call => call.path === "projects:configure").length, 1);
+      assert.deepEqual(JSON.parse(printed.at(-1)!), { projectId: "project", capturePolicyDigest: input.hash, configVersion: stored.configVersion, policyVersion: stored.policyVersion, mutated: false });
+      assert.deepEqual(replay.asked.map(ask => ask.hidden), [true]);
+      assert.deepEqual(await readFile(f.vault), vault); assert.deepEqual(await readFile(f.planPath), plan);
+      for (const text of [...printed, ...terminal.shown, ...terminal.asked.map(ask => ask.label)]) assert(!text.includes(f.bundle.humanToken) && !text.includes(f.bundle.agentToken) && !text.includes(passphrase));
+    });
+  } finally { console.log = log; await rm(f.directory, { recursive: true, force: true }); }
+});
+
+test("invalid capture input is rejected before unlocking and declined confirmation never configures", async () => {
+  const f = await fixture(), input = await policyInput(f);
+  try {
+    await wire(f, async calls => {
+      const terminal = operator(input.phrase);
+      await assert.rejects(approveCommand([...input.argv.slice(0, -1), "0".repeat(64)], terminal.io), /does not reproduce the stated hash/);
+      for (const invalid of [{ ...capturePolicy, unknown: true }, { ...capturePolicy, requiredPaths: ["../private"] }]) {
+        await writeFile(input.path, JSON.stringify(invalid));
+        await assert.rejects(approveCommand(input.argv, terminal.io), error => (error as { code?: string }).code === "INVALID_INPUT");
+      }
+      assert.equal(terminal.asked.length, 0); assert.equal(calls.length, 0);
+      await writeFile(input.path, JSON.stringify(capturePolicy));
+      await assert.rejects(approveCommand(input.argv, operator("no").io), /confirmation did not match/);
+      assert.equal(calls.filter(call => call.path === "projects:configure").length, 0);
+      assert.equal(f.backend.find("projects", "project").capturePolicyDigest, undefined);
+    });
+  } finally { await rm(f.directory, { recursive: true, force: true }); }
+});
+
+test("a nonhuman credential cannot configure capture policy and its error contains no credential", async () => {
+  const f = await fixture(), input = await policyInput(f);
+  try {
+    await wire(f, async calls => {
+      const client = new BackendClient(f.plan.config, f.bundle.agentToken);
+      const session: OperatorSession = { plan: f.plan, client, status: await client.query("projects:status") as Record<string, unknown>, write: () => {}, prompt: async () => input.phrase };
+      await assert.rejects(approveCapturePolicy(session, capturePolicy, input.hash), error => {
+        assert.equal((error as { code?: string }).code, "FORBIDDEN");
+        assert(!String(error).includes(f.bundle.agentToken) && !String(error).includes(f.bundle.humanToken)); return true;
+      });
+      assert.equal(calls.filter(call => call.path === "projects:configure").length, 1);
+      assert.equal(f.backend.find("projects", "project").capturePolicyDigest, undefined);
+    });
+  } finally { await rm(f.directory, { recursive: true, force: true }); }
+});
+
+test("concurrent configuration changes are preserved and uncertain policy readback prints no success", async () => {
+  const f = await fixture(), input = await policyInput(f), printed: string[] = [], log = console.log;
+  console.log = (...values: unknown[]) => { printed.push(values.map(String).join(" ")); };
+  try {
+    await wire(f, async () => {
+      const terminal = operator(input.phrase), prompt = terminal.io.prompt;
+      terminal.io.prompt = async (label, hidden) => {
+        if (!hidden) await f.backend.call(projects.configure, { ...request(f.bundle.humanToken), repository: f.plan.config.repository, remote: f.plan.config.remote, defaultBranch: f.plan.config.defaultBranch, allowedPaths: ["other"], excludedPaths: [], ruleTargets: ["AGENTS.md"], sharingApproved: true, capacity: 4, taskCap: 25 });
+        return prompt(label, hidden);
+      };
+      await assert.rejects(approveCommand(input.argv, terminal.io), error => (error as { code?: string }).code === "IDEMPOTENCY_CONFLICT");
+      assert.deepEqual(f.backend.find("projects", "project").allowedPaths, ["other"]);
+      assert.equal(f.backend.find("projects", "project").capturePolicyDigest, undefined);
+      assert.deepEqual(printed, []);
+    });
+    let statuses = 0;
+    await wire(f, async () => {
+      await assert.rejects(approveCommand(input.argv, operator(input.phrase).io), /did not confirm this exact capture policy configuration/);
+      assert.equal(f.backend.find("projects", "project").capturePolicyDigest, input.hash, "uncertain readback does not undo an applied mutation");
+      assert.deepEqual(printed, []);
+    }, (path, value) => {
+      if (path !== "projects:status" || ++statuses !== 2) return value;
+      const status = value as { project: Record<string, Value> };
+      return { ...status, project: { ...status.project, capturePolicyDigest: "0".repeat(64) } };
+    });
+  } finally { console.log = log; await rm(f.directory, { recursive: true, force: true }); }
 });

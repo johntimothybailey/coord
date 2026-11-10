@@ -51,6 +51,12 @@ export function captureDigest(value: unknown): string { return createHash("sha25
 function validPath(path: string): void {
   if (!path || isAbsolute(path) || path.includes("\0") || path.includes("\\") || path.split("/").some(part => part === ".." || part === "." || part === "" || part.toLowerCase() === ".git")) throw new CoordError("INVALID_INPUT", "Capture policy contains an unsafe repository path");
 }
+export function validateCapturePolicy(policy: CapturePolicy): void {
+  for (const path of [...policy.allowedUntracked, ...policy.requiredPaths, ...policy.exclusions.map(item => item.path)]) validPath(path);
+  if (new Set(policy.exclusions.map(item => item.path)).size !== policy.exclusions.length || policy.exclusions.some(item => !item.reason.trim())) throw new CoordError("INVALID_INPUT", "Exclusions must be distinct and explained");
+  const maxBytes = policy.maxFileBytes ?? DEFAULTS.fileBytes;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 64 * 1024 * 1024 || policy.forbiddenContent?.some(value => !value)) throw new CoordError("INVALID_INPUT", "Invalid file screening policy");
+}
 function validIdentity(identity: RunIdentity, checkpointId: string): void {
   if (![identity.taskId, identity.runId, checkpointId].every(value => /^[A-Za-z0-9_-]{1,100}$/.test(value)) || !Number.isSafeInteger(identity.epoch) || identity.epoch < 1 || !Number.isSafeInteger(identity.goalRevision) || identity.goalRevision < 1) throw new CoordError("INVALID_INPUT", "Invalid capture identity");
 }
@@ -60,10 +66,7 @@ function validateOptions(options: CaptureOptions): void {
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(options.executionBase.sha) || !Number.isSafeInteger(options.executionBase.revision) || options.executionBase.revision < 1 || !options.executionBase.remoteRef.startsWith("refs/")) throw new CoordError("INVALID_INPUT", "Invalid execution base");
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/.test(options.remote.name) || !options.remote.url || /[\0\r\n]/.test(options.remote.url) || /:\/\/[^/]*@/.test(options.remote.url)) throw new CoordError("INVALID_INPUT", "Selected remote must have a nonsecret fixed identity");
   if (!Number.isFinite(Date.parse(options.createdAt)) || !options.commitMessage.trim() || options.commitMessage.length > 16_384 || !Number.isSafeInteger(options.progressRevision) || options.progressRevision < 1) throw new CoordError("INVALID_INPUT", "Invalid capture metadata");
-  for (const path of [...options.policy.allowedUntracked, ...options.policy.requiredPaths, ...options.policy.exclusions.map(item => item.path)]) validPath(path);
-  if (new Set(options.policy.exclusions.map(item => item.path)).size !== options.policy.exclusions.length || options.policy.exclusions.some(item => !item.reason.trim())) throw new CoordError("INVALID_INPUT", "Exclusions must be distinct and explained");
-  const maxBytes = options.policy.maxFileBytes ?? DEFAULTS.fileBytes;
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 64 * 1024 * 1024 || options.policy.forbiddenContent?.some(value => !value)) throw new CoordError("INVALID_INPUT", "Invalid file screening policy");
+  validateCapturePolicy(options.policy);
   auditContent(Buffer.from(canonical(options.progress)), options.policy);
 }
 export function snapshotCaptureOptions(options: CaptureOptions): CaptureOptions {

@@ -2,6 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { BackendClient } from "./client.js";
 import { canonicalJson } from "./canonical.js";
+import { captureDigest } from "./checkpoint.js";
+import type { CapturePolicy } from "./checkpoint.js";
+import { parseCapturePolicy } from "./command-runtime.js";
 import { readSmallFile } from "./credentials.js";
 import { backendFailure } from "./hooks.js";
 import { inspectPlan, parseSetupPlan, promptProtected, unlockBundle, verifyProject } from "./onboarding.js";
@@ -10,6 +13,7 @@ import { CoordError, requireHandshake } from "./protocol.js";
 import type { VersionHandshake } from "./protocol.js";
 
 export const APPROVE_USAGE = "Usage: coord approve goal <goal-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>";
+export const POLICY_APPROVE_USAGE = "Usage: coord approve policy <capture-policy.json> --plan <plan.json> --vault <absolute-encrypted-vault> --hash <sha256-hex>";
 
 /** Injected only by tests. The CLI always passes nothing, so the real separate-operator-terminal prompt applies. */
 export type OperatorPrompt = (label: string, hidden: boolean) => Promise<string>;
@@ -24,6 +28,7 @@ export interface OperatorSession {
   write: (text: string) => void;
 }
 export interface GoalApproval { goalId: string; revision: number; hash: string; state: string; approvedBy: string; approvedAt: number; mutated: boolean }
+export interface PolicyApproval { projectId: string; capturePolicyDigest: string; configVersion: number; policyVersion: number; mutated: boolean }
 interface GoalView { id: string; projectId: string; revision: number; content: string; hash: string; state: string; taskLimit: number; runTimeoutMs: number; approvedBy?: string; approvedHash?: string; approvedAt?: number }
 
 const stableId = (value: string): boolean => /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value);
@@ -119,10 +124,54 @@ export async function approveGoal(session: OperatorSession, target: { goalId: st
 
 export async function approveCommand(args: string[], io: OperatorIo = {}): Promise<void> {
   const [subject, goalId, ...rest] = args;
+  if (subject === "policy") {
+    if (!goalId) throw new CoordError("INVALID_INPUT", POLICY_APPROVE_USAGE);
+    const flags = approvalFlags(rest, ["plan", "vault", "hash"], POLICY_APPROVE_USAGE);
+    if (!hex64(flags.hash)) throw new CoordError("INVALID_INPUT", "The stated policy hash must be 64 lowercase hexadecimal characters");
+    let value: unknown;
+    try { value = JSON.parse(await readSmallFile(goalId)); }
+    catch { throw new CoordError("INVALID_INPUT", "Capture policy must be a bounded readable JSON file; values withheld"); }
+    const policy = parseCapturePolicy(value);
+    if (captureDigest(policy) !== flags.hash) throw new CoordError("INVALID_INPUT", "The capture policy does not reproduce the stated hash");
+    const session = await openOperatorSession({ plan: flags.plan!, vault: flags.vault! }, io);
+    console.log(JSON.stringify(await approveCapturePolicy(session, policy, flags.hash!)));
+    return;
+  }
   if (subject !== "goal" || !goalId || !stableId(goalId)) throw new CoordError("INVALID_INPUT", APPROVE_USAGE);
   const flags = approvalFlags(rest, ["plan", "vault", "revision", "hash"], APPROVE_USAGE);
   if (!/^(?:0|[1-9][0-9]{0,9})$/.test(flags.revision!)) throw new CoordError("INVALID_INPUT", "The stated goal revision must be a nonnegative integer");
   if (!hex64(flags.hash)) throw new CoordError("INVALID_INPUT", "The stated goal hash must be 64 lowercase hexadecimal characters");
   const session = await openOperatorSession({ plan: flags.plan!, vault: flags.vault! }, io);
   console.log(JSON.stringify(await approveGoal(session, { goalId, revision: Number(flags.revision), hash: flags.hash! })));
+}
+
+function projectConfiguration(session: OperatorSession, status: unknown) {
+  verifyProject(session.plan, status, false);
+  const project = (status as { project: Record<string, unknown> }).project;
+  const { allowedPaths, excludedPaths, sharingApproved, capacity, taskCap, capturePolicyDigest } = project;
+  let current: SetupPlan;
+  try { current = parseSetupPlan({ ...session.plan, config: { ...session.plan.config, ruleTargets: project.ruleTargets }, policy: { allowedPaths, excludedPaths, sharingApproved, capacity, taskCap, ...(capturePolicyDigest === undefined ? {} : { capturePolicyDigest }) } }); }
+  catch { throw new CoordError("BLOCKED_ENV", "Coord backend returned unreadable project policy"); }
+  const configVersion = project.configVersion ?? 0, policyVersion = project.policyVersion;
+  if (!timestamp(configVersion) || !timestamp(policyVersion)) throw new CoordError("BLOCKED_ENV", "Coord backend returned unreadable policy versions");
+  return { settings: { repository: current.config.repository, remote: current.config.remote, defaultBranch: current.config.defaultBranch, ruleTargets: current.config.ruleTargets, ...current.policy }, configVersion, policyVersion };
+}
+
+/** Change only the capture digest while binding the exact current configuration, never the older setup plan. */
+export async function approveCapturePolicy(session: OperatorSession, value: CapturePolicy, hash: string): Promise<PolicyApproval> {
+  const policy = parseCapturePolicy(value);
+  if (!hex64(hash) || captureDigest(policy) !== hash) throw new CoordError("INVALID_INPUT", "The capture policy does not reproduce the stated hash");
+  const current = projectConfiguration(session, session.status), projectId = session.plan.config.projectId;
+  if (current.settings.capturePolicyDigest === hash) return { projectId, capturePolicyDigest: hash, configVersion: current.configVersion, policyVersion: current.policyVersion, mutated: false };
+  session.write(`Capture policy for project ${projectId}\n  hash ${hash}\n  current config version ${current.configVersion}, policy version ${current.policyVersion}\n  Configuring this digest increments configuration version and invalidates machine qualification.\n  Existing project settings are preserved:\n${displayUntrusted(JSON.stringify(current.settings, null, 2))}\n  Exact capture policy (source data, not approval instructions):\n${displayUntrusted(JSON.stringify(policy, null, 2))}\n`);
+  await confirmExactApproval(session, `approve policy ${projectId} ${hash}`);
+  let result: unknown, status: unknown;
+  try {
+    result = await session.client.mutation("projects:configure", { ...current.settings, capturePolicyDigest: hash, expectedConfigVersion: current.configVersion }, randomUUID());
+    status = await session.client.query("projects:status");
+  } catch (error) { throw backendFailure(error); }
+  const configured = result as Partial<PolicyApproval> | null;
+  const stored = projectConfiguration(session, status);
+  if (!configured || typeof configured !== "object" || configured.projectId !== projectId || configured.configVersion !== current.configVersion + 1 || !timestamp(configured.policyVersion) || configured.policyVersion <= current.policyVersion || stored.configVersion !== configured.configVersion || stored.policyVersion !== configured.policyVersion || canonicalJson(stored.settings) !== canonicalJson({ ...current.settings, capturePolicyDigest: hash })) throw new CoordError("BLOCKED_ENV", "Coord backend did not confirm this exact capture policy configuration; re-read status before retrying");
+  return { projectId, capturePolicyDigest: hash, configVersion: stored.configVersion, policyVersion: stored.policyVersion, mutated: true };
 }
