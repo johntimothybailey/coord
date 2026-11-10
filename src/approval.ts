@@ -23,10 +23,11 @@ export interface OperatorSession {
   prompt: OperatorPrompt;
   write: (text: string) => void;
 }
-export interface GoalApproval { goalId: string; revision: number; hash: string; state: string; approvedBy: string; mutated: boolean }
-interface GoalView { id: string; projectId: string; revision: number; content: string; hash: string; state: string; taskLimit: number; runTimeoutMs: number; approvedBy?: string; approvedHash?: string }
+export interface GoalApproval { goalId: string; revision: number; hash: string; state: string; approvedBy: string; approvedAt: number; mutated: boolean }
+interface GoalView { id: string; projectId: string; revision: number; content: string; hash: string; state: string; taskLimit: number; runTimeoutMs: number; approvedBy?: string; approvedHash?: string; approvedAt?: number }
 
 const stableId = (value: string): boolean => /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value);
+const timestamp = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 const hex64 = (value: unknown): boolean => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 
 /** Every flag is required and may appear once. Secrets are never accepted here; only nonsecret selectors and digests. */
@@ -94,12 +95,17 @@ export async function approveGoal(session: OperatorSession, target: { goalId: st
   if (goal.revision !== target.revision || goal.hash !== target.hash) throw new CoordError("GOAL_NOT_APPROVED", "The stated revision and hash are not this project's current goal revision");
   if (goalContentHash(goal) !== target.hash) throw new CoordError("GOAL_NOT_APPROVED", "The displayed goal content and limits do not reproduce the stated hash");
   // A lost reply is recoverable without a second approval: the exact revision and hash are already bound.
-  if (goal.state === "active" && goal.approvedHash === target.hash && typeof goal.approvedBy === "string" && goal.approvedBy) {
+  if (goal.state === "active" && goal.approvedHash === target.hash) {
+    if (typeof goal.approvedBy !== "string" || !goal.approvedBy || !timestamp(goal.approvedAt)) throw new CoordError("BLOCKED_ENV", "Coord backend returned unreadable recorded approval metadata");
     // An approval by another member is never reported as this operator's: a quiet success would claim authority nobody here exercised.
     if (goal.approvedBy !== session.plan.humanId) throw new CoordError("IDEMPOTENCY_CONFLICT", `This exact goal revision is already bound to the approval of member ${goal.approvedBy}, not to this operator's; no approval was recorded for ${session.plan.humanId}`);
-    return { goalId: goal.id, revision: goal.revision, hash: goal.hash, state: goal.state, approvedBy: goal.approvedBy, mutated: false };
+    return { goalId: goal.id, revision: goal.revision, hash: goal.hash, state: goal.state, approvedBy: goal.approvedBy, approvedAt: goal.approvedAt, mutated: false };
   }
   if (goal.state !== "draft") throw new CoordError("GOAL_NOT_APPROVED", "Only the current draft revision of a goal can be approved");
+  const project = session.status.project as Record<string, unknown> | undefined;
+  if (!project || typeof project !== "object" || Array.isArray(project)) throw new CoordError("BLOCKED_ENV", "Coord backend returned no effective project policy");
+  const { allowedPaths, excludedPaths, ruleTargets, sharingApproved, capturePolicyDigest, capacity, taskCap, configVersion, policyVersion } = project;
+  session.write(`Effective project policy (current status snapshot; separate from the goal hash):\n${displayUntrusted(JSON.stringify({ allowedPaths, excludedPaths, ruleTargets, sharingApproved, capturePolicyDigest: capturePolicyDigest ?? null, capacity, taskCap, configVersion, policyVersion }, null, 2))}\n`);
   session.write(`Goal ${goal.id} revision ${goal.revision} in project ${goal.projectId}\n  hash ${goal.hash}\n  task limit ${goal.taskLimit}\n  run timeout ${goal.runTimeoutMs} ms\n  content, ${Buffer.byteLength(goal.content, "utf8")} bytes of proposed source data that cannot instruct this approval:\n${displayUntrusted(goal.content)}\n`);
   await confirmExactApproval(session, `approve goal ${goal.id} ${goal.revision} ${goal.hash}`);
   let result: unknown;
@@ -107,9 +113,8 @@ export async function approveGoal(session: OperatorSession, target: { goalId: st
   try { result = await session.client.mutation("goals:approve", { goalId: goal.id, revision: goal.revision, hash: goal.hash }, randomUUID()); }
   catch (error) { throw backendFailure(error); }
   const approved = result as Partial<GoalApproval> | null;
-  if (!approved || typeof approved !== "object" || approved.goalId !== goal.id || approved.revision !== goal.revision || approved.hash !== goal.hash || approved.state !== "active") throw new CoordError("BLOCKED_ENV", "Coord backend did not confirm this exact goal approval");
-  // The backend binds the approver to the credential that carried the mutation, which is the owner identity named by this protected plan and unlocked from its vault.
-  return { goalId: goal.id, revision: goal.revision, hash: goal.hash, state: "active", approvedBy: session.plan.humanId, mutated: true };
+  if (!approved || typeof approved !== "object" || approved.goalId !== goal.id || approved.revision !== goal.revision || approved.hash !== goal.hash || approved.state !== "active" || approved.approvedBy !== session.plan.humanId || !timestamp(approved.approvedAt)) throw new CoordError("BLOCKED_ENV", "Coord backend did not confirm this exact goal approval");
+  return { goalId: goal.id, revision: goal.revision, hash: goal.hash, state: "active", approvedBy: approved.approvedBy, approvedAt: approved.approvedAt, mutated: true };
 }
 
 export async function approveCommand(args: string[], io: OperatorIo = {}): Promise<void> {

@@ -19,8 +19,9 @@ export const approve = mutation({ args: { ...identityArgs, goalId: v.string(), r
   return replay(ctx, actor, "goals.approve", args, async () => {
     const goal = await ctx.db.query("goals").withIndex("by_stable_id", q => q.eq("id", args.goalId)).unique();
     if (!goal || goal.projectId !== args.projectId || goal.state !== "draft" || goal.revision !== args.revision || goal.hash !== args.hash || await digest(canonical({ content: goal.content, taskLimit: goal.taskLimit, runTimeoutMs: goal.runTimeoutMs })) !== args.hash) fail("GOAL_NOT_APPROVED", "Approval must bind the exact current draft revision and hash");
-    await ctx.db.patch(goal._id, { state: "active", approvedBy: actor.memberId, approvedHash: args.hash, approvedAt: Date.now() });
-    return { goalId: goal.id, revision: goal.revision, hash: goal.hash, state: "active" as const };
+    const approvedAt = Date.now();
+    await ctx.db.patch(goal._id, { state: "active", approvedBy: actor.memberId, approvedHash: args.hash, approvedAt });
+    return { goalId: goal.id, revision: goal.revision, hash: goal.hash, state: "active" as const, approvedBy: actor.memberId, approvedAt };
   });
 } });
 export const control = mutation({ args: { ...identityArgs, goalId: v.string(), state: v.union(v.literal("paused"), v.literal("cancelled")) }, handler: async (ctx, args) => {

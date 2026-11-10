@@ -39,7 +39,7 @@ async function fixture() {
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
 const handlers: Record<string, typeof auth.handshake> = { "auth:handshake": auth.handshake, "projects:status": projects.status as unknown as typeof auth.handshake, "goals:approve": goals.approve as unknown as typeof auth.handshake };
-async function wire(f: Fixture, run: (calls: Array<{ path: string; args: Record<string, unknown> }>) => Promise<void>): Promise<void> {
+async function wire(f: Fixture, run: (calls: Array<{ path: string; args: Record<string, unknown> }>) => Promise<void>, reply: (path: string, value: Value) => Value = (_path, value) => value): Promise<void> {
   const original = globalThis.fetch, calls: Array<{ path: string; args: Record<string, unknown> }> = [];
   globalThis.fetch = async (input, init) => {
     assert.equal(new URL(String(input)).origin, f.plan.config.backendUrl);
@@ -47,7 +47,7 @@ async function wire(f: Fixture, run: (calls: Array<{ path: string; args: Record<
     calls.push({ path: body.path, args });
     const handler = handlers[body.path];
     assert(handler, "Only expected approval endpoints may be called");
-    try { return new Response(JSON.stringify({ status: "success", value: convexToJson(await f.backend.call(handler, args as never) as Value), logLines: [] })); }
+    try { return new Response(JSON.stringify({ status: "success", value: convexToJson(reply(body.path, await f.backend.call(handler, args as never) as Value)), logLines: [] })); }
     catch (error) {
       if (!(error as { data?: unknown }).data) throw error;
       return new Response(JSON.stringify({ status: "error", errorMessage: "Fixture denied", errorData: (error as { data: Value }).data, logLines: [] }));
@@ -63,23 +63,32 @@ function operator(confirmation: string) {
 }
 const phrase = (f: Fixture) => `approve goal goal ${f.draft.revision} ${f.draft.hash}`;
 
-test("an owner approval binds the exact displayed revision and hash through one protected confirmation", async () => {
+test("an owner approval shows the effective policy and returns the exact stored approver and server time", async () => {
   const f = await fixture();
+  await f.backend.call(projects.configure, { ...request(f.bundle.humanToken), repository: f.plan.config.repository, remote: f.plan.config.remote, defaultBranch: f.plan.config.defaultBranch, allowedPaths: ["src", "tests"], excludedPaths: ["private"], ruleTargets: ["AGENTS.md", "CLAUDE.md"], sharingApproved: true, capturePolicyDigest: "a".repeat(64), capacity: 3, taskCap: 21 });
   const printed: string[] = [], log = console.log;
   console.log = (...values: unknown[]) => { printed.push(values.map(String).join(" ")); };
   try {
     await wire(f, async calls => {
       const terminal = operator(phrase(f));
+      const prompt = terminal.io.prompt;
+      terminal.io.prompt = async (label, hidden) => {
+        if (!hidden) assert(terminal.shown.join("").includes("Effective project policy"), "policy must precede confirmation");
+        return prompt(label, hidden);
+      };
       await approveCommand(["goal", "goal", "--plan", f.planPath, "--vault", f.vault, "--revision", String(f.draft.revision), "--hash", f.draft.hash], terminal.io);
       const mutations = calls.filter(call => call.path === "goals:approve");
       assert.equal(mutations.length, 1);
       assert.deepEqual({ goalId: mutations[0]!.args.goalId, revision: mutations[0]!.args.revision, hash: mutations[0]!.args.hash }, { goalId: "goal", revision: f.draft.revision, hash: f.draft.hash });
-      assert.deepEqual(JSON.parse(printed.at(-1)!), { goalId: "goal", revision: f.draft.revision, hash: f.draft.hash, state: "active", approvedBy: f.plan.humanId, mutated: true });
       const stored = f.backend.find("goals", "goal");
+      assert(Number.isSafeInteger(stored.approvedAt) && stored.approvedAt! > 0);
+      assert.deepEqual(JSON.parse(printed.at(-1)!), { goalId: "goal", revision: f.draft.revision, hash: f.draft.hash, state: "active", approvedBy: stored.approvedBy, approvedAt: stored.approvedAt, mutated: true });
       assert.equal(stored.state, "active"); assert.equal(stored.approvedHash, f.draft.hash); assert.equal(stored.approvedBy, "human");
       assert.deepEqual(terminal.asked.map(ask => ask.hidden), [true, false]);
       const display = terminal.shown.join("");
       assert(display.includes(f.draft.hash) && display.includes(`revision ${f.draft.revision}`));
+      assert(display.includes('"tests"'), "show the widened backend scope, not the stale plan");
+      for (const policyValue of ['"private"', '"CLAUDE.md"', '"sharingApproved": true', '"capacity": 3', '"taskCap": 21', '"configVersion": 2', '"policyVersion": 2', "a".repeat(64)]) assert(display.includes(policyValue));
       assert(display.includes("\\u001b[31m") && !display.includes("\u001b"), "untrusted goal content must not emit terminal escapes");
       for (const text of [...printed, ...terminal.shown, ...terminal.asked.map(ask => ask.label)]) assert(!text.includes(f.bundle.humanToken) && !text.includes(f.bundle.agentToken) && !text.includes(passphrase));
     });
@@ -146,10 +155,11 @@ test("an already bound approval replays for its own approver and never reports a
       const approvals = () => calls.filter(call => call.path === "goals:approve").length;
       await approveCommand(argv, operator(phrase(f)).io);
       assert.equal(approvals(), 1);
+      const original = JSON.parse(printed.at(-1)!);
       // A lost reply: the same operator reruns the same command, reads back the bound approval with its approver, and mutates nothing.
       const replay = operator(phrase(f));
       await approveCommand(argv, replay.io);
-      assert.deepEqual(JSON.parse(printed.at(-1)!), { goalId: "goal", revision: f.draft.revision, hash: f.draft.hash, state: "active", approvedBy: f.plan.humanId, mutated: false });
+      assert.deepEqual(JSON.parse(printed.at(-1)!), { goalId: "goal", revision: f.draft.revision, hash: f.draft.hash, state: "active", approvedBy: f.plan.humanId, approvedAt: original.approvedAt, mutated: false });
       assert.equal(approvals(), 1, "a replay must never approve the same revision a second time");
       assert.deepEqual(replay.asked.map(ask => ask.hidden), [true], "only the passphrase may be requested");
       assert.deepEqual(replay.shown, []);
@@ -166,7 +176,30 @@ test("an already bound approval replays for its own approver and never reports a
       assert.equal(printed.length, quiet, "another member's approval must never be printed as this operator's success");
       assert.equal(approvals(), 1);
       const stored = f.backend.find("goals", "goal");
-      assert.equal(stored.state, "active"); assert.equal(stored.approvedBy, f.plan.humanId);
+      assert.equal(stored.state, "active"); assert.equal(stored.approvedBy, f.plan.humanId); assert.equal(stored.approvedAt, original.approvedAt);
+      const malformed: OperatorSession = { ...session, status: { ...session.status, goals: [{ ...stored, approvedAt: undefined }] } };
+      await assert.rejects(approveGoal(malformed, { goalId: "goal", revision: f.draft.revision, hash: f.draft.hash }), /unreadable recorded approval metadata/);
+      assert.equal(approvals(), 1, "invalid stored metadata must not cause another mutation");
     });
   } finally { console.log = log; await rm(f.directory, { recursive: true, force: true }); }
+});
+
+
+test("an applied approval with missing or mismatched reply metadata never prints success", async () => {
+  const printed: string[] = [], log = console.log;
+  console.log = (...values: unknown[]) => { printed.push(values.map(String).join(" ")); };
+  try {
+    for (const metadata of [{ approvedBy: undefined }, { approvedBy: "different-human" }, { approvedAt: undefined }, { approvedAt: -1 }]) {
+      const f = await fixture();
+      try {
+        await wire(f, async calls => {
+          const before = printed.length;
+          await assert.rejects(approveCommand(["goal", "goal", "--plan", f.planPath, "--vault", f.vault, "--revision", String(f.draft.revision), "--hash", f.draft.hash], operator(phrase(f)).io), /did not confirm this exact goal approval/);
+          assert.equal(printed.length, before, "an unconfirmed reply must not print success");
+          assert.equal(calls.filter(call => call.path === "goals:approve").length, 1);
+          assert.equal(f.backend.find("goals", "goal").state, "active", "the backend effect already happened; rejection does not roll it back");
+        }, (path, value) => path === "goals:approve" ? Object.fromEntries(Object.entries({ ...value as Record<string, Value>, ...metadata }).filter(([, field]) => field !== undefined)) as Value : value);
+      } finally { await rm(f.directory, { recursive: true, force: true }); }
+    }
+  } finally { console.log = log; }
 });
