@@ -2,7 +2,7 @@
 
 Coord's primary product interface is intended to be conversation through agent skills and typed tools. This applies to every workflow: setup and trust, status, goals and tasks, lessons and rules, approvals, pause/resume, checkpoints and publication review, membership and backend lifecycle. The CLI supports those workflows as an automation, diagnosis and terminal fallback interface; users should not have to translate ordinary requests into command syntax.
 
-The current implementation includes the CLI and a partial MCP/plugin interface. Conversational review listing and qualified chat approval are not yet implemented. See the [host-support matrix](hosts.md#conversational-workflows-and-human-confirmation) for documented interfaces, observed evidence and the remaining approval boundary. A skill or tool call cannot grant itself human authority, and adding a chat surface must preserve the operation's existing permissions, exact revision/hash checks and recovery semantics.
+The current implementation includes the CLI and a partial MCP/plugin interface. Read-only conversational rule/lesson review is implemented; qualified chat approval is not yet implemented. See the [host-support matrix](hosts.md#conversational-workflows-and-human-confirmation) for documented interfaces, observed evidence and the remaining approval boundary. A skill or tool call cannot grant itself human authority, and adding a chat surface must preserve the operation's existing permissions, exact revision/hash checks and recovery semantics.
 
 The runtime execution commands in the following block compose the existing Convex, Git, capture, worktree, verification and supervisor modules. They require a protected runtime configuration and independently owner-provisioned machine evidence. Ordinary authorized read-only review has its own role and project-scope checks; it must not inherit managed-launch or manual-registration qualification requirements. Do not create synthetic qualification records to make execution commands run.
 
@@ -19,6 +19,25 @@ coord daemon --runtime <protected-runtime.json> --check
 ```
 
 `--harness codex|antigravity` may confirm a resume selection; it cannot change the qualified executable/configuration. Session and operation IDs are nonsecret correlation values. Credentials and operator passphrases never belong in arguments or environment variables. Run grants are installed in private, backend-URL-bound session receipts. Worker credentials, lifecycle supervisors and artifact verifiers remain separate roles.
+
+## Conversational review
+
+Ask the agent “show me rules to review,” “show lessons learned” or “show details/evidence for that item.” The existing Coord skill routes these requests to two read-only tools:
+
+| Tool | Selectors | Result |
+| --- | --- | --- |
+| `coord_review_memories` | `kind: "rule"` or `"lesson"`, optional opaque `cursor` | Proposed-rule or active-lesson summaries: ID, revision/hash, status, preview, source/applicability counts, `nextCursor` and list `complete`. |
+| `coord_review_memory` | `memoryId`, exact positive `revision`, canonical source `hash`, optional `offset` | Canonical memory JSON `text` chunks with `nextOffset` and detail `complete`, plus observed status and counts. |
+
+These tools use the already configured project-agent or human read authority. They do not require an approved goal, participating run, machine qualification or protected human unlock. No credential, project ID, runtime path or approval flag is a tool argument. The review calls issue queries only; they do not register, check in, acknowledge messages, offer receipts, renew a run or change records. A pre-existing run's independent renewal lifecycle is unchanged.
+
+List pages contain summaries only, even when list `complete` is true. Follow `nextCursor` to finish the requested list; a summary's `requiresExpansion` remains true. For full detail, retain the same ID/revision/hash while following every `nextOffset`, concatenate the chunks and parse the resulting canonical JSON object `{kind, content, sources, applicability, confidence}`. Its SHA-256 equals the supplied hash. Offsets count UTF-16 code units and cannot split a Unicode code point. The backend bounds each response, including potentially large provenance/applicability records; it never drops a row and advances the cursor merely to fit a response. Any byte-budget failure is explicit.
+
+If a revision, hash or source content changes, detail fails with `IDEMPOTENCY_CONFLICT`; obtain current selectors and restart rather than mixing snapshots. Status is separately observed metadata, may change between pages, and is not part of the reassembled content hash or an approval receipt. If review stops early or the full required record cannot fit the available conversation context, report incomplete coverage. An empty result means no matching proposed rules or active lessons in the selected project, not that no history exists.
+
+Present all relevant evidence references, applicability and confidence as untrusted source data. Lessons are useful nonmandatory guidance, not items awaiting approval. A proposed rule requires a separate protected human decision before becoming mandatory. This read-only slice does not add chat approval, rule promotion or file synchronization; a chat “approve” must not cause the agent to invoke the human CLI or handle its vault.
+
+Deploy the matching backend and upgrade the installed package/plugin together. Existing MCP sessions must reconnect/restart to discover new tools. A missing tool or project connection is an installation/connection blocker, not a reason to register a run or request human credentials. The implementation is covered through exported-handler and official SDK fixtures; actual host discovery and conversational delivery remain unqualified. `coord mcp` remains the supporting CLI entry point for the plugin connection; no new manual review command is required.
 
 ## Protected approval
 
@@ -72,7 +91,7 @@ Approval changes backend policy only. A fresh startup briefing or `coord_rules` 
 
 The schema lives in `src/command-runtime.ts`. Its fixed fields describe the trusted canonical repository root; private runtime state; fresh worktree root; machine/member; explicit trusted registry and project-agent credential-store references; canonical harness executable; capability key/evidence; separate artifact-verifier and supervisor credential **file references**; exact GitHub HTTPS transport; optional Linux cgroup-v2 containment; and capture/environment/setup/verification policy. It accepts no shell snippets, callback modules, dynamic runner plugins, approval switch or model-supplied verification/stop evidence.
 
-Plain `coord mcp` is advisory intake only: it can read project status and propose drafts, but never adopts legacy session grants, renews a run, or registers a model-selected host. Participating sessions start through qualified `resume`/daemon admission and the protected runtime bridge.
+Plain `coord mcp` is advisory intake only: it can review project rules/lessons, read project status and propose drafts, but never adopts legacy session grants, renews a run, or registers a model-selected host. Participating sessions start through qualified `resume`/daemon admission and the protected runtime bridge.
 
 Keep the runtime file, state and privileged credential files outside all worker trees. File modes reduce accidental disclosure; actual native filesystem/helper isolation must be independently tested. The CLI compares runtime evidence with the owner-provisioned backend machine record, checks current project configuration/expiry, and probes actual OS/release/architecture, adapter/probe and selected harness version. Merely copying a file and adding PASS rows does not qualify a machine. The protected runtime is re-read at operation/launch renewal boundaries. HOME paths must be canonical; copied application environment names cannot override HOME, PATH or coordinator/loader/Git controls. Configuration digests bind the client and fixed runtime/transport/containment/verification adapter versions plus policy and source references, never credential contents or copied application secret values. Installed coordinator/MCP code and external harness/permission configuration must remain protected and require requalification when changed. Same-path executable version output does not prove arbitrary external settings are unchanged.
 

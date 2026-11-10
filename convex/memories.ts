@@ -1,7 +1,7 @@
 import { v } from "convex/values";
 import type { Doc, QueryCtx } from "./server.js";
 import { mutation, query } from "./server.js";
-import { authenticate, liveRun, replay, runArgs, identityArgs, stableId, bounded, path, fail, digest, canonical } from "./auth.js";
+import { authenticate, liveRun, replay, runArgs, identityArgs, stableId, bounded, integer, path, fail, digest, canonical } from "./auth.js";
 import { taskById } from "./tasks.js";
 import { boundedRecords } from "./messages.js";
 const source = v.object({ taskId: v.string(), revision: v.string(), evidenceRef: v.string() });
@@ -52,6 +52,33 @@ export const rules = query({ args: runArgs, handler: async (ctx, args) => {
 export const projectRules = query({ args: identityArgs, handler: async (ctx, args) => {
   const { project } = await authenticate(ctx, args, ["agent", "human"]);
   return approvedRuleProjection(ctx, project);
+} });
+function boundedReview<T>(value: T): T {
+  if (new TextEncoder().encode(JSON.stringify(value)).length > 8 * 1024) fail("COVERAGE_INCOMPLETE", "Review response exceeds its byte budget; no source page was returned");
+  return value;
+}
+/** Advisory review is project-scoped; it never requires or changes a participating run. */
+export const reviewList = query({ args: { ...identityArgs, kind: v.union(v.literal("rule"), v.literal("lesson")), cursor: v.optional(v.string()) }, handler: async (ctx, args) => {
+  const { project } = await authenticate(ctx, args, ["agent", "human"]);
+  if (args.kind !== "rule" && args.kind !== "lesson") fail("INVALID_INPUT", "Review requires rules or lessons");
+  const page = await ctx.db.query("memories").withIndex("by_project_kind_status", q => q.eq("projectId", project.id).eq("kind", args.kind).eq("status", args.kind === "rule" ? "proposed" : "active")).paginate({ cursor: args.cursor ?? null, numItems: 5 });
+  const memories = page.page.map(memory => ({ id: memory.id, kind: memory.kind, status: memory.status, revision: memory.revision, hash: memory.hash, contentPreview: Array.from(memory.content).slice(0, 128).join(""), sourceCount: memory.sources.length, applicabilityCount: memory.applicability.length, requiresExpansion: true }));
+  return boundedReview({ memories, complete: page.isDone, nextCursor: page.isDone ? null : page.continueCursor, coverage: "summaries_only" as const, untrusted: true, reviewOnly: true });
+} });
+/** Reassemble this canonical JSON to review all provenance; the hash binds every chunk to one revision. */
+export const reviewDetail = query({ args: { ...identityArgs, memoryId: v.string(), revision: v.number(), hash: v.string(), offset: v.optional(v.number()) }, handler: async (ctx, args) => {
+  const { project } = await authenticate(ctx, args, ["agent", "human"]);
+  stableId(args.memoryId); integer(args.revision, 1, Number.MAX_SAFE_INTEGER);
+  if (!/^[a-f0-9]{64}$/.test(args.hash)) fail("INVALID_INPUT", "Review requires an exact content hash");
+  const memory = await ctx.db.query("memories").withIndex("by_stable_id", q => q.eq("id", args.memoryId)).unique();
+  if (!memory || memory.projectId !== project.id || (memory.kind !== "rule" && memory.kind !== "lesson")) fail("NOT_FOUND", "Review source is unavailable in this project");
+  const text = canonical({ kind: memory.kind, content: memory.content, sources: memory.sources, applicability: memory.applicability, confidence: memory.confidence });
+  if (memory.revision !== args.revision || memory.hash !== args.hash || await digest(text) !== args.hash) fail("IDEMPOTENCY_CONFLICT", "Review source changed; obtain its current revision and hash before restarting detail review");
+  const offset = args.offset ?? 0; integer(offset, 0, text.length);
+  if (offset > 0 && /[\uDC00-\uDFFF]/.test(text[offset] ?? "") && /[\uD800-\uDBFF]/.test(text[offset - 1] ?? "")) fail("INVALID_INPUT", "Review offset splits a Unicode code point");
+  let end = offset, bytes = 0;
+  for (const character of text.slice(offset)) { const size = new TextEncoder().encode(character).length; if (bytes + size > 2048) break; bytes += size; end += character.length; }
+  return boundedReview({ memoryId: memory.id, kind: memory.kind, status: memory.status, revision: memory.revision, hash: memory.hash, encoding: "canonical-memory-json" as const, text: text.slice(offset, end), offset, nextOffset: end < text.length ? end : null, complete: end === text.length, sourceCount: memory.sources.length, applicabilityCount: memory.applicability.length, untrusted: true, reviewOnly: true });
 } });
 export const context = query({ args: { ...runArgs, cursor: v.optional(v.string()) }, handler: async (ctx, args) => {
   const { actor } = await authenticate(ctx, args, ["run"]); const { task } = await liveRun(ctx, args, actor);
