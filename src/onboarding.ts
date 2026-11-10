@@ -143,7 +143,8 @@ async function persistRouting(plan: SetupPlan, receipt: string, directory: strin
     const dir = await open(directory, "r"); try { await dir.sync(); } finally { await dir.close(); }
   } finally { await unlink(temporary).catch(() => {}); await lock.close(); await unlink(lockPath); }
 }
-function verifyProject(plan: SetupPlan, value: unknown, requirePolicy: boolean): void {
+/** Shared by setup and every protected approval: the backend project must still be the exact planned identity. */
+export function verifyProject(plan: SetupPlan, value: unknown, requirePolicy: boolean): void {
   const status = record(value), project = record(status.project) as unknown as ProjectView & { id: string };
   if (project.id !== plan.config.projectId || project.backendId !== plan.config.backendId || project.repository !== plan.config.repository || project.remote !== plan.config.remote || project.defaultBranch !== plan.config.defaultBranch) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Backend project identity differs from protected plan");
   if (requirePolicy) {
@@ -187,7 +188,8 @@ export async function readProtectedLine(input: typeof process.stdin, write: (tex
     input.on("data", onData); input.on("end", cancelled); input.on("error", cancelled);
   });
 }
-async function prompt(label: string, hidden: boolean): Promise<string> {
+/** The only protected operator input path: a real separate operator terminal, never an argument or environment value. */
+export async function promptProtected(label: string, hidden: boolean): Promise<string> {
   // TTY is an input capability check only. It never certifies human presence or a qualified host.
   if (!process.stdin.isTTY || !process.stderr.isTTY || process.env.COORD_LAUNCH_ID || process.env.COORD_SESSION_ID) throw new CoordError("NEEDS_HUMAN", "Run protected setup in your separate operator terminal, outside every agent/worker session");
   process.stderr.write(label);
@@ -201,20 +203,20 @@ export async function setupCommand(args: string[]): Promise<void> {
   const hash = planDigest(plan);
   console.log(JSON.stringify({ clientVersion: CLIENT_VERSION, planDigest: hash, plan, qualification: "BLOCKED: operator unlock and worker isolation require independent real-host evidence" }, null, 2));
   if (action === "inspect") return;
-  if (await prompt(`Type ${action} ${hash} to apply this exact plan: `, false) !== `${action} ${hash}`) throw new CoordError("NEEDS_HUMAN", "Exact plan confirmation did not match");
+  if (await promptProtected(`Type ${action} ${hash} to apply this exact plan: `, false) !== `${action} ${hash}`) throw new CoordError("NEEDS_HUMAN", "Exact plan confirmation did not match");
   let bundle: Bundle;
   if (action === "bootstrap") {
     const exists = await lstat(vaultPath!).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; });
-    if (exists) bundle = await unlockBundle(plan, vaultPath!, await prompt("Vault passphrase (not cached): ", true));
+    if (exists) bundle = await unlockBundle(plan, vaultPath!, await promptProtected("Vault passphrase (not cached): ", true));
     else {
-      const passphrase = await prompt("New vault passphrase (16+ UTF-8 bytes; not cached): ", true);
-      if (passphrase !== await prompt("Repeat passphrase: ", true)) throw new CoordError("INVALID_INPUT", "Passphrases differ");
+      const passphrase = await promptProtected("New vault passphrase (16+ UTF-8 bytes; not cached): ", true);
+      if (passphrase !== await promptProtected("Repeat passphrase: ", true)) throw new CoordError("INVALID_INPUT", "Passphrases differ");
       bundle = await createBundle(plan, vaultPath!, passphrase);
     }
     await runOwnerBootstrap(plan, bundle, vaultPath!);
     console.log(JSON.stringify({ bootstrap: "confirmed", backendId: plan.config.backendId, projectId: plan.config.projectId, next: "Run setup connect in this external operator session; host qualification remains blocked" }));
   } else {
-    bundle = await unlockBundle(plan, vaultPath!, await prompt("Vault passphrase (not cached): ", true));
+    bundle = await unlockBundle(plan, vaultPath!, await promptProtected("Vault passphrase (not cached): ", true));
     await configureAndConnect(plan, bundle);
     console.log(JSON.stringify({ connected: true, backendId: plan.config.backendId, projectId: plan.config.projectId, authority: "project-agent only; host qualification remains blocked" }));
   }

@@ -16,6 +16,20 @@ coord daemon --runtime <protected-runtime.json> --check
 
 `--harness codex|antigravity` may confirm a resume selection; it cannot change the qualified executable/configuration. Session and operation IDs are nonsecret correlation values. Credentials and operator passphrases never belong in arguments or environment variables. Run grants are installed in private, backend-URL-bound session receipts. Worker credentials, lifecycle supervisors and artifact verifiers remain separate roles.
 
+## Protected approval
+
+Approving a goal is an owner action. It runs in a separate operator terminal, outside every agent or worker session, and reads the operator passphrase with hidden input only.
+
+```text
+coord approve goal <goal-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>
+```
+
+The command unlocks the existing encrypted vault without rewriting it or widening its binding, confirms the backend project is still the exact planned identity, and reads the named goal from project status. It then checks three things independently: the stated revision and hash are the project's current goal revision, the displayed content and limits reproduce that hash locally, and only a current draft revision is offered for approval. A mismatch is refused before anything is sent.
+
+Only then does it display the goal's revision, hash, task limit, run timeout and full content, and require the operator to type the exact approval phrase. Goal content is proposed source data: it is shown with control characters escaped so it cannot emit terminal escapes or forge a confirmation line, and it carries no authority over the approval. There is no flag that approves without that typed confirmation.
+
+The mutation rebinds the exact revision and hash, so a revision proposed while the operator was reading is rejected rather than approved by the stale confirmation. If the reply to an approval is lost, running the same command again reports the already bound approval, including the member it is bound to, instead of approving a second time. An approval already bound to a different member is refused as a conflict rather than reported as this operator's, so one owner can never read another owner's approval as their own. Passphrases and credentials never appear in arguments, environment values, output or errors, and raw backend errors are never printed because they can carry the request credential.
+
 ## Protected runtime selection
 
 The schema lives in `src/command-runtime.ts`. Its fixed fields describe the trusted canonical repository root; private runtime state; fresh worktree root; machine/member; explicit trusted registry and project-agent credential-store references; canonical harness executable; capability key/evidence; separate artifact-verifier and supervisor credential **file references**; exact GitHub HTTPS transport; optional Linux cgroup-v2 containment; and capture/environment/setup/verification policy. It accepts no shell snippets, callback modules, dynamic runner plugins, approval switch or model-supplied verification/stop evidence.
