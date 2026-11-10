@@ -64,6 +64,7 @@ async function briefing(binding: RunConnection, onlyRules = false, cursor?: stri
 export function createCoordMcpServer(options: CoordMcpOptions): McpServer {
   const server = new McpServer({ name: "coord", version: CLIENT_VERSION });
   registerConfirmationProbe(server);
+  registerConfirmationProbe(server, { declineOnly: true });
   let run = options.run;
   let initialized = false;
   let connected = true;

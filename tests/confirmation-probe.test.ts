@@ -15,12 +15,12 @@ import { createCoordMcpServer } from "../src/mcp.js";
 import { canonicalJson } from "../src/canonical.js";
 
 const nonce = (request: ElicitRequest) => request.params.message.match(/Public probe nonce: ([a-f0-9-]{36})/)![1]!;
-const payload = (result: unknown): ConfirmationProbeObservation => {
+const payload = (result: unknown, expectedAction: "no_effect_check" | "no_effect_decline_check" = "no_effect_check"): ConfirmationProbeObservation => {
   const response = result as { isError?: boolean; content: { text: string }[] };
   assert.ok(!response.isError, JSON.stringify(response));
   const value = JSON.parse(response.content[0]!.text) as ConfirmationProbeObservation;
   assert.equal(value.humanVerified, false); assert.equal(value.authorityGranted, false); assert.equal(value.sideEffects, "none");
-  assert.equal(value.synthetic.projectId, "coord-confirmation-probe"); assert.equal(value.synthetic.action, "no_effect_check");
+  assert.equal(value.synthetic.projectId, "coord-confirmation-probe"); assert.equal(value.synthetic.action, expectedAction);
   return value;
 };
 async function session(handler?: (request: ElicitRequest) => Promise<ElicitResult>, timeoutMs = 1000) {
@@ -104,4 +104,38 @@ test("the ordinary plugin probe never calls its backend or a bound run's check-i
     await server.connect(a); await client.connect(b);
     assert.equal(payload(await call(client)).outcome, "cancelled_response"); assert.equal(calls, 0);
   } finally { await client.close(); await server.close(); }
+});
+
+
+test("Decline path: fieldless denial cannot pass on Allow", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "coord-decline-"));
+  const client = new Client({ name: "decline-fixture", version: "fixture" }, { capabilities: { elicitation: { form: {} } } });
+  let action: "decline" | "accept" = "decline";
+  client.setRequestHandler(ElicitRequestSchema, async request => {
+    assert.equal(request.params.mode, "form");
+    assert.deepEqual("requestedSchema" in request.params ? request.params.requestedSchema : null, { type: "object", properties: {} });
+    return { action, ...(action === "accept" ? { content: {} } : {}) };
+  });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [resolve("dist/src/cli.js"), "mcp", "--confirmation-decline-probe"], cwd: directory, env: { PATH: process.env.PATH ?? "", COORD_RUNTIME_PATH: "/nonexistent/never-read-runtime.json", COORD_SESSION_ID: "never-load-session" }, stderr: "pipe" });
+  try {
+    await client.connect(transport);
+    assert.deepEqual((await client.listTools()).tools.map(tool => tool.name), ["coord_confirmation_decline_probe"]);
+    assert.equal((await client.callTool({ name: "coord_confirmation_decline_probe", arguments: { outcome: "decline", approved: true } })).isError, true);
+    const denied = payload(await client.callTool({ name: "coord_confirmation_decline_probe", arguments: {} }), "no_effect_decline_check");
+    assert.equal(denied.outcome, "declined_response"); assert.equal(denied.responseAction, "decline"); assert.equal(denied.contentMatched, false);
+    const { hash, ...source } = denied.synthetic;
+    assert.equal(createHash("sha256").update(canonicalJson(source)).digest("hex"), hash);
+    action = "accept";
+    const allowed = payload(await client.callTool({ name: "coord_confirmation_decline_probe", arguments: {} }), "no_effect_decline_check");
+    assert.equal(allowed.outcome, "invalid_response"); assert.equal(allowed.responseAction, "accept"); assert.equal(allowed.contentMatched, false);
+  } finally { await client.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("Decline path: literal decline remains invalid nonce content", async () => {
+  // A text-form submission is protocol Accept; the SDK rejects the word as a malformed nonce.
+  const text = await session(async () => ({ action: "accept", content: { nonce: "decline" } }));
+  try {
+    const invalid = payload(await call(text.client));
+    assert.equal(invalid.outcome, "request_failed"); assert.equal(invalid.responseAction, null);
+  } finally { await text.close(); }
 });
