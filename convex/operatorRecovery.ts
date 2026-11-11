@@ -1,9 +1,11 @@
-import { v } from "convex/values";
-import { internalMutation, internalQuery } from "./server.js";
+import { ConvexError, v } from "convex/values";
+import { makeFunctionReference } from "convex/server";
+import { internalAction, internalMutation, internalQuery } from "./server.js";
 import type { QueryCtx } from "./server.js";
 import { canonical, digest, fail, stableId } from "./auth.js";
 
 const selection = { backendId: v.string(), projectId: v.string(), repository: v.string(), remote: v.string(), defaultBranch: v.string(), memberId: v.string(), replacedCredentialId: v.string() };
+const recoveryArgs = { ...selection, recoveryId: v.string(), credentialId: v.string(), credentialDigest: v.string(), expiresAt: v.number() };
 async function selected(ctx: Pick<QueryCtx, "db">, args: { backendId: string; projectId: string; repository: string; remote: string; defaultBranch: string; memberId: string; replacedCredentialId: string }) {
   for (const id of [args.backendId, args.projectId, args.memberId, args.replacedCredentialId]) stableId(id);
   const metadata = await ctx.db.query("metadata").withIndex("by_backend", q => q.eq("backendId", args.backendId)).unique();
@@ -19,7 +21,7 @@ export const inspect = internalQuery({ args: selection, handler: async (ctx, arg
 } });
 
 /** Owner-only break-glass rotation, never a public endpoint or agent tool. */
-export const recover = internalMutation({ args: { ...selection, recoveryId: v.string(), credentialId: v.string(), credentialDigest: v.string(), expiresAt: v.number() }, handler: async (ctx, args) => {
+export const recover = internalMutation({ args: recoveryArgs, handler: async (ctx, args) => {
   const old = await selected(ctx, args); stableId(args.recoveryId); stableId(args.credentialId);
   if (args.credentialId !== `recovered_${args.recoveryId}` || args.credentialId === old.id || !/^[a-f0-9]{64}$/.test(args.credentialDigest) || !Number.isSafeInteger(args.expiresAt)) fail("INVALID_INPUT", "Invalid recovery binding");
   const payloadHash = await digest(canonical(args));
@@ -39,4 +41,23 @@ export const recover = internalMutation({ args: { ...selection, recoveryId: v.st
   await ctx.db.insert("idempotency", { credentialId: "deployment-owner", operation: "operatorRecovery.recover", requestId: args.recoveryId, payloadHash, resultJson: JSON.stringify(receipt) });
   await ctx.db.insert("audit", { projectId: args.projectId, actorId: "deployment-owner", operation: "operatorRecovery.recover", requestId: args.recoveryId, recordId: args.credentialId, detail: `replaced ${old.id}`, at: now });
   return receipt;
+} });
+
+/** Owner CLI transport envelope. Catch outside the mutation so every refused transaction rolls back. */
+export const recoverAttempt = internalAction({ args: recoveryArgs, returns: v.union(
+  v.object({ status: v.literal("recovered"), receipt: v.object({ recoveryId: v.string(), credentialId: v.string(), replacedCredentialId: v.string(), memberId: v.string(), projectId: v.string(), expiresAt: v.number(), recoveredAt: v.number() }) }),
+  v.object({ status: v.literal("refused"), code: v.union(v.literal("INVALID_INPUT"), v.literal("FORBIDDEN"), v.literal("IDEMPOTENCY_CONFLICT")) }),
+  v.object({ status: v.literal("unconfirmed") }),
+), handler: async (ctx, args) => {
+  try {
+    const receipt = await ctx.runMutation(makeFunctionReference<"mutation", typeof args>("operatorRecovery:recover"), args);
+    return { status: "recovered" as const, receipt };
+  } catch (error) {
+    if (error instanceof ConvexError && error.data && typeof error.data === "object" && !Array.isArray(error.data)) {
+      const code: unknown = error.data.code;
+      if (code === "INVALID_INPUT" || code === "FORBIDDEN" || code === "IDEMPOTENCY_CONFLICT") return { status: "refused", code } as const;
+    }
+    // Unknown failures may follow a committed transaction. Never turn them into a confirmed refusal.
+    return { status: "unconfirmed" as const };
+  }
 } });

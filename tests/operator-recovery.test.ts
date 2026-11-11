@@ -5,7 +5,8 @@ import fs, { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/p
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { convexToJson } from "convex/values";
+import { ConvexError, convexToJson } from "convex/values";
+import { getFunctionName } from "convex/server";
 import type { Value } from "convex/values";
 import { BackendFixture } from "./backend.fixture.js";
 import * as auth from "../convex/auth.js";
@@ -33,6 +34,14 @@ async function fixture() {
   return { directory, plan, planPath, oldVault, newVault, old, backend, selection, args };
 }
 const confirm = async (label: string, hidden: boolean): Promise<string> => hidden ? password : label.slice(5, label.indexOf(" to authorize this exact recovery:"));
+async function attempt(backend: BackendFixture, args: Record<string, unknown>) {
+  // The action catches the outcome of a separate transaction, including its rollback.
+  const ctx = { runMutation: async (reference: Parameters<typeof getFunctionName>[0], value: Record<string, unknown>) => {
+    assert.equal(getFunctionName(reference), "operatorRecovery:recover");
+    return backend.call(recovery.recover, value as never);
+  } };
+  return (recovery.recoverAttempt as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> })._handler(ctx, args);
+}
 async function wire(backend: BackendFixture, operation: () => Promise<void>) {
   const original = globalThis.fetch;
   const handlers = { "auth:handshake": auth.handshake, "projects:status": projects.status, "approvalAuth:beginEnrollment": approvalAuth.beginEnrollment, "approvalAuth:enrollmentStatus": approvalAuth.enrollmentStatus, "approvalAuth:finishEnrollment": approvalAuth.finishEnrollment };
@@ -82,6 +91,33 @@ test("owner recovery refuses wrong routing/member/scope/expiry and rolls back at
   } finally { await rm(x.directory, { recursive: true, force: true }); }
 });
 
+test("owner action reports only structured refusals after rollback and cannot revive later-revoked authority", async () => {
+  const x = await fixture(); try {
+    const before = structuredClone(x.backend.rows);
+    assert.deepEqual(await attempt(x.backend, { ...x.args, repository: "other" }), { status: "refused", code: "FORBIDDEN" });
+    assert.deepEqual(x.backend.rows, before);
+    assert.deepEqual(await attempt(x.backend, { ...x.args, credentialId: "human" }), { status: "refused", code: "INVALID_INPUT" });
+    const context = x.backend.context.bind(x.backend);
+    // Even an allowlisted refusal after the insert must roll back before the action catches it.
+    x.backend.context = () => { const ctx = context(); ctx.db.patch = async () => { throw new ConvexError({ code: "FORBIDDEN", message: "SENSITIVE TRANSACTION ERROR" }); }; return ctx; };
+    assert.deepEqual(await attempt(x.backend, x.args), { status: "refused", code: "FORBIDDEN" });
+    assert.deepEqual(x.backend.rows, before);
+    for (const error of [new Error("SENSITIVE DB ERROR"), new ConvexError({ code: "UNKNOWN", message: "SENSITIVE UNKNOWN ERROR" }), { data: { code: "FORBIDDEN" } }]) {
+      x.backend.context = () => { const ctx = context(); ctx.db.patch = async () => { throw error; }; return ctx; };
+      assert.deepEqual(await attempt(x.backend, x.args), { status: "unconfirmed" });
+      assert.deepEqual(x.backend.rows, before);
+    }
+    x.backend.context = context;
+    const success = await attempt(x.backend, x.args) as { status: string; receipt: unknown }; assert.equal(success.status, "recovered");
+    assert.deepEqual(await attempt(x.backend, x.args), success);
+    assert.deepEqual(await attempt(x.backend, { ...x.args, credentialDigest: "d".repeat(64) }), { status: "refused", code: "IDEMPOTENCY_CONFLICT" });
+    await x.backend.context().db.patch(x.backend.find("credentials", "recovered_one")._id, { revokedAt: Date.now() });
+    const revoked = structuredClone(x.backend.rows);
+    assert.deepEqual(await attempt(x.backend, x.args), { status: "refused", code: "FORBIDDEN" }); assert.deepEqual(x.backend.rows, revoked);
+    assert.equal((recovery.recoverAttempt as unknown as { isInternal: boolean }).isInternal, true);
+  } finally { await rm(x.directory, { recursive: true, force: true }); }
+});
+
 test("create refuses an existing lost vault without opening it or calling owner recovery", async () => {
   const x = await fixture(), open = fs.open; let openedOld = false, ownerCalled = false;
   fs.open = (async (...args: Parameters<typeof fs.open>) => { if (args[0] === x.oldVault) openedOld = true; return open(...args); }) as typeof fs.open; syncBuiltinESMExports();
@@ -98,7 +134,7 @@ test("human recovery persists only new authority before digest-only owner call; 
   const ownerCall = async (_plan: unknown, operation: "inspect" | "recover", args: Record<string, unknown>) => {
     if (operation === "inspect") return x.backend.call(recovery.inspect, args as never);
     const encoded = await readFile(x.newVault, "utf8"); assert(encoded.includes('"ciphertext"')); assert(!encoded.includes(password)); argsSeen.push(args);
-    const result = await x.backend.call(recovery.recover, args as never); if (loseReply) { loseReply = false; throw new Error("secret-child-error-canary"); } return result;
+    const result = await attempt(x.backend, args); if (loseReply) { loseReply = false; throw new Error("secret-child-error-canary"); } return result;
   };
   try {
     await assert.rejects(recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human"], { prompt: confirm, write: text => { shown.push(text); }, ownerCall }), error => !String(error).includes("secret-child-error-canary"));
@@ -112,7 +148,7 @@ test("human recovery persists only new authority before digest-only owner call; 
     await wire(x.backend, async () => {
       const session = await openOperatorSession({ plan: x.planPath, vault: x.newVault }, { prompt: async () => password, write: () => {} }); assert.equal(session.plan.humanId, "human");
       let enrollmentId = "";
-      await passkeySetupCommand([x.planPath, x.newVault], { prompt: async (label, hidden) => hidden ? password : label.slice(5, label.indexOf(" to approve exactly this:")), write: () => {}, openBrowser: async url => {
+      await passkeySetupCommand([x.planPath, x.newVault], { prompt: async (label, hidden) => hidden ? password : label === "Browser's own fingerprint (43 characters, copied from the browser): " ? "f".repeat(43) : label.slice(5, label.indexOf(" to approve exactly this:")), write: () => {}, openBrowser: async url => {
         enrollmentId = new URL(url).searchParams.get("enrollment")!;
         const row = x.backend.find("approvalEnrollments", enrollmentId); assert.equal(row.humanCredentialId, argsSeen[0]!.credentialId);
         await x.backend.context().db.patch(row._id, { credentialId: "Y3JlZGVudGlhbA", publicKeySpki: "cHVibGlj", fingerprint: "f".repeat(43), signCount: 0 });
@@ -122,11 +158,50 @@ test("human recovery persists only new authority before digest-only owner call; 
   } finally { await rm(x.directory, { recursive: true, force: true }); }
 });
 
-test("official owner subprocess receives only digests/public binding and suppresses raw errors", async () => {
-  const x = await fixture(), original = childProcess.execFileSync; const calls: string[][] = []; let output = "", failInspect = true;
+test("confirmed CLI refusal preserves the vault for protected inspection and never recommends blind retry", async () => {
+  const x = await fixture(); let shown = "";
+  const ownerCall = async (_plan: unknown, operation: "inspect" | "recover", args: Record<string, unknown>) => {
+    if (operation === "inspect") return x.backend.call(recovery.inspect, args as never);
+    const result = await attempt(x.backend, args);
+    if ((result as { status: string }).status === "recovered") {
+      await x.backend.context().db.patch(x.backend.find("credentials", String(args.credentialId))._id, { revokedAt: Date.now() });
+      throw new Error("SENSITIVE LOST REPLY");
+    }
+    return result;
+  };
+  try {
+    await assert.rejects(recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human"], { prompt: confirm, write: text => { shown += text; }, ownerCall }), /unconfirmed.*--retry/);
+    const encoded = await readFile(x.newVault), before = structuredClone(x.backend.rows);
+    await assert.rejects(recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human", "--retry"], { prompt: confirm, write: text => { shown += text; }, ownerCall }), error => {
+      const message = String(error); return message.includes("refused (FORBIDDEN)") && message.includes("Preserve the recovery vault") && message.includes("protected owner inspection") && !message.includes("--retry") && !message.includes("SENSITIVE");
+    });
+    assert.deepEqual(await readFile(x.newVault), encoded); assert.deepEqual(x.backend.rows, before); assert(!shown.includes("Operator access recovered."));
+  } finally { await rm(x.directory, { recursive: true, force: true }); }
+});
+
+test("malformed, unbound and unknown recovery replies stay uncertain with the same vault and exact retry", async () => {
+  const x = await fixture(); let reply: unknown, encoded: Buffer | undefined; const calls: Record<string, unknown>[] = [];
+  const ownerCall = async (_plan: unknown, operation: "inspect" | "recover", args: Record<string, unknown>) => {
+    if (operation === "inspect") return x.backend.call(recovery.inspect, args as never);
+    calls.push(args); if (reply instanceof Error) throw reply; return reply;
+  };
+  try {
+    for (const value of [new Error("SENSITIVE TIMEOUT"), undefined, [], { status: "refused", code: "UNKNOWN" }, { status: "refused", code: "FORBIDDEN", raw: "SENSITIVE" }, { status: "unconfirmed" }, { status: "recovered", receipt: {} }, { status: "recovered", receipt: { ...x.args, recoveredAt: Date.now() } }]) {
+      reply = value;
+      await assert.rejects(recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human", ...(encoded ? ["--retry"] : [])], { prompt: confirm, write: () => {}, ownerCall }), error => String(error).includes("unconfirmed") && String(error).includes("--retry") && !String(error).includes("SENSITIVE"));
+      const current = await readFile(x.newVault); if (encoded) assert.deepEqual(current, encoded); else encoded = current;
+      assert.equal(x.backend.find("credentials", "human").revokedAt, undefined);
+    }
+    assert(calls.every(args => JSON.stringify(args) === JSON.stringify(calls[0])));
+  } finally { await rm(x.directory, { recursive: true, force: true }); }
+});
+
+test("official owner subprocess parses only structured stdout and suppresses raw errors", async () => {
+  const x = await fixture(), original = childProcess.execFileSync; const calls: string[][] = []; let output = "", failInspect = true, recoverOutput: string | undefined;
   childProcess.execFileSync = ((file: string, args: readonly string[], options: unknown) => {
     if (!String(args[0]).endsWith("node_modules/convex/bin/main.js")) return original(file, args, options as never);
     calls.push([...args]); const operation = args[2]; if (operation === "operatorRecovery:inspect" && !failInspect) return JSON.stringify({ ...x.selection, expiresAt: x.plan.credentialExpiresAt, revoked: false });
+    if (operation === "operatorRecovery:recoverAttempt" && recoverOutput !== undefined) return recoverOutput;
     throw new Error("SENSITIVE OWNER CLI ERROR");
   }) as typeof childProcess.execFileSync; syncBuiltinESMExports();
   try {
@@ -134,6 +209,24 @@ test("official owner subprocess receives only digests/public binding and suppres
     await assert.rejects(readFile(x.newVault), { code: "ENOENT" }); assert.equal(x.backend.find("credentials", "human").revokedAt, undefined); failInspect = false; calls.length = 0;
     await assert.rejects(recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human"], { prompt: confirm, write: text => { output += text; } }), error => String(error).includes("unconfirmed") && !String(error).includes("SENSITIVE OWNER"));
     const unlocked = await unlockOperatorBundle(x.plan, x.newVault, password); const args = JSON.parse(calls[1]![3]!); assert.equal(args.credentialDigest, digest(unlocked.humanToken));
+    const encoded = await readFile(x.newVault), receipt = { recoveryId: args.recoveryId, credentialId: args.credentialId, replacedCredentialId: args.replacedCredentialId, memberId: args.memberId, projectId: args.projectId, expiresAt: args.expiresAt, recoveredAt: Date.now() };
+    for (const [value, expected] of [
+      [JSON.stringify({ status: "refused", code: "FORBIDDEN" }), /refused \(FORBIDDEN\).*protected owner inspection/],
+      ['SENSITIVE malformed stderr-like "code":"FORBIDDEN"', /unconfirmed.*--retry/],
+      [JSON.stringify({ status: "refused", code: "SENSITIVE UNKNOWN CODE" }), /unconfirmed.*--retry/],
+      [JSON.stringify({ status: "recovered", receipt: { ...receipt, credentialId: "wrong" } }), /unconfirmed.*--retry/],
+      [JSON.stringify({ status: "recovered", receipt: { ...receipt, raw: "SENSITIVE" } }), /unconfirmed.*--retry/],
+    ] as const) {
+      recoverOutput = value;
+      await assert.rejects(recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human", "--retry"], { prompt: confirm, write: text => { output += text; } }), error => expected.test(String(error)) && !String(error).includes("SENSITIVE"));
+      assert.deepEqual(await readFile(x.newVault), encoded);
+    }
+    assert(!output.includes("Operator access recovered."));
+    recoverOutput = JSON.stringify({ status: "recovered", receipt });
+    await recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human", "--retry"], { prompt: confirm, write: text => { output += text; } });
+    assert(output.includes("Operator access recovered."));
+    assert(calls.filter(args => args[2] === "operatorRecovery:recoverAttempt").every(call => call[3] === calls[1]![3]));
+    assert(!calls.some(args => args[2] === "operatorRecovery:recover"), "owner CLI always uses the safe action envelope");
     assert(!JSON.stringify(calls).includes(unlocked.humanToken)); assert(!JSON.stringify(calls).includes(password)); assert(!output.includes("SENSITIVE OWNER")); assert(calls.every(args => args.includes("--deployment") && args.includes("fixture") && !args.includes("--push")));
   } finally { childProcess.execFileSync = original; syncBuiltinESMExports(); await rm(x.directory, { recursive: true, force: true }); }
 });

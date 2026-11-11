@@ -16,15 +16,12 @@ const selection = (plan: SetupPlan, replacedCredentialId: string) => ({ backendI
 interface RecoveryIo extends OperatorIo { ownerCall?: (plan: SetupPlan, operation: "inspect" | "recover", args: Record<string, unknown>) => Promise<unknown> }
 async function ownerCall(plan: SetupPlan, operation: "inspect" | "recover", args: Record<string, unknown>): Promise<unknown> {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-  try {
-    // The official CLI alone handles owner authentication. Arguments contain only public selectors/digests.
-    const output = execFileSync(process.execPath, [join(root, "node_modules/convex/bin/main.js"), "run", `operatorRecovery:${operation}`, JSON.stringify(args), "--deployment", plan.deploymentName, "--typecheck", "disable", "--codegen", "disable"], { cwd: root, stdio: ["ignore", "pipe", "pipe"], timeout: 60_000, maxBuffer: 128 * 1024, encoding: "utf8" });
-    return JSON.parse(output) as unknown;
-  } catch {
-    if (operation === "inspect") throw new CoordError("NEEDS_HUMAN", "Owner inspection failed before recovery in this attempt. Authenticate the existing owner/admin account in your protected terminal, then rerun the same command unchanged. This attempt created no new vault; preserve any earlier recovery vault");
-    throw new CoordError("NEEDS_HUMAN", "Owner recovery unconfirmed. Preserve the new recovery vault and retry this exact operation with --retry; never reset bootstrap or generate another token after an uncertain reply");
-  }
+  // The official CLI alone handles owner authentication. Arguments contain only public selectors/digests.
+  const output = execFileSync(process.execPath, [join(root, "node_modules/convex/bin/main.js"), "run", `operatorRecovery:${operation === "recover" ? "recoverAttempt" : "inspect"}`, JSON.stringify(args), "--deployment", plan.deploymentName, "--typecheck", "disable", "--codegen", "disable"], { cwd: root, stdio: ["ignore", "pipe", "pipe"], timeout: 60_000, maxBuffer: 128 * 1024, encoding: "utf8" });
+  return JSON.parse(output) as unknown;
 }
+const unconfirmed = () => new CoordError("NEEDS_HUMAN", "Owner recovery unconfirmed. Preserve the recovery vault and retry this exact operation with --retry; never reset bootstrap or generate another token after an uncertain reply");
+const exactKeys = (value: Record<string, unknown>, keys: string[]) => Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new CoordError("BLOCKED_ENV", "Unreadable protected recovery response");
   return value as Record<string, unknown>;
@@ -43,7 +40,10 @@ export async function recoverOperatorCommand(args: string[], io: RecoveryIo = {}
       const exists = await lstat(vaultPath).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; });
       if (exists) throw new CoordError("UNTRUSTED_WORKSPACE_CONFIG", "Recovery requires a new vault path; existing files will not be opened or overwritten. Use --retry only for this operation's newly created recovery vault");
     }
-    const selected = selection(plan, oldId), inspection = object(await call(plan, "inspect", selected));
+    const selected = selection(plan, oldId);
+    let inspection: Record<string, unknown>;
+    try { inspection = object(await call(plan, "inspect", selected)); }
+    catch { throw new CoordError("NEEDS_HUMAN", "Owner inspection failed before recovery in this attempt. Authenticate the existing owner/admin account in your protected terminal, then rerun the same command unchanged. This attempt created no new vault; preserve any earlier recovery vault"); }
     if (Object.entries(selected).some(([key, value]) => inspection[key] !== value) || !Number.isSafeInteger(inspection.expiresAt) || typeof inspection.revoked !== "boolean" || (!retry && inspection.revoked)) throw new CoordError("BLOCKED_ENV", "Owner inspection did not confirm the exact recoverable human authority");
     if (plan.credentialExpiresAt <= Date.now() || plan.credentialExpiresAt > Date.now() + 365 * 86400_000 || (Number(inspection.expiresAt) > Date.now() && plan.credentialExpiresAt > Number(inspection.expiresAt))) throw new CoordError("FORBIDDEN", "Recovery expiry must be current and cannot extend a still-valid grant");
     write(`Protected operator recovery: ${JSON.stringify({ ...selected, expiresAt: plan.credentialExpiresAt, planDigest: planDigest(plan) })}\nThis creates replacement human authority and immediately revokes the selected old credential and its linked passkey/enrollment authority. Project policy, approvals, agent access and the existing vault stay unchanged.\n`);
@@ -65,9 +65,15 @@ export async function recoverOperatorCommand(args: string[], io: RecoveryIo = {}
     }
     // Exact retry re-establishes durable private bytes before revoking any authority remotely.
     await syncLocalFile(vaultPath, hash(encoded));
-    const result = object(await call(plan, "recover", { ...selected, recoveryId: bundle.recoveryId, credentialId: bundle.credentialId, credentialDigest: hash(bundle.humanToken), expiresAt: bundle.expiresAt }));
+    let reply: Record<string, unknown>;
+    try { reply = object(await call(plan, "recover", { ...selected, recoveryId: bundle.recoveryId, credentialId: bundle.credentialId, credentialDigest: hash(bundle.humanToken), expiresAt: bundle.expiresAt })); }
+    catch { throw unconfirmed(); }
+    if (reply.status === "refused" && exactKeys(reply, ["status", "code"]) && (reply.code === "INVALID_INPUT" || reply.code === "FORBIDDEN" || reply.code === "IDEMPOTENCY_CONFLICT")) throw new CoordError("NEEDS_HUMAN", `Owner recovery refused (${reply.code}). Preserve the recovery vault and use protected owner inspection before choosing another action; do not retry blindly or generate another token`);
+    if (reply.status !== "recovered" || !exactKeys(reply, ["status", "receipt"])) throw unconfirmed();
+    let result: Record<string, unknown>;
+    try { result = object(reply.receipt); } catch { throw unconfirmed(); }
     const expected = { recoveryId: bundle.recoveryId, credentialId: bundle.credentialId, replacedCredentialId: oldId, memberId: plan.humanId, projectId: plan.config.projectId, expiresAt: bundle.expiresAt };
-    if (Object.entries(expected).some(([key, value]) => result[key] !== value) || !Number.isSafeInteger(result.recoveredAt) || Number(result.recoveredAt) <= 0 || Number(result.recoveredAt) > Date.now() + 60_000) throw new CoordError("BLOCKED_ENV", "Recovery reply unconfirmed. Preserve the recovery vault and retry the exact operation with --retry; the backend may already have applied it");
+    if (!exactKeys(result, [...Object.keys(expected), "recoveredAt"]) || Object.entries(expected).some(([key, value]) => result[key] !== value) || !Number.isSafeInteger(result.recoveredAt) || Number(result.recoveredAt) <= 0 || Number(result.recoveredAt) > Date.now() + 60_000) throw unconfirmed();
     write(`${JSON.stringify({ ...expected, recoveredAt: result.recoveredAt })}\nOperator access recovered. Keep both vault files; use only the new human-only recovery vault for protected passkey enrollment and approvals. Do not run setup bootstrap/connect with it.\n`);
   } catch (error) { throw backendFailure(error); }
 }
