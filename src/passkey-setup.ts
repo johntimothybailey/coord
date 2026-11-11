@@ -30,16 +30,19 @@ export async function passkeySetupCommand(args: string[], io: SetupIo = {}): Pro
     const begin = await session.client.mutation("approvalAuth:beginEnrollment", { enrollmentId }, randomUUID()) as { enrollmentId: string; memberId: string; url: string; expiresAt: number };
     const url = new URL(begin.url), origin = approvalOriginForBackend(session.plan.config.backendUrl);
     if (begin.enrollmentId !== enrollmentId || begin.memberId !== session.plan.humanId || url.origin !== origin || url.pathname !== "/approval" || url.href !== `${origin}/approval?enrollment=${encodeURIComponent(enrollmentId)}` || !Number.isSafeInteger(begin.expiresAt) || begin.expiresAt <= Date.now() || begin.expiresAt > Date.now() + 11 * 60_000) throw new CoordError("BLOCKED_ENV", "Backend did not confirm this exact enrollment");
-    session.write(`Create a passkey in the protected browser page, then compare its OWN fingerprint here.\n${url.href}\n`);
+    session.write(`Create a passkey in the protected browser page, then enter its OWN fingerprint here.\n${url.href}\n`);
     try { await (io.openBrowser ?? browser)(url.href); } catch { session.write("Open the displayed HTTPS link in your browser; no key is authorized yet.\n"); }
     while (Date.now() < begin.expiresAt) {
       const status = await session.client.query("approvalAuth:enrollmentStatus", { enrollmentId }) as { enrollmentId: string; memberId: string; fingerprint: string | null; credentialId: string | null; expiresAt: number };
       if (status.enrollmentId !== enrollmentId || status.memberId !== session.plan.humanId || status.expiresAt !== begin.expiresAt) throw new CoordError("BLOCKED_ENV", "Enrollment identity changed");
       if (status.fingerprint) {
         if (!status.credentialId || decode64(status.credentialId, 2048).length > 1024 || !/^[A-Za-z0-9_-]{43}$/.test(status.fingerprint)) throw new CoordError("BLOCKED_ENV", "Invalid enrollment fingerprint");
-        session.write(`Browser-key fingerprint for project ${projectId}:\n${status.fingerprint}\nCompare this with the fingerprint computed by your browser from its own newly created passkey. Do not confirm a mismatched value or a browser error.\n`);
-        await confirmExactApproval(session, `enroll passkey ${projectId} ${status.fingerprint}`);
-        const result = await session.client.mutation("approvalAuth:finishEnrollment", { enrollmentId, fingerprint: status.fingerprint }, randomUUID()) as { credentialId?: string; memberId?: string; fingerprint?: string; enrolledAt?: number };
+        const browserFingerprint = await session.prompt("Browser's own fingerprint (43 characters, copied from the browser): ", false);
+        if (!/^[A-Za-z0-9_-]{43}$/.test(browserFingerprint)) throw new CoordError("NEEDS_HUMAN", "Browser fingerprint must be exactly 43 base64url characters; no key was authorized");
+        if (browserFingerprint !== status.fingerprint) throw new CoordError("NEEDS_HUMAN", "Browser fingerprint did not match the staged passkey; no key was authorized");
+        session.write(`Browser fingerprint matched the staged passkey for project ${projectId}.\n`);
+        await confirmExactApproval(session, `enroll passkey ${projectId} ${browserFingerprint}`);
+        const result = await session.client.mutation("approvalAuth:finishEnrollment", { enrollmentId, fingerprint: browserFingerprint }, randomUUID()) as { credentialId?: string; memberId?: string; fingerprint?: string; enrolledAt?: number };
         if (!result || result.credentialId !== status.credentialId || result.memberId !== session.plan.humanId || result.fingerprint !== status.fingerprint || !Number.isSafeInteger(result.enrolledAt) || result.enrolledAt! <= 0 || result.enrolledAt! > Date.now() + 60_000) throw new CoordError("BLOCKED_ENV", "Passkey enrollment reply unconfirmed; preserve the key and inspect protected enrollment status before retrying");
         session.write(`${JSON.stringify({ credentialId: result.credentialId, memberId: result.memberId, fingerprint: result.fingerprint, enrolledAt: result.enrolledAt })}\nPasskey enrolled. Routine rule approval now uses the browser link from chat.\n`); return;
       }
