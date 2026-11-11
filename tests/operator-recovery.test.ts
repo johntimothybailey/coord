@@ -272,6 +272,26 @@ test("the bounded expiry sweep keeps deliberately revoked human authority unreco
   } finally { await rm(x.directory, { recursive: true, force: true }); }
 });
 
+test("explicit revocation in the sweep millisecond refuses owner recovery without changing state", async t => {
+  const x = await fixture(), now = Date.now(); t.mock.method(Date, "now", () => now);
+  try {
+    const { PROTOCOL_VERSION, CAPABILITIES, CLIENT_VERSION } = await import("../src/protocol.js");
+    const identity = { backendId: "backend", projectId: "project", protocolVersion: PROTOCOL_VERSION, clientVersion: CLIENT_VERSION, capabilities: [...CAPABILITIES] };
+    const inviteToken = "1".repeat(64), humanToken = "2".repeat(64);
+    await x.backend.call(auth.invite, { ...identity, token: x.old.humanToken, requestId: "invite-revoker", inviteToken, memberId: "second_human", projectIds: ["project"], role: "human", expiresAt: now + 60_000 });
+    assert.deepEqual(await x.backend.call(auth.redeem, { ...identity, requestId: "redeem-revoker", inviteToken, newToken: humanToken, credentialExpiresAt: x.plan.credentialExpiresAt }), { joined: true, memberId: "second_human", role: "human", projectIds: ["project"] });
+    await x.backend.context().db.patch(x.backend.find("credentials", "human")._id, { expiresAt: now - 1 });
+    await x.backend.call(lifecycle.sweep, {});
+    assert.equal(x.backend.find("credentials", "human").lapsedAt, now);
+    assert.deepEqual(await x.backend.call(auth.revoke, { ...identity, token: humanToken, requestId: "deliberate-revoke", credentialId: "human" }), { revoked: "human" });
+    assert.equal(x.backend.find("credentials", "human").revokedAt, now, "explicit revoke shares the sweep timestamp");
+    const revoked = structuredClone(x.backend.rows);
+    assert.deepEqual(await attempt(x.backend, x.args), { status: "refused", code: "FORBIDDEN" });
+    assert.deepEqual(x.backend.rows, revoked, "refused recovery changes no credentials, receipts or audit rows");
+    assert.equal(x.backend.find("credentials", "human").lapsedAt, undefined);
+  } finally { await rm(x.directory, { recursive: true, force: true }); }
+});
+
 test("owner inspection reports the replacement credential so a confirmed refusal names the permanent state", async () => {
   const x = await fixture(); let shown = ""; const ownerCall = wiredOwnerCall(x); try {
     assert.deepEqual((await x.backend.call(recovery.inspect, { ...x.selection, replacementCredentialId: "recovered_one" }) as { replacement: unknown }).replacement, { present: false, revoked: false, expiresAt: null });

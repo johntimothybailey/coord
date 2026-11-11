@@ -124,7 +124,7 @@ export const revoke = mutation({ args: { ...identityArgs, credentialId: v.string
   return replay(ctx, actor, "auth.revoke", args, async () => {
     const target = await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", args.credentialId)).unique();
     if (!target || target.backendId !== args.backendId || target.projectIds.some(id => !actor.projectIds.includes(id))) fail("FORBIDDEN", "Credential is outside human scope");
-    await ctx.db.patch(target._id, { revokedAt: Date.now() }); return { revoked: target.id };
+    await ctx.db.patch(target._id, { revokedAt: Date.now(), lapsedAt: undefined }); return { revoked: target.id };
   });
 } });
 
