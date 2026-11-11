@@ -21,10 +21,25 @@ async function ownerCall(plan: SetupPlan, operation: "inspect" | "recover", args
   return JSON.parse(output) as unknown;
 }
 const unconfirmed = () => new CoordError("NEEDS_HUMAN", "Owner recovery unconfirmed. Preserve the recovery vault and retry this exact operation with --retry; never reset bootstrap or generate another token after an uncertain reply");
+const INSPECT_FIRST = "Preserve the recovery vault and use protected owner inspection before choosing another action; do not retry blindly or generate another token";
 const exactKeys = (value: Record<string, unknown>, keys: string[]) => Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new CoordError("BLOCKED_ENV", "Unreadable protected recovery response");
   return value as Record<string, unknown>;
+}
+/** A confirmed refusal is deterministic: report the replacement authority's own state instead of an exact retry that cannot change it. */
+async function refusalGuidance(plan: SetupPlan, call: NonNullable<RecoveryIo["ownerCall"]>, selected: Record<string, unknown>, credentialId: string): Promise<string> {
+  let replacement: Record<string, unknown>;
+  try {
+    const inspection = object(await call(plan, "inspect", { ...selected, replacementCredentialId: credentialId }));
+    if (Object.entries(selected).some(([key, value]) => inspection[key] !== value) || inspection.replacementCredentialId !== credentialId) throw new CoordError("BLOCKED_ENV", "Unreadable protected recovery response");
+    replacement = object(inspection.replacement);
+    if (!exactKeys(replacement, ["present", "revoked", "expiresAt"]) || typeof replacement.present !== "boolean" || typeof replacement.revoked !== "boolean") throw new CoordError("BLOCKED_ENV", "Unreadable protected recovery response");
+  } catch { return INSPECT_FIRST; }
+  // Raw inspection values are never displayed; only this classification of existence, revocation and expiry.
+  if (!replacement.present) return `Follow-up protected owner inspection found no replacement human authority, so this vault holds none and no exact retry can create it. ${INSPECT_FIRST}`;
+  if (replacement.revoked || !Number.isSafeInteger(replacement.expiresAt) || Number(replacement.expiresAt) <= Date.now()) return "Follow-up protected owner inspection reports the recorded replacement human authority as revoked or expired, so no exact retry can ever succeed and this vault cannot be revived. Preserve the recovery vault and plan for the deployment owner: re-establishing human authority now needs owner-level intervention that this operation cannot perform; do not generate another token yourself";
+  return `Follow-up protected owner inspection reports the recorded replacement human authority as present and still valid, so this recovery already applied and no exact retry can change it. Preserve the recovery vault and confirm through protected owner inspection which vault matches that credential; do not generate another token. ${INSPECT_FIRST}`;
 }
 /** Human-only supporting recovery. The old vault is never selected, opened, decrypted or overwritten. */
 export async function recoverOperatorCommand(args: string[], io: RecoveryIo = {}): Promise<void> {
@@ -44,10 +59,11 @@ export async function recoverOperatorCommand(args: string[], io: RecoveryIo = {}
     let inspection: Record<string, unknown>;
     try { inspection = object(await call(plan, "inspect", selected)); }
     catch { throw new CoordError("NEEDS_HUMAN", "Owner inspection failed before recovery in this attempt. Authenticate the existing owner/admin account in your protected terminal, then rerun the same command unchanged. This attempt created no new vault; preserve any earlier recovery vault"); }
-    if (Object.entries(selected).some(([key, value]) => inspection[key] !== value) || !Number.isSafeInteger(inspection.expiresAt) || typeof inspection.revoked !== "boolean" || (!retry && inspection.revoked)) throw new CoordError("BLOCKED_ENV", "Owner inspection did not confirm the exact recoverable human authority");
+    if (Object.entries(selected).some(([key, value]) => inspection[key] !== value) || !Number.isSafeInteger(inspection.expiresAt) || typeof inspection.revoked !== "boolean" || typeof inspection.lapsed !== "boolean" || (!retry && inspection.revoked && !inspection.lapsed)) throw new CoordError("BLOCKED_ENV", "Owner inspection did not confirm the exact recoverable human authority");
     if (plan.credentialExpiresAt <= Date.now() || plan.credentialExpiresAt > Date.now() + 365 * 86400_000 || (Number(inspection.expiresAt) > Date.now() && plan.credentialExpiresAt > Number(inspection.expiresAt))) throw new CoordError("FORBIDDEN", "Recovery expiry must be current and cannot extend a still-valid grant");
     write(`Protected operator recovery: ${JSON.stringify({ ...selected, expiresAt: plan.credentialExpiresAt, planDigest: planDigest(plan) })}\nThis creates replacement human authority and immediately revokes the selected old credential and its linked passkey/enrollment authority. Project policy, approvals, agent access and the existing vault stay unchanged.\n`);
-    if (Number(inspection.expiresAt) <= Date.now()) write("The old grant expired. This operation explicitly reauthorizes the displayed human scope until the displayed new expiry.\n");
+    // The bounded expiry sweep revokes a lapsed grant and clears its expiry, so the lapse itself reports the reauthorization.
+    if (inspection.lapsed === true || Number(inspection.expiresAt) <= Date.now()) write("The old grant expired. This operation explicitly reauthorizes the displayed human scope until the displayed new expiry.\n");
     const phrase = `recover operator ${plan.config.projectId} ${oldId} ${planDigest(plan)} ${plan.credentialExpiresAt}`;
     if (await prompt(`Type ${phrase} to authorize this exact recovery: `, false) !== phrase) throw new CoordError("NEEDS_HUMAN", "Exact recovery confirmation did not match");
     let bundle: RecoveredOperatorBundle, encoded: string;
@@ -68,7 +84,7 @@ export async function recoverOperatorCommand(args: string[], io: RecoveryIo = {}
     let reply: Record<string, unknown>;
     try { reply = object(await call(plan, "recover", { ...selected, recoveryId: bundle.recoveryId, credentialId: bundle.credentialId, credentialDigest: hash(bundle.humanToken), expiresAt: bundle.expiresAt })); }
     catch { throw unconfirmed(); }
-    if (reply.status === "refused" && exactKeys(reply, ["status", "code"]) && (reply.code === "INVALID_INPUT" || reply.code === "FORBIDDEN" || reply.code === "IDEMPOTENCY_CONFLICT")) throw new CoordError("NEEDS_HUMAN", `Owner recovery refused (${reply.code}). Preserve the recovery vault and use protected owner inspection before choosing another action; do not retry blindly or generate another token`);
+    if (reply.status === "refused" && exactKeys(reply, ["status", "code"]) && (reply.code === "INVALID_INPUT" || reply.code === "FORBIDDEN" || reply.code === "IDEMPOTENCY_CONFLICT")) throw new CoordError("NEEDS_HUMAN", `Owner recovery refused (${reply.code}). ${await refusalGuidance(plan, call, selected, bundle.credentialId)}`);
     if (reply.status !== "recovered" || !exactKeys(reply, ["status", "receipt"])) throw unconfirmed();
     let result: Record<string, unknown>;
     try { result = object(reply.receipt); } catch { throw unconfirmed(); }

@@ -129,7 +129,8 @@ export const confirmStopped = mutation({ args: { ...runArgs, evidence: stopEvide
 export const sweep = internalMutation({ args: {}, handler: async ctx => {
   const now = Date.now();
   const expiredCredentials = await ctx.db.query("credentials").withIndex("by_expiry", q => q.lte("expiresAt", now)).take(100);
-  for (const credential of expiredCredentials) await ctx.db.patch(credential._id, { revokedAt: credential.revokedAt ?? now, expiresAt: Number.MAX_SAFE_INTEGER });
+  // A swept lapse stays distinguishable from a deliberate revocation: stamp the cause without changing any existing denial.
+  for (const credential of expiredCredentials) await ctx.db.patch(credential._id, credential.revokedAt === undefined ? { revokedAt: now, lapsedAt: now, expiresAt: Number.MAX_SAFE_INTEGER } : { expiresAt: Number.MAX_SAFE_INTEGER });
   const expiredRuns = await ctx.db.query("runs").withIndex("by_lease", q => q.lte("leaseUntil", now)).take(100);
   for (const run of expiredRuns) {
     if (run.mode === "manual") {

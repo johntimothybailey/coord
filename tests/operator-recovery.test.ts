@@ -11,6 +11,7 @@ import type { Value } from "convex/values";
 import { BackendFixture } from "./backend.fixture.js";
 import * as auth from "../convex/auth.js";
 import * as recovery from "../convex/operatorRecovery.js";
+import * as lifecycle from "../convex/lifecycle.js";
 import * as approvalAuth from "../convex/approvalAuth.js";
 import * as projects from "../convex/projects.js";
 import { bootstrapArguments, createBundle, parseSetupPlan, unlockBundle, unlockOperatorBundle } from "../src/onboarding.js";
@@ -200,7 +201,7 @@ test("official owner subprocess parses only structured stdout and suppresses raw
   const x = await fixture(), original = childProcess.execFileSync; const calls: string[][] = []; let output = "", failInspect = true, recoverOutput: string | undefined;
   childProcess.execFileSync = ((file: string, args: readonly string[], options: unknown) => {
     if (!String(args[0]).endsWith("node_modules/convex/bin/main.js")) return original(file, args, options as never);
-    calls.push([...args]); const operation = args[2]; if (operation === "operatorRecovery:inspect" && !failInspect) return JSON.stringify({ ...x.selection, expiresAt: x.plan.credentialExpiresAt, revoked: false });
+    calls.push([...args]); const operation = args[2]; if (operation === "operatorRecovery:inspect" && !failInspect) return JSON.stringify({ ...x.selection, expiresAt: x.plan.credentialExpiresAt, revoked: false, lapsed: false });
     if (operation === "operatorRecovery:recoverAttempt" && recoverOutput !== undefined) return recoverOutput;
     throw new Error("SENSITIVE OWNER CLI ERROR");
   }) as typeof childProcess.execFileSync; syncBuiltinESMExports();
@@ -229,4 +230,70 @@ test("official owner subprocess parses only structured stdout and suppresses raw
     assert(!calls.some(args => args[2] === "operatorRecovery:recover"), "owner CLI always uses the safe action envelope");
     assert(!JSON.stringify(calls).includes(unlocked.humanToken)); assert(!JSON.stringify(calls).includes(password)); assert(!output.includes("SENSITIVE OWNER")); assert(calls.every(args => args.includes("--deployment") && args.includes("fixture") && !args.includes("--push")));
   } finally { childProcess.execFileSync = original; syncBuiltinESMExports(); await rm(x.directory, { recursive: true, force: true }); }
+});
+
+// The recorded audit row names the public replacement credential without opening the recovery vault's own binding.
+const recoveredId = (backend: BackendFixture): string => String([...backend.rows.values()].find(row => row._table === "audit" && row.operation === "operatorRecovery.recover")!.recordId);
+const wiredOwnerCall = (x: { backend: BackendFixture }) => async (_plan: unknown, operation: "inspect" | "recover", args: Record<string, unknown>): Promise<unknown> =>
+  operation === "inspect" ? x.backend.call(recovery.inspect, args as never) : attempt(x.backend, args);
+
+test("the bounded expiry sweep leaves lapsed human authority recoverable through the documented path", async () => {
+  const x = await fixture(); let shown = ""; try {
+    const beforeAgent = x.backend.find("credentials", "agent"), beforeProject = x.backend.find("projects", "project");
+    await x.backend.context().db.patch(x.backend.find("credentials", "human")._id, { expiresAt: Date.now() - 1 });
+    assert.equal((await x.backend.call(lifecycle.sweep, {}) as { credentials: number }).credentials, 1);
+    const swept = x.backend.find("credentials", "human");
+    // The sweep must keep revoking the lapsed grant; only its separate cause stamp makes the lapse recoverable.
+    assert.equal(typeof swept.revokedAt, "number"); assert.equal(swept.lapsedAt, swept.revokedAt); assert.equal(swept.expiresAt, Number.MAX_SAFE_INTEGER);
+    await assert.rejects(x.backend.call(auth.handshake, { backendId: "backend", projectId: "project", token: x.old.humanToken, protocolVersion: 1, clientVersion: "0.1.0-private", capabilities: [], requestId: "swept" }), /invalid for this backend\/project/);
+    assert.deepEqual(await x.backend.call(recovery.inspect, x.selection), { ...x.selection, expiresAt: Number.MAX_SAFE_INTEGER, revoked: true, lapsed: true, replacement: null });
+    await recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human"], { prompt: confirm, write: text => { shown += text; }, ownerCall: wiredOwnerCall(x) });
+    assert(shown.includes("The old grant expired."), "a swept lapse still reports explicit reauthorization");
+    assert(shown.includes("Operator access recovered."));
+    const recovered = await unlockOperatorBundle(x.plan, x.newVault, password), replacement = x.backend.find("credentials", recoveredId(x.backend));
+    assert.equal(replacement.revokedAt, undefined); assert.equal(replacement.memberId, "human"); assert.equal(replacement.digest, digest(recovered.humanToken)); assert.equal(replacement.expiresAt, x.plan.credentialExpiresAt);
+    const replaced = x.backend.find("credentials", "human");
+    assert.equal(typeof replaced.revokedAt, "number"); assert.equal(replaced.lapsedAt, undefined, "recovery replaces the lapse with its own deliberate revocation");
+    assert.deepEqual(x.backend.find("credentials", "agent"), beforeAgent); assert.deepEqual(x.backend.find("projects", "project"), beforeProject);
+    for (const secret of [password, oldPassword, x.old.humanToken, recovered.humanToken]) assert(!shown.includes(secret));
+  } finally { await rm(x.directory, { recursive: true, force: true }); }
+});
+
+test("the bounded expiry sweep keeps deliberately revoked human authority unrecoverable", async () => {
+  const x = await fixture(); const revokedAt = Date.now() - 5_000; try {
+    await x.backend.context().db.patch(x.backend.find("credentials", "human")._id, { revokedAt, expiresAt: Date.now() - 1 });
+    await x.backend.call(lifecycle.sweep, {});
+    const swept = x.backend.find("credentials", "human");
+    assert.equal(swept.revokedAt, revokedAt); assert.equal(swept.lapsedAt, undefined, "the sweep never stamps a lapse over a deliberate revocation");
+    assert.deepEqual(await x.backend.call(recovery.inspect, x.selection), { ...x.selection, expiresAt: Number.MAX_SAFE_INTEGER, revoked: true, lapsed: false, replacement: null });
+    await assert.rejects(x.backend.call(recovery.recover, x.args), /cannot replace revoked authority/);
+    await assert.rejects(recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human"], { prompt: confirm, write: () => {}, ownerCall: wiredOwnerCall(x) }), /did not confirm the exact recoverable human authority/);
+    await assert.rejects(readFile(x.newVault), { code: "ENOENT" });
+  } finally { await rm(x.directory, { recursive: true, force: true }); }
+});
+
+test("owner inspection reports the replacement credential so a confirmed refusal names the permanent state", async () => {
+  const x = await fixture(); let shown = ""; const ownerCall = wiredOwnerCall(x); try {
+    assert.deepEqual((await x.backend.call(recovery.inspect, { ...x.selection, replacementCredentialId: "recovered_one" }) as { replacement: unknown }).replacement, { present: false, revoked: false, expiresAt: null });
+    await recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human"], { prompt: confirm, write: text => { shown += text; }, ownerCall });
+    const recovered = await unlockOperatorBundle(x.plan, x.newVault, password), credentialId = recoveredId(x.backend);
+    const healthy = await x.backend.call(recovery.inspect, { ...x.selection, replacementCredentialId: credentialId });
+    assert.deepEqual((healthy as { replacement: unknown }).replacement, { present: true, revoked: false, expiresAt: x.plan.credentialExpiresAt });
+    for (const secret of [digest(recovered.humanToken), recovered.humanToken, password]) assert(!JSON.stringify(healthy).includes(secret));
+    const record = [...x.backend.rows.values()].find(row => row._table === "idempotency" && row.operation === "operatorRecovery.recover")!;
+    await x.backend.context().db.patch(record._id as never, { payloadHash: "0".repeat(64) });
+    await assert.rejects(recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human", "--retry"], { prompt: confirm, write: text => { shown += text; }, ownerCall }), error => {
+      const message = String(error);
+      return message.includes("refused (IDEMPOTENCY_CONFLICT)") && message.includes("present and still valid") && message.includes("already applied") && !message.includes("--retry");
+    });
+    await x.backend.context().db.patch(record._id as never, { payloadHash: record.payloadHash as string });
+    await x.backend.context().db.patch(x.backend.find("credentials", credentialId)._id, { expiresAt: Date.now() - 1 });
+    const expired = structuredClone(x.backend.rows);
+    await assert.rejects(recoverOperatorCommand([x.planPath, x.newVault, "--replace", "human", "--retry"], { prompt: confirm, write: text => { shown += text; }, ownerCall }), error => {
+      const message = String(error);
+      return message.includes("refused (FORBIDDEN)") && message.includes("revoked or expired") && message.includes("no exact retry can ever succeed") && message.includes("Preserve the recovery vault") && !message.includes("--retry");
+    });
+    assert.deepEqual(x.backend.rows, expired, "a confirmed refusal changes no backend state");
+    assert.equal(shown.split("Operator access recovered.").length - 1, 1);
+  } finally { await rm(x.directory, { recursive: true, force: true }); }
 });

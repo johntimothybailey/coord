@@ -1,7 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import { makeFunctionReference } from "convex/server";
 import { internalAction, internalMutation, internalQuery } from "./server.js";
-import type { QueryCtx } from "./server.js";
+import type { Doc, QueryCtx } from "./server.js";
 import { canonical, digest, fail, stableId } from "./auth.js";
 
 const selection = { backendId: v.string(), projectId: v.string(), repository: v.string(), remote: v.string(), defaultBranch: v.string(), memberId: v.string(), replacedCredentialId: v.string() };
@@ -14,10 +14,19 @@ async function selected(ctx: Pick<QueryCtx, "db">, args: { backendId: string; pr
   if (!metadata || !project || project.backendId !== args.backendId || project.repository !== args.repository || project.remote !== args.remote || project.defaultBranch !== args.defaultBranch || !old || old.role !== "human" || old.backendId !== args.backendId || old.memberId !== args.memberId || old.projectIds.length !== 1 || old.projectIds[0] !== args.projectId || old.machineId !== undefined || old.runId !== undefined) fail("FORBIDDEN", "Recovery must select the exact existing project and single-project human authority");
   return old;
 }
+/** The expiry sweep revokes a lapsed grant to keep every denial exact, so only its own lapse stamp marks a recoverable lapse. */
+const lapsed = (credential: Doc<"credentials">): boolean => credential.revokedAt !== undefined && credential.lapsedAt === credential.revokedAt;
 /** Deployment-owner inspection only. Never returns a credential digest, token or browser key. */
-export const inspect = internalQuery({ args: selection, handler: async (ctx, args) => {
+export const inspect = internalQuery({ args: { ...selection, replacementCredentialId: v.optional(v.string()) }, handler: async (ctx, args) => {
   const old = await selected(ctx, args);
-  return { ...args, expiresAt: old.expiresAt, revoked: old.revokedAt !== undefined };
+  let replacement: { present: boolean; revoked: boolean; expiresAt: number | null } | null = null;
+  if (args.replacementCredentialId !== undefined) {
+    stableId(args.replacementCredentialId);
+    // A confirmed refusal is permanent, so the owner must also see whether the replacement authority exists and still authorizes.
+    const record = await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", args.replacementCredentialId!)).unique();
+    replacement = { present: record !== null, revoked: record?.revokedAt !== undefined, expiresAt: record ? record.expiresAt : null };
+  }
+  return { ...args, expiresAt: old.expiresAt, revoked: old.revokedAt !== undefined, lapsed: lapsed(old), replacement };
 } });
 
 /** Owner-only break-glass rotation, never a public endpoint or agent tool. */
@@ -34,9 +43,9 @@ export const recover = internalMutation({ args: recoveryArgs, handler: async (ct
     return JSON.parse(prior.resultJson) as { recoveryId: string; credentialId: string; replacedCredentialId: string; memberId: string; projectId: string; expiresAt: number; recoveredAt: number };
   }
   const now = Date.now();
-  if (old.revokedAt !== undefined || replacement || args.expiresAt <= now || args.expiresAt > now + 365 * 86400_000 || (old.expiresAt > now && args.expiresAt > old.expiresAt) || await ctx.db.query("credentials").withIndex("by_digest", q => q.eq("digest", args.credentialDigest)).unique()) fail("FORBIDDEN", "Recovery cannot replace revoked authority, collide or extend a still-valid grant");
+  if ((old.revokedAt !== undefined && !lapsed(old)) || replacement || args.expiresAt <= now || args.expiresAt > now + 365 * 86400_000 || (old.expiresAt > now && args.expiresAt > old.expiresAt) || await ctx.db.query("credentials").withIndex("by_digest", q => q.eq("digest", args.credentialDigest)).unique()) fail("FORBIDDEN", "Recovery cannot replace revoked authority, collide or extend a still-valid grant");
   await ctx.db.insert("credentials", { id: args.credentialId, backendId: args.backendId, memberId: old.memberId, role: "human", projectIds: [args.projectId], digest: args.credentialDigest, expiresAt: args.expiresAt });
-  await ctx.db.patch(old._id, { revokedAt: now });
+  await ctx.db.patch(old._id, { revokedAt: now, lapsedAt: undefined });
   const receipt = { recoveryId: args.recoveryId, credentialId: args.credentialId, replacedCredentialId: old.id, memberId: old.memberId, projectId: args.projectId, expiresAt: args.expiresAt, recoveredAt: now };
   await ctx.db.insert("idempotency", { credentialId: "deployment-owner", operation: "operatorRecovery.recover", requestId: args.recoveryId, payloadHash, resultJson: JSON.stringify(receipt) });
   await ctx.db.insert("audit", { projectId: args.projectId, actorId: "deployment-owner", operation: "operatorRecovery.recover", requestId: args.recoveryId, recordId: args.credentialId, detail: `replaced ${old.id}`, at: now });
