@@ -5,7 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { getFunctionName } from "convex/server";
-import { bootstrap, canonical, digest } from "../convex/auth.js";
+import { bootstrap, canonical, digest, invite, redeem } from "../convex/auth.js";
 import * as auth from "../convex/approvalAuth.js";
 import * as requests from "../convex/approvalRequests.js";
 import router from "../convex/http.js";
@@ -19,7 +19,7 @@ import type { PasskeyAssertion } from "../src/passkeys.js";
 // Software test authenticators and serialized handlers prove logic, not physical user/device qualification.
 const origin = "https://fixture.convex.site";
 process.env.CONVEX_SITE_URL = origin;
-const agent = "a".repeat(64), human = "b".repeat(64);
+const agent = "a".repeat(64), human = "b".repeat(64), secondHuman = "c".repeat(64);
 let serial = 0;
 const identity = (token = agent) => ({ token, protocolVersion: 1, clientVersion: CLIENT_VERSION, capabilities: [...CAPABILITIES], backendId: "backend", projectId: "project", requestId: `passkey_${++serial}` });
 const code = (expected: string) => (error: unknown) => (error as { data?: { code?: string } }).data?.code === expected;
@@ -49,14 +49,22 @@ async function fixture() {
   return { f, source, target };
 }
 type Authenticator = Awaited<ReturnType<typeof authenticator>>;
-async function enroll(f: BackendFixture, key: Authenticator) {
+async function enroll(f: BackendFixture, key: Authenticator, token = human) {
   const enrollmentId = `enrollment_${++serial}`;
-  await f.call(auth.beginEnrollment, { ...identity(human), enrollmentId });
+  await f.call(auth.beginEnrollment, { ...identity(token), enrollmentId });
   const options = await f.call(auth.enrollmentOptions, { enrollmentId }) as { challenge: string; binding: string };
   const candidate = await f.call(auth.stageEnrollment, { enrollmentId, credentialId: key.id, publicKeySpki: key.spki, assertion: await key.sign(options.challenge) }) as { fingerprint: string };
   assert.equal(candidate.fingerprint, await passkeyFingerprint(key.id, key.spki, options.binding));
-  await f.call(auth.finishEnrollment, { ...identity(human), enrollmentId, fingerprint: candidate.fingerprint });
+  await f.call(auth.finishEnrollment, { ...identity(token), enrollmentId, fingerprint: candidate.fingerprint });
   return { enrollmentId, candidate };
+}
+// A real second project human, joined through the one-use invite path rather than a hand-written credential row.
+async function joinHuman(f: BackendFixture, memberId: string, token: string) {
+  const inviteToken = "d".repeat(64);
+  await f.call(invite, { ...identity(human), inviteToken, memberId, projectIds: ["project"], role: "human", expiresAt: Date.now() + 60_000 });
+  const { token: _unused, ...join } = identity();
+  const joined = await f.call(redeem, { ...join, inviteToken, newToken: token, credentialExpiresAt: Date.now() + 3600_000 }) as { joined: boolean };
+  assert.equal(joined.joined, true);
 }
 async function pending(f: BackendFixture, target: { memoryId: string; revision: number; hash: string }, id = `intent_${++serial}`) {
   return f.call(requests.requestRule, { ...identity(), requestId: id, ...target }) as Promise<requests.ApprovalRequestView>;
@@ -147,6 +155,19 @@ test("approval requires prior private review and the same enrolled human key", a
   const { f, target } = await fixture(), a = await authenticator(), b = await authenticator();await enroll(f, a);await enroll(f, b);const request=await pending(f,target), args={approvalRequestId:request.envelope.id,requestDigest:request.requestDigest};
   await assert.rejects(f.call(auth.challenge,{...args,phase:"approve"}),code("FORBIDDEN"));await reviewed(f,a,request);const challenge=await f.call(auth.challenge,{...args,phase:"approve"}) as { challenge: string };
   const reviewChallenge=await f.call(auth.challenge,{...args,phase:"review"}) as {challenge:string};const before=structuredClone(f.rows);await assert.rejects(f.call(auth.decide,{...args,decision:"approve",assertion:await a.sign(reviewChallenge.challenge)}));assert.deepEqual(f.rows,before,"a review signature cannot authorize approval");await assert.rejects(f.call(auth.decide,{...args,decision:"approve",assertion:await b.sign(challenge.challenge)}),code("FORBIDDEN"));assert.deepEqual(f.rows,before);
+});
+
+test("a second project human cannot take the review slot the first reviewer already holds", async () => {
+  const { f, target } = await fixture(), first = await authenticator(), second = await authenticator("human2");
+  await enroll(f, first); await joinHuman(f, "human2", secondHuman); await enroll(f, second, secondHuman);
+  const request = await pending(f, target), args = await reviewed(f, first, request);
+  const options = await f.call(auth.challenge, { ...args, phase: "review" }) as { challenge: string }; const before = structuredClone(f.rows);
+  await assert.rejects(f.call(auth.review, { ...args, assertion: await second.sign(options.challenge) }), code("IDEMPOTENCY_CONFLICT"));
+  assert.deepEqual(f.rows, before, "a raced review must not move the slot or advance the second key's counter");
+  assert.equal(f.find("approvalRequests", request.envelope.id).reviewedBy, "human");
+  const approve = await f.call(auth.challenge, { ...args, phase: "approve" }) as { challenge: string };
+  const decided = await f.call(auth.decide, { ...args, decision: "approve", assertion: await first.sign(approve.challenge) }) as requests.ApprovalRequestView;
+  assert.equal(decided.state, "approved"); assert.equal(decided.approvedBy, "human");
 });
 
 test("denial consumes only the request and returns its actual human actor/time", async()=>{

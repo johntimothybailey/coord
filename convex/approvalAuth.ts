@@ -116,6 +116,7 @@ export const review = internalMutation({ args: { approvalRequestId: v.string(), 
   const { record, project } = await requestRecord(ctx, args.approvalRequestId, args.requestDigest);
   if ((await requestView(ctx, project, record)).state !== "pending") fail("FORBIDDEN", "Request is no longer pending");
   const { actor } = await verifiedHuman(ctx, record, args.assertion, "review");
+  if (record.reviewedCredentialId !== undefined && record.reviewedBy !== actor.memberId) fail("IDEMPOTENCY_CONFLICT", "Another project human already holds this request's review; wait for their decision, or cancel and request again to review it yourself");
   await ctx.db.patch(record._id, { reviewedBy: actor.memberId, reviewedCredentialId: args.assertion.credentialId, reviewedAt: Date.now() });
   const rule = await ctx.db.query("memories").withIndex("by_stable_id", q => q.eq("id", record.memoryId)).unique();
   if (!rule || !await currentRule(ctx, project.id, record)) fail("FORBIDDEN", "Exact rule changed");
