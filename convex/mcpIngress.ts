@@ -3,7 +3,8 @@ import type { HttpRouter } from "convex/server";
 import type { McpUser, ToolCtx } from "@convex-dev/mcp";
 import { httpRouter, httpActionGeneric, makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
-import { components } from "./_generated/api.js";
+import { boundedMcpClientInfo } from "../src/protocol.js";
+import { components, internal } from "./_generated/api.js";
 import { identityArgs } from "./authArgs.js";
 import { OAUTH_SCOPES } from "./oauthPolicy.js";
 import { repositoryMemorySource } from "./schema.js";
@@ -47,6 +48,37 @@ const options = {
   scopes: Object.fromEntries(OAUTH_SCOPES.map(scope => [scope, `Restrict existing Coord authority to ${scope.slice(6)} operations in the authenticated project consent.`])),
   accessTokenTtlMs: 5 * 60_000, deviceFlow: false,
 };
+// Optional observation is bounded independently of the SDK's own request parser.
+// Cancel a cloned tee without awaiting its peer (which the SDK consumes next).
+async function optionalObservation<T>(action: Promise<T>, timeoutMs = 2_000): Promise<T | undefined> {
+  let cancelTimeout = () => {};
+  try { return await Promise.race([action.catch(() => undefined), new Promise<undefined>(resolve => { const timeout = setTimeout(resolve, timeoutMs); cancelTimeout = () => clearTimeout(timeout); })]); }
+  finally { cancelTimeout(); }
+}
+async function observationJson(message: Request | Response): Promise<unknown> {
+  const reader = message.clone().body?.getReader();
+  if (!reader) return undefined;
+  const deadline = Date.now() + 2_000;
+  let size = 0; const chunks: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const chunk = await optionalObservation(reader.read(), Math.max(0, deadline - Date.now()));
+      if (!chunk) { void reader.cancel().catch(() => undefined); return undefined; }
+      const { value, done } = chunk;
+      if (done) break;
+      size += value.byteLength;
+      if (size > 16 * 1024) { void reader.cancel().catch(() => undefined); return undefined; }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size); let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch { return undefined; }
+  finally { reader.releaseLock(); }
+}
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
 class RequestScopedMcpServer extends QueryOnlyMcpServer {
   override registerRoutes(http: HttpRouter): void {
     const consentUrl = this.options.consentUrl;
@@ -59,9 +91,24 @@ class RequestScopedMcpServer extends QueryOnlyMcpServer {
         : handler });
     }
   }
-  override handleMcp(ctx: ToolCtx, request: Request): Promise<Response> {
+  override async handleMcp(ctx: ToolCtx, request: Request): Promise<Response> {
+    const pendingObservation = observationJson(request);
     const scoped = new QueryOnlyMcpServer(components.mcp, { ...options, tools: toolsFor(bearerFrom(request)) });
-    return scoped.handleMcp(ctx, request);
+    const response = await scoped.handleMcp(ctx, request);
+    if (response.status !== 200) return response;
+    const observed = record(await pendingObservation);
+    // This is a server-observed accepted legacy initialize exchange, not a
+    // stateful session, executable attestation or human authentication.
+    const clientInfo = boundedMcpClientInfo(record(observed?.params)?.clientInfo);
+    const bearer = bearerFrom(request);
+    if (observed?.jsonrpc === "2.0" && observed.method === "initialize" && (typeof observed.id === "number" || typeof observed.id === "string") && clientInfo && bearer && response.status === 200) {
+      const accepted = record(await observationJson(response)); const result = record(accepted?.result);
+      if (accepted?.jsonrpc === "2.0" && accepted.id === observed.id && accepted.error === undefined && typeof result?.protocolVersion === "string" && record(result.serverInfo)?.name === "coord") {
+        try { await optionalObservation(ctx.runMutation(internal.attribution.recordHandshake, { bearer, clientInfo })); }
+        catch { /* Optional telemetry cannot change an authenticated protocol response. */ }
+      }
+    }
+    return response;
   }
 }
 export const mcpIngress = new RequestScopedMcpServer(components.mcp, { ...options, tools: toolsFor(undefined) });

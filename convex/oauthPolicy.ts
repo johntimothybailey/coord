@@ -6,7 +6,7 @@ const groups: Record<string, readonly string[]> = {
   "coord:read": ["auth.handshake", "approvalRequests.get", "checkpoints.getInput", "checkpoints.getReady", "machines.runtime", "memories.projectRules", "memories.reviewList", "memories.reviewDetail", "projects.status"],
   "coord:propose": ["goals.propose", "memories.proposeRule", "tasks.propose"],
   "coord:approval-request": ["approvalRequests.requestRule", "approvalRequests.cancel"],
-  "coord:run": ["tasks.claim", "tasks.claimReplan", "tasks.registerManual", "tasks.renew", "tasks.sessionStatus", "tasks.checkIn", "tasks.progress", "tasks.proposeSubtasks", "tasks.refreshDependencies", "tasks.finishReplan", "tasks.requestResume", "lifecycle.starting", "lifecycle.requestFinalization", "lifecycle.requestYield", "memories.record", "memories.rules", "memories.context", "memories.expand"],
+  "coord:run": ["tasks.claim", "tasks.claimReplan", "tasks.registerManual", "tasks.renew", "tasks.reportClient", "tasks.sessionStatus", "tasks.checkIn", "tasks.progress", "tasks.proposeSubtasks", "tasks.refreshDependencies", "tasks.finishReplan", "tasks.requestResume", "lifecycle.starting", "lifecycle.requestFinalization", "lifecycle.requestYield", "memories.record", "memories.rules", "memories.context", "memories.expand"],
   "coord:supervise": ["lifecycle.status", "lifecycle.authorizeLaunch", "lifecycle.reportUncertain", "lifecycle.confirmStopped"],
   "coord:artifact": ["checkpoints.prepare", "publications.request", "scans.upload"],
   "coord:verify": ["checkpoints.verifyCode", "checkpoints.ready", "publications.verifyBranch", "publications.verifyPR", "publications.accept", "scans.verify"],

@@ -8,6 +8,7 @@
  * @module
  */
 
+import type * as attribution from "../attribution.js";
 import type * as artifacts from "../artifacts.js";
 import type * as auth from "../auth.js";
 import type * as authCore from "../authCore.js";
@@ -35,6 +36,7 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  attribution: typeof attribution;
   artifacts: typeof artifacts;
   auth: typeof auth;
   authCore: typeof authCore;

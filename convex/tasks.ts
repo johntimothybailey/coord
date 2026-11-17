@@ -1,10 +1,11 @@
+import { localClientObservation, connectionObservation } from "./attribution.js";
 import { childLineage, isOAuth, validateLineage } from "./oauthAuthority.js";
 import { v } from "convex/values";
 import { progressHash } from "./artifacts.js";
 import type { Manifest } from "./artifacts.js";
 import { DEFAULTS, requireCapability } from "../src/protocol.js";
 import { boundedRecords } from "./messages.js";
-import { base, dependency, capabilityKey } from "./schema.js";
+import { base, dependency, capabilityKey, mcpClientInfo } from "./schema.js";
 import { mutation, query } from "./server.js";
 import type { Doc, MutationCtx, QueryCtx } from "./server.js";
 import { identityArgs, runArgs, authenticate, replay, fail, stableId, bounded, paths, overlaps, boundRun, approvedGoal, liveRun, digest, tokenFormat, canonical } from "./auth.js";
@@ -75,11 +76,13 @@ export const propose = mutation({ args: { ...identityArgs, taskId: v.string(), g
   });
 } });
 
-const admissionArgs = { ...identityArgs, taskId: v.string(), runId: v.string(), launchId: v.string(), grantToken: v.string(), machineId: v.string(), harness: v.union(v.literal("codex"), v.literal("antigravity")), capabilityKey };
-type Admission = { token: string; oauthBearer?: string; protocolVersion: number; clientVersion: string; capabilities: string[]; backendId: string; projectId: string; requestId: string; taskId: string; runId: string; launchId: string; grantToken: string; machineId: string; harness: "codex" | "antigravity"; capabilityKey: Doc<"machines">["capabilityKey"] & {} };
+const admissionArgs = { ...identityArgs, mcpClientInfo: v.optional(mcpClientInfo), taskId: v.string(), runId: v.string(), launchId: v.string(), grantToken: v.string(), machineId: v.string(), harness: v.union(v.literal("codex"), v.literal("antigravity")), capabilityKey };
+type Admission = { mcpClientInfo?: { name: string; version: string }; token: string; oauthBearer?: string; protocolVersion: number; clientVersion: string; capabilities: string[]; backendId: string; projectId: string; requestId: string; taskId: string; runId: string; launchId: string; grantToken: string; machineId: string; harness: "codex" | "antigravity"; capabilityKey: Doc<"machines">["capabilityKey"] & {} };
 async function admit(ctx: MutationCtx, args: Admission, mode: "manual" | "managed" | "replan") {
   const { actor, project } = await authenticate(ctx, args, ["agent"], `tasks.${mode === "manual" ? "registerManual" : mode === "replan" ? "claimReplan" : "claim"}`);
-  return replay(ctx, actor, `tasks.${mode === "manual" ? "registerManual" : mode === "replan" ? "claimReplan" : "claim"}`, args, async () => {
+  if (args.mcpClientInfo) localClientObservation(args.mcpClientInfo, actor.id);
+  const { mcpClientInfo: _telemetry, ...intent } = args;
+  return replay(ctx, actor, `tasks.${mode === "manual" ? "registerManual" : mode === "replan" ? "claimReplan" : "claim"}`, intent, async () => {
     stableId(args.runId); stableId(args.launchId); stableId(args.machineId); tokenFormat(args.grantToken);
     if (args.grantToken === args.token) fail("INVALID_INPUT", "Run credential must be independent");
     const task = await taskById(ctx, args.taskId, project.id); validateScope(project, task.scope); const goal = await approvedGoal(ctx, task);
@@ -100,7 +103,7 @@ async function admit(ctx: MutationCtx, args: Admission, mode: "manual" | "manage
     const grantDigest = await digest(args.grantToken); const grantId = `grant_${args.runId}`;
     if (await ctx.db.query("credentials").withIndex("by_digest", q => q.eq("digest", grantDigest)).unique() || await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", grantId)).unique() || await ctx.db.query("runs").withIndex("by_stable_id", q => q.eq("id", args.runId)).unique()) fail("IDEMPOTENCY_CONFLICT", "Run or grant identity already used");
     const epoch = task.epoch + 1; const authorityUntil = isOAuth(actor) ? await validateLineage(ctx, actor, project.id) : Number.POSITIVE_INFINITY; const deadline = Math.min(Date.now() + goal.runTimeoutMs, authorityUntil); const leaseUntil = Math.min(Date.now() + DEFAULTS.leaseMs, deadline);
-    await ctx.db.insert("runs", { id: args.runId, projectId: project.id, taskId: task.id, memberId: actor.memberId, machineId: machine.id, harness: args.harness, mode, goalRevision: goal.revision, epoch, launchId: args.launchId, state: mode === "manual" ? "running" : "reserved", grantId, capabilityDigest: machine.capabilityDigest, configVersion: project.configVersion, policyVersion: project.policyVersion, leaseUntil, deadline, capacityHeld: mode !== "manual", resultAccepted: false });
+    await ctx.db.insert("runs", { ...(args.mcpClientInfo ? { clientObservation: localClientObservation(args.mcpClientInfo, actor.id) } : {}), id: args.runId, projectId: project.id, taskId: task.id, memberId: actor.memberId, machineId: machine.id, harness: args.harness, mode, goalRevision: goal.revision, epoch, launchId: args.launchId, state: mode === "manual" ? "running" : "reserved", grantId, capabilityDigest: machine.capabilityDigest, configVersion: project.configVersion, policyVersion: project.policyVersion, leaseUntil, deadline, capacityHeld: mode !== "manual", resultAccepted: false });
     await ctx.db.insert("credentials", { id: grantId, backendId: args.backendId, memberId: actor.memberId, digest: grantDigest, role: "run", projectIds: [project.id], runId: args.runId, expiresAt: deadline, ...childLineage(actor) });
     await ctx.db.patch(task._id, { epoch, ownerRunId: args.runId, leaseUntil, state: mode === "manual" ? "running" : "reserved", replanAttempts: task.replanAttempts + (mode === "replan" ? 1 : 0), coverageComplete: false });
     return { taskId: task.id, runId: args.runId, epoch, goalRevision: goal.revision, launchId: args.launchId, grantId, leaseUntil, deadline, mode };
@@ -109,24 +112,36 @@ async function admit(ctx: MutationCtx, args: Admission, mode: "manual" | "manage
 export const claim = mutation({ args: admissionArgs, handler: (ctx, args) => admit(ctx, args, "managed") });
 export const claimReplan = mutation({ args: admissionArgs, handler: (ctx, args) => admit(ctx, args, "replan") });
 export const registerManual = mutation({ args: admissionArgs, handler: (ctx, args) => admit(ctx, args, "manual") });
-export const renew = mutation({ args: runArgs, handler: async (ctx, args) => {
+export const renew = mutation({ args: { ...runArgs, mcpClientInfo: v.optional(mcpClientInfo) }, handler: async (ctx, args) => {
   const { actor } = await authenticate(ctx, args, ["run"], "tasks.renew"); const { task, run } = await liveRun(ctx, args, actor, ["reserved", "starting", "running"]);
-  return replay(ctx, actor, "tasks.renew", args, async () => {
+  if (args.mcpClientInfo) localClientObservation(args.mcpClientInfo, actor.id);
+  const { mcpClientInfo: _telemetry, ...intent } = args;
+  return replay(ctx, actor, "tasks.renew", intent, async () => {
     const leaseUntil = Math.min(Date.now() + DEFAULTS.leaseMs, run.deadline, await validateLineage(ctx, actor, args.projectId));
-    await ctx.db.patch(task._id, { leaseUntil }); await ctx.db.patch(run._id, { leaseUntil }); return { runId: run.id, epoch: run.epoch, leaseUntil };
+    await ctx.db.patch(task._id, { leaseUntil }); await ctx.db.patch(run._id, { leaseUntil, ...(args.mcpClientInfo ? { clientObservation: localClientObservation(args.mcpClientInfo, actor.id) } : {}) }); return { runId: run.id, epoch: run.epoch, leaseUntil };
+  });
+} });
+// Telemetry has ordinary run authority but does not extend its lease.
+export const reportClient = mutation({ args: { ...runArgs, mcpClientInfo }, handler: async (ctx, args) => {
+  const { actor } = await authenticate(ctx, args, ["run"], "tasks.reportClient");
+  const { run } = await liveRun(ctx, args, actor, ["reserved", "starting", "running"]);
+  return replay(ctx, actor, "tasks.reportClient", args, async () => {
+    await ctx.db.patch(run._id, { clientObservation: localClientObservation(args.mcpClientInfo, actor.id) });
+    return { recorded: true };
   });
 } });
 // Status facts are not execution/renewal authority; post-result native check-in remains blocked.
 export const sessionStatus = query({ args: runArgs, handler: async (ctx, args) => {
   const { actor } = await authenticate(ctx, args, ["run"], "tasks.sessionStatus"); const { task, run } = await boundRun(ctx, args, actor);
-  return { taskState: task.state, runState: run.state, resultAccepted: run.resultAccepted, requestedOutcome: run.requestedOutcome, leaseUntil: run.leaseUntil, deadline: run.deadline, currentOwner: task.ownerRunId === run.id && task.epoch === run.epoch };
+  const connectionClientObservation = await connectionObservation(ctx, actor);
+  return { ...(run.clientObservation ? { clientObservation: run.clientObservation } : {}), ...(run.supervisorObservation ? { supervisorObservation: run.supervisorObservation } : {}), ...(connectionClientObservation ? { connectionClientObservation } : {}), taskState: task.state, runState: run.state, resultAccepted: run.resultAccepted, requestedOutcome: run.requestedOutcome, leaseUntil: run.leaseUntil, deadline: run.deadline, currentOwner: task.ownerRunId === run.id && task.epoch === run.epoch };
 } });
 export const checkIn = query({ args: runArgs, handler: async (ctx, args) => {
   const { actor, project } = await authenticate(ctx, args, ["run"], "tasks.checkIn"); const { task, run, goal } = await liveRun(ctx, args, actor, ["reserved", "starting", "running"]);
   const messages = await ctx.db.query("messages").withIndex("by_recipient", q => q.eq("projectId", project.id).eq("recipientTaskId", task.id)).take(101);
   let conflictBlocked = false; try { await noConflicts(ctx, task); } catch { conflictBlocked = true; }
   const selected = boundedRecords(messages.filter(m => (m.recipientEpoch === task.epoch && m.state !== "acknowledged_by_agent") || (m.conflict && (m.resolution !== "accepted" || m.decisionRecipientEpoch !== task.epoch))).slice(0, 100), 2048);
-  return { task, run, goal, policyVersion: project.policyVersion, messages: selected.records, conflictBlocked, complete: messages.length <= 100 && selected.complete };
+  return { task, run, goal, connectionClientObservation: await connectionObservation(ctx, actor), policyVersion: project.policyVersion, messages: selected.records, conflictBlocked, complete: messages.length <= 100 && selected.complete };
 } });
 export const progress = mutation({ args: { ...runArgs, expectedRevision: v.number(), progress: v.string() }, handler: async (ctx, args) => {
   const { actor } = await authenticate(ctx, args, ["run"], "tasks.progress"); const { task } = await liveRun(ctx, args, actor);

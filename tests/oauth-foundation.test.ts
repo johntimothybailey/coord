@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { getFunctionAddress, getFunctionName, httpRouter } from "convex/server";
 import type { MutationCtx, Doc } from "../convex/server.js";
 import { BackendFixture } from "./backend.fixture.js";
+import * as attribution from "../convex/attribution.js";
 import * as auth from "../convex/auth.js";
 import * as oauth from "../convex/oauthAuthority.js";
 import * as goals from "../convex/goals.js";
@@ -81,6 +82,8 @@ class ComponentFixture extends BackendFixture {
       const address = getFunctionAddress(ref).reference ?? "";
       if (address.endsWith("oauth/decideAuthRequest")) return mcpOauth.decideAuthRequest._handler(this.componentContext(), args);
       if (address.endsWith("grants/revoke")) return mcpGrants.revoke._handler(this.componentContext(), args);
+      const name = getFunctionName(ref as never);
+      if (name === "attribution:recordHandshake") return this.call(attribution.recordHandshake, args as { bearer: string; clientInfo: { name: string; version: string } });
       throw new Error("Unexpected telemetry or mutation");
     }) as MutationCtx["runMutation"];
     return ctx;
@@ -328,4 +331,87 @@ test("OAuth verifier scope is checked on its own live connection while target ru
   const before = structuredClone(f.rows);
   await assert.rejects(f.call(checkpoints.authority, input), scopeDenied);
   assert.deepEqual(f.rows, before);
+});
+
+
+async function initialize(f: ComponentFixture, clientInfo?: unknown, options: { bearer?: string; headers?: Record<string, string>; body?: unknown; failObservation?: boolean; hangObservation?: boolean } = {}) {
+  const ctx = f.context() as unknown as Parameters<typeof mcpIngress.handleMcp>[0];
+  if (options.hangObservation) ctx.runMutation = (() => new Promise(() => {})) as typeof ctx.runMutation;
+  if (options.failObservation) ctx.runMutation = (async () => { throw new Error("Synthetic observation unavailable"); }) as typeof ctx.runMutation;
+  return mcpIngress.handleMcp(ctx, new Request(resource, { method: "POST", headers: { Authorization: `Bearer ${options.bearer ?? "access-one"}`, "Content-Type": "application/json", ...options.headers }, body: JSON.stringify(options.body ?? { jsonrpc: "2.0", id: "observed_initialize", method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, ...(clientInfo === undefined ? {} : { clientInfo }) } }) }));
+}
+test("remote accepted initialize persists backend-observed metadata on exact authenticated connection without altering consent or child authority", async () => {
+  const { f, link, consent, binding, identity } = await runnable();
+  const info = { name: "unknown Orca / model:untrusted", version: "custom-version" };
+  const before = structuredClone(f.rows.get(consent.connectionId)); assert(before);
+  const response = await initialize(f, info);
+  assert.equal(response.status, 200); const exchange = await response.json() as { id: string; result: { serverInfo: { name: string } } };
+  assert.equal(exchange.id, "observed_initialize"); assert.equal(exchange.result.serverInfo.name, "coord");
+  const row = f.rows.get(consent.connectionId)!;
+  const observation = row.clientObservation as { provenance: string; clientInfo: unknown };
+  assert.equal(observation.provenance, "mcp_handshake"); assert.deepEqual(observation.clientInfo, info);
+  assert.equal(row.absoluteExpiresAt, before.absoluteExpiresAt); assert.equal(row.rootCredentialId, binding.credentialId);
+  assert.deepEqual(await f.call(oauth.consentGrant, { ...link, grantId: "grant" }), consent);
+  assert.deepEqual(f.rows.get(consent.connectionId)!.clientObservation, observation);
+  const status = await f.call(tasks.sessionStatus, { ...request(secrets.run), ...identity }) as { connectionClientObservation?: unknown; clientObservation?: { provenance: string }; supervisorObservation?: unknown };
+  assert.deepEqual(status.connectionClientObservation, observation);
+  assert.equal(status.clientObservation, undefined); assert.equal(status.supervisorObservation, undefined);
+  assert.equal(f.find("runs", "run").harness, "codex");
+  assert.ok(!JSON.stringify(row).includes("access-one"));
+  // A weaker local report is stored separately; it cannot replace the canonical
+  // server-observed connection or acquire launcher/process provenance.
+  await f.call(tasks.reportClient, { ...request(secrets.run), ...identity, requestId: "local_report", mcpClientInfo: { name: "supervisor_spawned", version: "claimed-model" } });
+  const after = await f.call(tasks.sessionStatus, { ...request(secrets.run), ...identity }) as { connectionClientObservation?: unknown; clientObservation?: { provenance: string }; supervisorObservation?: unknown };
+  assert.equal(after.clientObservation?.provenance, "self_reported");
+  assert.equal(after.supervisorObservation, undefined); assert.deepEqual(after.connectionClientObservation, observation);
+  assert.equal((attribution.recordHandshake as unknown as { isInternal: boolean }).isInternal, true);
+});
+test("remote initialize observation is optional, bounded and unavailable to absent, invalid or rejected exchanges", async () => {
+  for (const clientInfo of [undefined, { name: "", version: "1" }, { name: "x".repeat(257), version: "1" }, { name: "line\ncontrol", version: "1" }]) {
+    const { f, consent } = await foundation();
+    assert.equal((await initialize(f, clientInfo)).status, 200);
+    assert.equal(f.rows.get(consent.connectionId)!.clientObservation, undefined);
+  }
+  const { f, consent } = await foundation();
+  const info = { name: "raw unknown", version: "1" };
+  assert.equal((await initialize(f, info, { bearer: "forged" })).status, 401);
+  assert.equal((await initialize(f, info, { headers: { Origin: "https://foreign.test" } })).status, 403);
+  assert.equal((await initialize(f, info, { headers: { "MCP-Protocol-Version": "unsupported" } })).status, 400);
+  // This SDK accepts some malformed initialization parameters but only an exact
+  // successful request/response pair with bounded clientInfo is observed.
+  const rejected = await initialize(f, info, { body: { jsonrpc: "2.0", id: null, method: "initialize", params: { clientInfo: info } } });
+  assert.equal((await rejected.json() as { error?: unknown }).error !== undefined, true);
+  assert.equal(f.rows.get(consent.connectionId)!.clientObservation, undefined);
+  assert.equal((await initialize(f, info, { failObservation: true })).status, 200);
+  assert.equal(f.rows.get(consent.connectionId)!.clientObservation, undefined);
+  // Optional parser gives up after16KiB without awaiting tee cancellation; the
+  // original request still reaches the real SDK and returns normally.
+  assert.equal((await initialize(f, info, { body: { jsonrpc: "2.0", id: "large", method: "initialize", params: { clientInfo: info, padding: "x".repeat(20_000) } } })).status, 200);
+  assert.equal(f.rows.get(consent.connectionId)!.clientObservation, undefined);
+  await assert.rejects(f.call(attribution.recordHandshake, { bearer: "forged", clientInfo: info }));
+  f.table("tokens").get("access")!.expiresAt = Date.now() - 1;
+  await assert.rejects(f.call(attribution.recordHandshake, { bearer: "access-one", clientInfo: info }));
+});
+test("accepted remote initialize can be associated before root binding without creating credentials", async () => {
+  const { f, consent, binding } = await foundation();
+  const root = f.find("credentials", binding.credentialId); f.rows.delete(root._id);
+  f.patch(consent.connectionId, { rootCredentialId: undefined });
+  const count = [...f.rows.values()].filter(row => row._table === "credentials").length;
+  assert.equal((await initialize(f, { name: "ChatGPT declared label", version: "untrusted" })).status, 200);
+  assert.equal((f.rows.get(consent.connectionId)!.clientObservation as { provenance: string }).provenance, "mcp_handshake");
+  assert.equal([...f.rows.values()].filter(row => row._table === "credentials").length, count);
+  assert.equal(f.rows.get(consent.connectionId)!.rootCredentialId, undefined);
+});
+
+test("optional remote observation timeout never blocks successful initialize indefinitely", async () => {
+  const { f, consent } = await foundation();
+  const started = Date.now();
+  const response = await initialize(f, { name: "optional", version: "1" }, { hangObservation: true });
+  assert.equal(response.status, 200); assert.ok(Date.now() - started < 3_000);
+  assert.equal(f.rows.get(consent.connectionId)!.clientObservation, undefined);
+  // An unauthenticated never-ending body must not hold up the SDK's auth denial.
+  const ctx = f.context() as unknown as Parameters<typeof mcpIngress.handleMcp>[0];
+  const deniedAt = Date.now();
+  const denied = await mcpIngress.handleMcp(ctx, new Request(resource, { method: "POST", headers: { Authorization: "Bearer forged" }, body: new ReadableStream({ start() {} }), duplex: "half" } as RequestInit));
+  assert.equal(denied.status, 401); assert.ok(Date.now() - deniedAt < 1_000);
 });

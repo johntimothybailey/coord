@@ -34,7 +34,7 @@ export const authorizeLaunch = mutation({ args: { ...runArgs, process: processId
   return replay(ctx, actor, "lifecycle.authorizeLaunch", args, async () => {
     if (args.process.launchId !== run.launchId || !Number.isSafeInteger(args.process.pid) || args.process.pid <= 0 || !args.process.bootId || !args.process.startIdentity) fail("INVALID_INPUT", "Process identity does not bind this launch");
     if (run.process && canonical(run.process) !== canonical(args.process)) fail("LAUNCH_UNCERTAIN", "Different process identity already recorded");
-    await ctx.db.patch(run._id, { process: args.process, state: "running" }); await ctx.db.patch(task._id, { state: "running" });
+    await ctx.db.patch(run._id, { process: args.process, supervisorObservation: run.supervisorObservation ?? { provenance: "supervisor_spawned", credentialId: actor.id, observedAt: Date.now(), process: args.process }, state: "running" }); await ctx.db.patch(task._id, { state: "running" });
     return { launchId: run.launchId, authorized: true, leaseUntil: run.leaseUntil };
   });
 } });

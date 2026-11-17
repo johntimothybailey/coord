@@ -11,6 +11,7 @@ import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/sdk/types.js";
 import { createConfirmationProbeServer } from "../src/confirmation-probe.js";
 import type { ConfirmationProbeObservation } from "../src/confirmation-probe.js";
+import type { CoordBackend } from "../src/mcp.js";
 import { createCoordMcpServer } from "../src/mcp.js";
 import { canonicalJson } from "../src/canonical.js";
 
@@ -93,16 +94,21 @@ test("request errors and timeouts return fixed observations without raw errors o
   }
 });
 
-test("the ordinary plugin probe never calls its backend or a bound run's check-in path", async () => {
-  let calls = 0;
-  const backend = { query: async () => { calls++; throw new Error("No backend query permitted"); }, mutation: async () => { calls++; throw new Error("No backend mutation permitted"); } };
+test("the ordinary plugin probe adds no backend calls after authenticated startup observation", async () => {
+  const calls: { name: string; args: unknown }[] = [];
+  const backend: CoordBackend = { query: async name => { calls.push({ name, args: undefined }); throw new Error("No backend query permitted"); }, mutation: async (name, args) => { calls.push({ name, args }); throw new Error("No backend mutation permitted"); } };
   const server = createCoordMcpServer({ client: backend, run: { client: backend, identity: { taskId: "task", runId: "run", epoch: 1, goalRevision: 1 } }, renewMs: 60_000 });
   const client = new Client({ name: "plugin-probe", version: "fixture" }, { capabilities: { elicitation: { form: {} } } });
   client.setRequestHandler(ElicitRequestSchema, async () => ({ action: "cancel" }));
   const [a, b] = InMemoryTransport.createLinkedPair();
   try {
     await server.connect(a); await client.connect(b);
-    assert.equal(payload(await call(client)).outcome, "cancelled_response"); assert.equal(calls, 0);
+    // SDK initialization reports optional client telemetry independently of this
+    // diagnostic tool. The refused observation grants no run authority.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(calls, [{ name: "tasks:reportClient", args: { taskId: "task", runId: "run", epoch: 1, goalRevision: 1, mcpClientInfo: { name: "plugin-probe", version: "fixture" } } }]);
+    calls.length = 0;
+    assert.equal(payload(await call(client)).outcome, "cancelled_response"); assert.deepEqual(calls, []);
   } finally { await client.close(); await server.close(); }
 });
 

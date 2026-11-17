@@ -126,3 +126,19 @@ test("oversized messages and incomplete retrieval block and fit the routine UTF-
   assert.deepEqual(old.messageIds, []);
   assert.throws(() => renderCheckIn({ ...data([]), run: { id: "wrong", epoch: 2, goalRevision: 1 } }, identity), /identity/);
 });
+
+test("optional client observations are bounded whitelisted diagnostics and never displace durable warnings", () => {
+  const base = data(), before = renderCheckIn(base, identity);
+  const clientInfo = { name: "x".repeat(256), version: "v".repeat(256) };
+  const local = { provenance: "self_reported", reportedOrigin: "local_mcp_initialize", clientInfo, observedAt: 1, credentialId: "private-credential-canary", digest: "private-digest-canary" };
+  const result = renderCheckIn({ ...base, run: { ...base.run, clientObservation: local, supervisorObservation: { provenance: "supervisor_spawned", observedAt: 2, process: { pid: 987 }, credentialId: "private-credential-canary" } }, connectionClientObservation: { ...local, provenance: "mcp_handshake" } }, identity);
+  assert.equal(result.text, before.text); assert.equal(result.blocked, before.blocked); assert.deepEqual(result.messageIds, before.messageIds);
+  assert.deepEqual(result.observations?.clientObservation, { provenance: "self_reported", reportedOrigin: "local_mcp_initialize", clientInfo, observedAt: 1 });
+  assert.deepEqual(result.observations?.supervisorObservation, { provenance: "supervisor_spawned", observedAt: 2 });
+  assert.deepEqual(result.observations?.connectionClientObservation, { provenance: "mcp_handshake", clientInfo, observedAt: 1 });
+  assert(!/private-|pid|digest|credentialId/.test(JSON.stringify(result.observations)));
+  for (const invalid of [{ ...local, clientInfo: { name: "x".repeat(257), version: "v" } }, { ...local, observedAt: NaN }, { ...local, provenance: "supervisor_spawned" }]) {
+    const offer = renderCheckIn({ ...base, run: { ...base.run, clientObservation: invalid } }, identity);
+    assert.equal(offer.observations, undefined); assert.equal(offer.blocked, before.blocked); assert.equal(offer.text, before.text);
+  }
+});

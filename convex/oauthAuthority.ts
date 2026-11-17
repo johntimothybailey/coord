@@ -162,7 +162,7 @@ export const consentGrant = mutation({ args: { grantId: v.string(), linkId: v.id
   const prior = await ctx.db.query("mcpConnections").withIndex("by_grant", q => q.eq("grantId", grant._id)).unique();
   if (prior) {
     await currentConnection(ctx, prior);
-    const { _id, _creationTime, rootCredentialId, revokedAt, ...stored } = prior;
+    const { _id, _creationTime, rootCredentialId, revokedAt, clientObservation: _telemetry, ...stored } = prior;
     if (canonical(stored) !== canonical(tuple)) fail("IDEMPOTENCY_CONFLICT", "Grant consent is immutable");
     return { connectionId: _id, projectId: prior.projectId, absoluteExpiresAt: prior.absoluteExpiresAt };
   }
