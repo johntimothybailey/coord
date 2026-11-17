@@ -1,3 +1,5 @@
+import { authorizeOAuth, bearerActor, isOAuth } from "./oauthAuthority.js";
+import type { AuthorityCtx } from "./oauthAuthority.js";
 import { canonicalJson } from "../src/canonical.js";
 import { v, ConvexError } from "convex/values";
 import type { ErrorCode, RequestIdentity } from "../src/protocol.js";
@@ -5,9 +7,9 @@ import { CAPABILITIES, DEFAULTS, PROTOCOL_VERSION, requireHandshake, requireCapa
 import { internalMutation, mutation, query } from "./server.js";
 import type { Doc, MutationCtx, QueryCtx } from "./server.js";
 
-export const identityArgs = { token: v.string(), protocolVersion: v.number(), clientVersion: v.string(), capabilities: v.array(v.string()), backendId: v.string(), projectId: v.string(), requestId: v.string() };
-export const runArgs = { ...identityArgs, taskId: v.string(), runId: v.string(), epoch: v.number(), goalRevision: v.number() };
-export type Identity = RequestIdentity & { token: string };
+export { identityArgs, runArgs } from "./authArgs.js";
+import { identityArgs } from "./authArgs.js";
+export type Identity = RequestIdentity & { token: string; oauthBearer?: string };
 export type RunIdentity = Identity & { taskId: string; runId: string; epoch: number; goalRevision: number };
 export function fail(code: ErrorCode, message: string): never { throw new ConvexError({ code, message }); }
 export function bounded(value: string, max: number, name: string): void {
@@ -26,12 +28,21 @@ export async function digest(value: string): Promise<string> {
 }
 export function tokenFormat(value: string): void { if (!/^[a-f0-9]{64}$/.test(value)) fail("UNAUTHORIZED", "Invalid credential"); }
 export const canonical = canonicalJson;
-export async function authenticate(ctx: Pick<QueryCtx, "db">, args: Identity, roles: readonly Doc<"credentials">["role"][]): Promise<{ actor: Doc<"credentials">; project: Doc<"projects"> }> {
-  tokenFormat(args.token);
+export async function authenticate(ctx: AuthorityCtx, args: Identity, roles: readonly Doc<"credentials">["role"][], operation?: string): Promise<{ actor: Doc<"credentials">; project: Doc<"projects"> }> {
   stableId(args.requestId);
-  const tokenDigest = await digest(args.token);
-  const actor = await ctx.db.query("credentials").withIndex("by_digest", q => q.eq("digest", tokenDigest)).unique();
-  return authorizeActor(ctx, args, actor, roles);
+  let actor: Doc<"credentials"> | null;
+  if (args.oauthBearer !== undefined) {
+    if (args.token !== "") fail("UNAUTHORIZED", "Ambiguous credential sources");
+    actor = await bearerActor(ctx, args.oauthBearer, args.backendId, args.projectId);
+  } else {
+    tokenFormat(args.token);
+    const tokenDigest = await digest(args.token);
+    actor = await ctx.db.query("credentials").withIndex("by_digest", q => q.eq("digest", tokenDigest)).unique();
+    if (actor && isOAuth(actor) && !actor.parentCredentialId) fail("UNAUTHORIZED", "OAuth roots require a current bearer");
+  }
+  const authorized = await authorizeActor(ctx, args, actor, roles);
+  await authorizeOAuth(ctx, authorized.actor, args.projectId, operation);
+  return authorized;
 }
 export async function authorizeActor(ctx: Pick<QueryCtx, "db">, args: RequestIdentity, actor: Doc<"credentials"> | null, roles: readonly Doc<"credentials">["role"][]): Promise<{ actor: Doc<"credentials">; project: Doc<"projects"> }> {
   stableId(args.requestId);
@@ -70,7 +81,7 @@ export async function liveRun(ctx: Pick<QueryCtx, "db">, args: RunIdentity, acto
   return { task, run, goal };
 }
 export async function replay<T>(ctx: MutationCtx, actor: Doc<"credentials">, operation: string, args: Identity, action: () => Promise<T>): Promise<T> {
-  const { token: _token, ...payload } = args;
+  const { token: _token, oauthBearer: _oauthBearer, ...payload } = args;
   const payloadHash = await digest(canonical(payload));
   const previous = await ctx.db.query("idempotency").withIndex("by_request", q => q.eq("credentialId", actor.id).eq("operation", operation).eq("requestId", args.requestId)).unique();
   if (previous) {
@@ -120,7 +131,7 @@ export const bootstrap = internalMutation({
 });
 
 export const revoke = mutation({ args: { ...identityArgs, credentialId: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["human"]);
+  const { actor } = await authenticate(ctx, args, ["human"], "auth.revoke");
   return replay(ctx, actor, "auth.revoke", args, async () => {
     const target = await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", args.credentialId)).unique();
     if (!target || target.backendId !== args.backendId || target.projectIds.some(id => !actor.projectIds.includes(id))) fail("FORBIDDEN", "Credential is outside human scope");
@@ -129,14 +140,14 @@ export const revoke = mutation({ args: { ...identityArgs, credentialId: v.string
 } });
 
 export const handshake = query({ args: identityArgs, handler: async (ctx, args) => {
-  await authenticate(ctx, args, ["human", "agent", "run", "supervisor", "artifact_verifier"]);
+  await authenticate(ctx, args, ["human", "agent", "run", "supervisor", "artifact_verifier"], "auth.handshake");
   const metadata = await ctx.db.query("metadata").withIndex("by_backend", q => q.eq("backendId", args.backendId)).unique();
   if (!metadata) fail("NOT_FOUND", "Backend metadata not found");
   return { backendProtocolVersion: metadata.protocolVersion, minSupportedClientVersion: metadata.minSupportedClientVersion, requiredCapabilities: metadata.requiredCapabilities ?? [], supportedCapabilities: metadata.supportedCapabilities ?? [] };
 } });
 
 export const invite = mutation({ args: { ...identityArgs, inviteToken: v.string(), memberId: v.string(), projectIds: v.array(v.string()), role: v.union(v.literal("agent"), v.literal("human")), expiresAt: v.number() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["human"]);
+  const { actor } = await authenticate(ctx, args, ["human"], "auth.invite");
   return replay(ctx, actor, "auth.invite", args, async () => {
     tokenFormat(args.inviteToken); stableId(args.memberId);
     if (!args.projectIds.length || args.projectIds.length > 20 || new Set(args.projectIds).size !== args.projectIds.length || args.projectIds.some(id => !actor.projectIds.includes(id)) || !args.projectIds.includes(args.projectId) || args.expiresAt <= Date.now() || args.expiresAt > Date.now() + 24 * 3600_000 || args.inviteToken === args.token) fail("FORBIDDEN", "Invite exceeds approver scope or expiry limit");

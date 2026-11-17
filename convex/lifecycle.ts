@@ -1,3 +1,4 @@
+import { validateLineage } from "./oauthAuthority.js";
 import { v } from "convex/values";
 import { makeFunctionReference } from "convex/server";
 import { processIdentity, stopEvidence } from "./schema.js";
@@ -13,21 +14,22 @@ export async function supervisedRun(ctx: Pick<QueryCtx, "db">, args: { projectId
   return { run, task: await taskById(ctx, args.taskId, args.projectId) };
 }
 export const status = query({ args: runArgs, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["supervisor"]);
+  const { actor } = await authenticate(ctx, args, ["supervisor"], "lifecycle.status");
   const { task, run } = await supervisedRun(ctx, args, actor);
   return { taskState: task.state, runState: run.state, resultAccepted: run.resultAccepted, requestedOutcome: run.requestedOutcome, leaseUntil: run.leaseUntil, deadline: run.deadline, capacityHeld: run.capacityHeld, releaseReceipt: run.releaseReceipt, process: run.process };
 } });
 export const starting = mutation({ args: runArgs, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); const { run } = await liveRun(ctx, args, actor, ["reserved", "starting"]);
+  const { actor } = await authenticate(ctx, args, ["run"], "lifecycle.starting"); const { run } = await liveRun(ctx, args, actor, ["reserved", "starting"]);
   return replay(ctx, actor, "lifecycle.starting", args, async () => {
     if (run.mode === "manual") fail("FORBIDDEN", "Manual sessions do not authorize managed launch");
     await ctx.db.patch(run._id, { state: "starting" }); return { launchId: run.launchId, state: "starting" as const };
   });
 } });
 export const authorizeLaunch = mutation({ args: { ...runArgs, process: processIdentity }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["supervisor"]); const supervised = await supervisedRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["supervisor"], "lifecycle.authorizeLaunch"); const supervised = await supervisedRun(ctx, args, actor);
   const grant = await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", supervised.run.grantId)).unique();
   if (!grant || grant.revokedAt !== undefined || grant.expiresAt <= Date.now() || grant.backendId !== args.backendId || !grant.projectIds.includes(args.projectId)) fail("LEASE_REVOKED", "Launch credential expired or left the scoped backend/project");
+  await validateLineage(ctx, grant, args.projectId, "coord:run");
   const { task, run } = await liveRun(ctx, args, grant, ["starting", "running"]);
   return replay(ctx, actor, "lifecycle.authorizeLaunch", args, async () => {
     if (args.process.launchId !== run.launchId || !Number.isSafeInteger(args.process.pid) || args.process.pid <= 0 || !args.process.bootId || !args.process.startIdentity) fail("INVALID_INPUT", "Process identity does not bind this launch");
@@ -37,7 +39,7 @@ export const authorizeLaunch = mutation({ args: { ...runArgs, process: processId
   });
 } });
 export const reportUncertain = mutation({ args: { ...runArgs, reason: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["supervisor"]); const { run, task } = await supervisedRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["supervisor"], "lifecycle.reportUncertain"); const { run, task } = await supervisedRun(ctx, args, actor);
   return replay(ctx, actor, "lifecycle.reportUncertain", args, async () => {
     bounded(args.reason, 2048, "uncertainty reason");
     if (run.releasedAt !== undefined) fail("FORBIDDEN", "Released reservation cannot become uncertain again");
@@ -52,7 +54,7 @@ export const reportUncertain = mutation({ args: { ...runArgs, reason: v.string()
   });
 } });
 export const requestFinalization = mutation({ args: { ...runArgs, outcome: v.union(v.literal("succeeded"), v.literal("failed"), v.literal("stopped")), reason: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); await boundRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "lifecycle.requestFinalization"); await boundRun(ctx, args, actor);
   return replay(ctx, actor, "lifecycle.requestFinalization", args, async () => {
     const { run, task } = await liveRun(ctx, args, actor, ["running"], ["running", "review_ready", "yielding"]);
     bounded(args.reason, 2048, "finalization reason");
@@ -71,7 +73,7 @@ export const requestFinalization = mutation({ args: { ...runArgs, outcome: v.uni
 } });
 const terminalLaunchReceipt = v.object({ schemaVersion: v.literal(1), identity: v.object({ taskId: v.string(), runId: v.string(), epoch: v.number(), goalRevision: v.number() }), launchId: v.string(), machineId: v.string(), workspace: v.string(), process: processIdentity, recordedAt: v.string() });
 export const confirmStopped = mutation({ args: { ...runArgs, evidence: stopEvidence, launchReceipt: v.optional(terminalLaunchReceipt) }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["supervisor"]); const { run, task } = await supervisedRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["supervisor"], "lifecycle.confirmStopped"); const { run, task } = await supervisedRun(ctx, args, actor);
   return replay(ctx, actor, "lifecycle.confirmStopped", args, async () => {
     const evidence = args.evidence; bounded(evidence.evidenceRef, 2048, "stop evidence");
     if (evidence.machineId !== run.machineId || evidence.launchId !== run.launchId || !Number.isFinite(Date.parse(evidence.observedAt)) || Date.parse(evidence.observedAt) > Date.now()) fail("INVALID_INPUT", "Stop evidence does not bind this run");
@@ -152,7 +154,7 @@ export const sweep = internalMutation({ args: {}, handler: async ctx => {
   return { credentials: expiredCredentials.length, runs: expiredRuns.length, complete: expiredCredentials.length < 100 && expiredRuns.length < 100 };
 } });
 export const forceClear = mutation({ args: { ...identityArgs, runId: v.string(), reason: v.string(), recoveryAction: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["human"]);
+  const { actor } = await authenticate(ctx, args, ["human"], "lifecycle.forceClear");
   return replay(ctx, actor, "lifecycle.forceClear", args, async () => {
     bounded(args.reason, 2048, "override reason"); bounded(args.recoveryAction, 2048, "recovery action");
     const run = await ctx.db.query("runs").withIndex("by_stable_id", q => q.eq("id", args.runId)).unique();
@@ -165,7 +167,7 @@ export const forceClear = mutation({ args: { ...identityArgs, runId: v.string(),
 } });
 
 export const requestYield = mutation({ args: { ...runArgs, checkpointId: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); await boundRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "lifecycle.requestYield"); await boundRun(ctx, args, actor);
   return replay(ctx, actor, "lifecycle.requestYield", args, async () => {
     const { task, run } = await liveRun(ctx, args, actor);
     if (run.mode === "manual" || task.state !== "yielding" || task.latestCheckpointId !== args.checkpointId) fail("BLOCKED_CHECKPOINT", "Supervised yielding requires the latest ready resume point");

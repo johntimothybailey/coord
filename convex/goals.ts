@@ -2,7 +2,7 @@ import { v } from "convex/values";
 import { mutation } from "./server.js";
 import { identityArgs, authenticate, replay, fail, bounded, stableId, integer, digest, canonical, revokeGrant } from "./auth.js";
 export const propose = mutation({ args: { ...identityArgs, goalId: v.string(), expectedRevision: v.number(), content: v.string(), taskLimit: v.number(), runTimeoutMs: v.number() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["agent", "human"]);
+  const { actor, project } = await authenticate(ctx, args, ["agent", "human"], "goals.propose");
   return replay(ctx, actor, "goals.propose", args, async () => {
     stableId(args.goalId); bounded(args.content, 32 * 1024, "goal content"); integer(args.taskLimit, 1, project.taskCap); integer(args.runTimeoutMs, 60_000, 24 * 3600_000);
     const old = await ctx.db.query("goals").withIndex("by_stable_id", q => q.eq("id", args.goalId)).unique();
@@ -15,7 +15,7 @@ export const propose = mutation({ args: { ...identityArgs, goalId: v.string(), e
   });
 } });
 export const approve = mutation({ args: { ...identityArgs, goalId: v.string(), revision: v.number(), hash: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["human"]);
+  const { actor } = await authenticate(ctx, args, ["human"], "goals.approve");
   return replay(ctx, actor, "goals.approve", args, async () => {
     const goal = await ctx.db.query("goals").withIndex("by_stable_id", q => q.eq("id", args.goalId)).unique();
     if (!goal || goal.projectId !== args.projectId || goal.state !== "draft" || goal.revision !== args.revision || goal.hash !== args.hash || await digest(canonical({ content: goal.content, taskLimit: goal.taskLimit, runTimeoutMs: goal.runTimeoutMs })) !== args.hash) fail("GOAL_NOT_APPROVED", "Approval must bind the exact current draft revision and hash");
@@ -25,7 +25,7 @@ export const approve = mutation({ args: { ...identityArgs, goalId: v.string(), r
   });
 } });
 export const control = mutation({ args: { ...identityArgs, goalId: v.string(), state: v.union(v.literal("paused"), v.literal("cancelled")) }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["human"]);
+  const { actor } = await authenticate(ctx, args, ["human"], "goals.control");
   return replay(ctx, actor, "goals.control", args, async () => {
     const goal = await ctx.db.query("goals").withIndex("by_stable_id", q => q.eq("id", args.goalId)).unique();
     if (!goal || goal.projectId !== args.projectId) fail("NOT_FOUND", "Goal not found");
@@ -45,7 +45,7 @@ export const control = mutation({ args: { ...identityArgs, goalId: v.string(), s
 } });
 
 export const resume = mutation({ args: { ...identityArgs, goalId: v.string(), revision: v.number(), hash: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["human"]);
+  const { actor } = await authenticate(ctx, args, ["human"], "goals.resume");
   return replay(ctx, actor, "goals.resume", args, async () => {
     const goal = await ctx.db.query("goals").withIndex("by_stable_id", q => q.eq("id", args.goalId)).unique();
     if (!goal || goal.projectId !== args.projectId || goal.state !== "paused" || goal.revision !== args.revision || goal.hash !== args.hash || goal.approvedHash !== args.hash || !goal.approvedBy) fail("GOAL_NOT_APPROVED", "Resume requires the exact previously approved paused goal");

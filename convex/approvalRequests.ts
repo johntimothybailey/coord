@@ -29,7 +29,7 @@ export type ApprovalRequestView = Awaited<ReturnType<typeof requestView>>;
 
 /** Prepare an exact handoff, never an approval. Replays read current state without renewing the envelope. */
 export const requestRule = mutation({ args: { ...identityArgs, memoryId: v.string(), revision: v.number(), hash: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["agent", "human"]);
+  const { actor, project } = await authenticate(ctx, args, ["agent", "human"], "approvalRequests.requestRule");
   const id = await replay(ctx, actor, "approvalRequests.requestRule", args, async () => {
     stableId(args.memoryId); integer(args.revision, 1, Number.MAX_SAFE_INTEGER);
     if (!/^[a-f0-9]{64}$/.test(args.hash)) fail("INVALID_INPUT", "An exact rule content hash is required");
@@ -44,11 +44,11 @@ export const requestRule = mutation({ args: { ...identityArgs, memoryId: v.strin
   return requestView(ctx, project, await readRequest(ctx, project, id));
 } });
 export const get = query({ args: { ...identityArgs, approvalRequestId: v.string() }, handler: async (ctx, args) => {
-  const { project } = await authenticate(ctx, args, ["agent", "human"]);
+  const { project } = await authenticate(ctx, args, ["agent", "human"], "approvalRequests.get");
   return requestView(ctx, project, await readRequest(ctx, project, args.approvalRequestId));
 } });
 export const cancel = mutation({ args: { ...identityArgs, approvalRequestId: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["agent", "human"]);
+  const { actor, project } = await authenticate(ctx, args, ["agent", "human"], "approvalRequests.cancel");
   await replay(ctx, actor, "approvalRequests.cancel", args, async () => {
     const record = await readRequest(ctx, project, args.approvalRequestId);
     if (actor.role !== "human" && actor.memberId !== record.requestedBy) fail("FORBIDDEN", "Only the requester or a project human can cancel this request");

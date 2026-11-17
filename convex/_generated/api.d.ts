@@ -10,6 +10,9 @@
 
 import type * as artifacts from "../artifacts.js";
 import type * as auth from "../auth.js";
+import type * as authCore from "../authCore.js";
+import type * as oauthAuthority from "../oauthAuthority.js";
+import type * as mcpConsent from "../mcpConsent.js";
 import type * as checkpoints from "../checkpoints.js";
 import type * as crons from "../crons.js";
 import type * as dispatch from "../dispatch.js";
@@ -34,6 +37,9 @@ import type {
 declare const fullApi: ApiFromModules<{
   artifacts: typeof artifacts;
   auth: typeof auth;
+  authCore: typeof authCore;
+  oauthAuthority: typeof oauthAuthority;
+  mcpConsent: typeof mcpConsent;
   checkpoints: typeof checkpoints;
   crons: typeof crons;
   dispatch: typeof dispatch;
@@ -76,4 +82,7 @@ export declare const internal: FilterApi<
   FunctionReference<any, "internal">
 >;
 
-export declare const components: {};
+export declare const components: {
+  auth: import("@convex-dev/auth/_generated/component.js").ComponentApi<"auth">;
+  mcp: import("@convex-dev/mcp/_generated/component.js").ComponentApi<"mcp">;
+};

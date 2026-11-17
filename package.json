@@ -18,8 +18,10 @@
     "doctor": "node dist/src/cli.js doctor --json"
   },
   "dependencies": {
+    "@convex-dev/auth": "2.0.0",
+    "@convex-dev/mcp": "0.1.0-alpha.7",
     "@modelcontextprotocol/sdk": "1.32.2",
-    "convex": "1.49.0",
+    "convex": "1.50.0",
     "zod": "4.6.7"
   },
   "devDependencies": {

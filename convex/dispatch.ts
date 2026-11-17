@@ -7,7 +7,7 @@ import { requireCapability } from "../src/protocol.js";
 
 /** Reactive candidate discovery is advisory; tasks.claim repeats all admission checks atomically. */
 export const runnable = query({ args: { ...identityArgs, machineId: v.string(), capabilityKey }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["agent"]);
+  const { actor, project } = await authenticate(ctx, args, ["agent"], "dispatch.runnable");
   const machine = await ctx.db.query("machines").withIndex("by_id_project", q => q.eq("id", args.machineId).eq("projectId", project.id)).unique();
   if (!machine || machine.memberId !== actor.memberId || !machine.capabilityKey || !machine.capabilityChecks || machine.qualificationExpiresAt <= Date.now() || project.configVersion === undefined || machine.configVersion !== project.configVersion || !machine.qualifiedModes.includes("managed")) fail("UNSUPPORTED_FOR_AUTONOMOUS_EXECUTION", "Machine has no current managed qualification");
   requireCapability({ key: machine.capabilityKey, checks: machine.capabilityChecks }, args.capabilityKey, "managed");

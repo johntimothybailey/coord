@@ -3,7 +3,7 @@ import { mutation } from "./server.js";
 import { runArgs, authenticate, liveRun, replay, stableId, bounded, fail, canonical } from "./auth.js";
 import { oid, verification, verifiedRun, publicationTask, currentPublicationArtifact, validateManifest, requireVerifiedScan } from "./artifacts.js";
 export const request = mutation({ args: { ...runArgs, publicationId: v.string(), checkpointId: v.string(), targetBase: v.string(), verification }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["run"]); const { run } = await liveRun(ctx, args, actor); const task = await publicationTask(ctx, args.taskId, args.projectId);
+  const { actor, project } = await authenticate(ctx, args, ["run"], "publications.request"); const { run } = await liveRun(ctx, args, actor); const task = await publicationTask(ctx, args.taskId, args.projectId);
   return replay(ctx, actor, "publications.request", args, async () => {
     if (run.mode === "replan") fail("FORBIDDEN", "Replanning runs cannot publish implementation code");
     stableId(args.publicationId); oid(args.targetBase);
@@ -20,7 +20,7 @@ export const request = mutation({ args: { ...runArgs, publicationId: v.string(),
   });
 } });
 export const verifyBranch = mutation({ args: { ...runArgs, publicationId: v.string(), head: v.string(), tree: v.string(), parent: v.union(v.string(), v.null()), parents: v.optional(v.array(v.string())), branch: v.string(), liveTargetBase: v.string(), evidenceRef: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["artifact_verifier", "human"]); const { task, run } = await verifiedRun(ctx, args, actor); await publicationTask(ctx, args.taskId, args.projectId);
+  const { actor, project } = await authenticate(ctx, args, ["artifact_verifier", "human"], "publications.verifyBranch"); const { task, run } = await verifiedRun(ctx, args, actor); await publicationTask(ctx, args.taskId, args.projectId);
   return replay(ctx, actor, "publications.verifyBranch", args, async () => {
     const publication = await ctx.db.query("publications").withIndex("by_stable_id", q => q.eq("id", args.publicationId)).unique(); bounded(args.evidenceRef, 2048, "branch readback evidence");
     if (!publication || publication.projectId !== args.projectId || publication.runId !== args.runId || publication.epoch !== args.epoch || publication.state !== "requested" || publication.head !== args.head || publication.tree !== args.tree || publication.branch !== args.branch || publication.targetBase !== args.liveTargetBase) fail("PUBLICATION_STALE", "Review branch/base readback does not match the exact audited artifact");
@@ -31,7 +31,7 @@ export const verifyBranch = mutation({ args: { ...runArgs, publicationId: v.stri
   });
 } });
 export const verifyPR = mutation({ args: { ...runArgs, publicationId: v.string(), head: v.string(), tree: v.string(), liveTargetBase: v.string(), repository: v.string(), headBranch: v.string(), targetBaseRef: v.string(), prId: v.string(), prUrl: v.string(), open: v.boolean(), evidenceRef: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["artifact_verifier", "human"]); const { task, run } = await verifiedRun(ctx, args, actor); await publicationTask(ctx, args.taskId, args.projectId);
+  const { actor, project } = await authenticate(ctx, args, ["artifact_verifier", "human"], "publications.verifyPR"); const { task, run } = await verifiedRun(ctx, args, actor); await publicationTask(ctx, args.taskId, args.projectId);
   return replay(ctx, actor, "publications.verifyPR", args, async () => {
     const publication = await ctx.db.query("publications").withIndex("by_stable_id", q => q.eq("id", args.publicationId)).unique(); bounded(args.evidenceRef, 2048, "PR readback evidence"); bounded(args.prId, 128, "PR identity"); bounded(args.prUrl, 2048, "PR URL");
     if (!publication || publication.projectId !== args.projectId || publication.runId !== args.runId || publication.epoch !== args.epoch || publication.state !== "branch_verified" || publication.head !== args.head || publication.tree !== args.tree || publication.targetBase !== args.liveTargetBase || args.repository !== project.repository || args.headBranch !== publication.branch || args.targetBaseRef !== project.defaultBranch || !args.open || !args.prUrl.startsWith("https://")) fail("PUBLICATION_STALE", "Open PR must bind exact verified head/tree and current target base");
@@ -40,7 +40,7 @@ export const verifyPR = mutation({ args: { ...runArgs, publicationId: v.string()
   });
 } });
 export const accept = mutation({ args: { ...runArgs, publicationId: v.string(), liveTargetBase: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["artifact_verifier", "human"]); const { task, run } = await verifiedRun(ctx, args, actor); await publicationTask(ctx, args.taskId, args.projectId);
+  const { actor, project } = await authenticate(ctx, args, ["artifact_verifier", "human"], "publications.accept"); const { task, run } = await verifiedRun(ctx, args, actor); await publicationTask(ctx, args.taskId, args.projectId);
   return replay(ctx, actor, "publications.accept", args, async () => {
     const publication = await ctx.db.query("publications").withIndex("by_stable_id", q => q.eq("id", args.publicationId)).unique();
     if (!publication || publication.projectId !== args.projectId || publication.runId !== run.id || publication.epoch !== run.epoch || publication.state !== "pr_verified" || publication.targetBase !== args.liveTargetBase) fail("PUBLICATION_STALE", "Publication is stale or lacks exact verified PR evidence");

@@ -1,3 +1,4 @@
+import { mcpIngress } from "./mcpIngress.js";
 import { httpRouter, makeFunctionReference } from "convex/server";
 import { httpAction } from "./server.js";
 import { siteOrigin } from "./approvalAuth.js";
@@ -43,4 +44,5 @@ for (const [path, name] of Object.entries(routes)) {
     } catch { return new Response(JSON.stringify({ error: "Protected verification rejected. Check request status in chat or restart protected enrollment." }), { status: 403, headers: { ...headers, "Content-Type": "application/json" } }); }
   }) });
 }
+mcpIngress.registerRoutes(router);
 export default router;

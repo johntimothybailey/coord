@@ -1,3 +1,4 @@
+import { childLineage, isOAuth, validateLineage } from "./oauthAuthority.js";
 import { v } from "convex/values";
 import { progressHash } from "./artifacts.js";
 import type { Manifest } from "./artifacts.js";
@@ -57,7 +58,7 @@ export async function noConflicts(ctx: Pick<QueryCtx, "db">, task: Doc<"tasks">,
   }
 }
 export const propose = mutation({ args: { ...identityArgs, taskId: v.string(), goalId: v.string(), goalRevision: v.number(), title: v.string(), scope: v.array(v.string()), dependencies: v.array(dependency), executionBase: base }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["agent", "human"]);
+  const { actor, project } = await authenticate(ctx, args, ["agent", "human"], "tasks.propose");
   return replay(ctx, actor, "tasks.propose", args, async () => {
     stableId(args.taskId); bounded(args.title, 1024, "task title"); validateScope(project, args.scope);
     if (!/^[a-f0-9]{40,64}$/.test(args.executionBase.sha) || !Number.isSafeInteger(args.executionBase.revision) || args.executionBase.revision < 1 || !args.executionBase.remoteRef.startsWith("refs/")) fail("INVALID_INPUT", "Invalid execution base");
@@ -75,9 +76,9 @@ export const propose = mutation({ args: { ...identityArgs, taskId: v.string(), g
 } });
 
 const admissionArgs = { ...identityArgs, taskId: v.string(), runId: v.string(), launchId: v.string(), grantToken: v.string(), machineId: v.string(), harness: v.union(v.literal("codex"), v.literal("antigravity")), capabilityKey };
-type Admission = { token: string; protocolVersion: number; clientVersion: string; capabilities: string[]; backendId: string; projectId: string; requestId: string; taskId: string; runId: string; launchId: string; grantToken: string; machineId: string; harness: "codex" | "antigravity"; capabilityKey: Doc<"machines">["capabilityKey"] & {} };
+type Admission = { token: string; oauthBearer?: string; protocolVersion: number; clientVersion: string; capabilities: string[]; backendId: string; projectId: string; requestId: string; taskId: string; runId: string; launchId: string; grantToken: string; machineId: string; harness: "codex" | "antigravity"; capabilityKey: Doc<"machines">["capabilityKey"] & {} };
 async function admit(ctx: MutationCtx, args: Admission, mode: "manual" | "managed" | "replan") {
-  const { actor, project } = await authenticate(ctx, args, ["agent"]);
+  const { actor, project } = await authenticate(ctx, args, ["agent"], `tasks.${mode === "manual" ? "registerManual" : mode === "replan" ? "claimReplan" : "claim"}`);
   return replay(ctx, actor, `tasks.${mode === "manual" ? "registerManual" : mode === "replan" ? "claimReplan" : "claim"}`, args, async () => {
     stableId(args.runId); stableId(args.launchId); stableId(args.machineId); tokenFormat(args.grantToken);
     if (args.grantToken === args.token) fail("INVALID_INPUT", "Run credential must be independent");
@@ -98,9 +99,9 @@ async function admit(ctx: MutationCtx, args: Admission, mode: "manual" | "manage
     if (mode !== "manual" && (held.length >= project.capacity || machineHeld.length >= machine.capacity)) fail("CAPACITY_EXHAUSTED", "Managed capacity is reserved");
     const grantDigest = await digest(args.grantToken); const grantId = `grant_${args.runId}`;
     if (await ctx.db.query("credentials").withIndex("by_digest", q => q.eq("digest", grantDigest)).unique() || await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", grantId)).unique() || await ctx.db.query("runs").withIndex("by_stable_id", q => q.eq("id", args.runId)).unique()) fail("IDEMPOTENCY_CONFLICT", "Run or grant identity already used");
-    const epoch = task.epoch + 1; const deadline = Date.now() + goal.runTimeoutMs; const leaseUntil = Math.min(Date.now() + DEFAULTS.leaseMs, deadline);
+    const epoch = task.epoch + 1; const authorityUntil = isOAuth(actor) ? await validateLineage(ctx, actor, project.id) : Number.POSITIVE_INFINITY; const deadline = Math.min(Date.now() + goal.runTimeoutMs, authorityUntil); const leaseUntil = Math.min(Date.now() + DEFAULTS.leaseMs, deadline);
     await ctx.db.insert("runs", { id: args.runId, projectId: project.id, taskId: task.id, memberId: actor.memberId, machineId: machine.id, harness: args.harness, mode, goalRevision: goal.revision, epoch, launchId: args.launchId, state: mode === "manual" ? "running" : "reserved", grantId, capabilityDigest: machine.capabilityDigest, configVersion: project.configVersion, policyVersion: project.policyVersion, leaseUntil, deadline, capacityHeld: mode !== "manual", resultAccepted: false });
-    await ctx.db.insert("credentials", { id: grantId, backendId: args.backendId, memberId: actor.memberId, digest: grantDigest, role: "run", projectIds: [project.id], runId: args.runId, expiresAt: deadline });
+    await ctx.db.insert("credentials", { id: grantId, backendId: args.backendId, memberId: actor.memberId, digest: grantDigest, role: "run", projectIds: [project.id], runId: args.runId, expiresAt: deadline, ...childLineage(actor) });
     await ctx.db.patch(task._id, { epoch, ownerRunId: args.runId, leaseUntil, state: mode === "manual" ? "running" : "reserved", replanAttempts: task.replanAttempts + (mode === "replan" ? 1 : 0), coverageComplete: false });
     return { taskId: task.id, runId: args.runId, epoch, goalRevision: goal.revision, launchId: args.launchId, grantId, leaseUntil, deadline, mode };
   });
@@ -109,26 +110,26 @@ export const claim = mutation({ args: admissionArgs, handler: (ctx, args) => adm
 export const claimReplan = mutation({ args: admissionArgs, handler: (ctx, args) => admit(ctx, args, "replan") });
 export const registerManual = mutation({ args: admissionArgs, handler: (ctx, args) => admit(ctx, args, "manual") });
 export const renew = mutation({ args: runArgs, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); const { task, run } = await liveRun(ctx, args, actor, ["reserved", "starting", "running"]);
+  const { actor } = await authenticate(ctx, args, ["run"], "tasks.renew"); const { task, run } = await liveRun(ctx, args, actor, ["reserved", "starting", "running"]);
   return replay(ctx, actor, "tasks.renew", args, async () => {
-    const leaseUntil = Math.min(Date.now() + DEFAULTS.leaseMs, run.deadline);
+    const leaseUntil = Math.min(Date.now() + DEFAULTS.leaseMs, run.deadline, await validateLineage(ctx, actor, args.projectId));
     await ctx.db.patch(task._id, { leaseUntil }); await ctx.db.patch(run._id, { leaseUntil }); return { runId: run.id, epoch: run.epoch, leaseUntil };
   });
 } });
 // Status facts are not execution/renewal authority; post-result native check-in remains blocked.
 export const sessionStatus = query({ args: runArgs, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); const { task, run } = await boundRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "tasks.sessionStatus"); const { task, run } = await boundRun(ctx, args, actor);
   return { taskState: task.state, runState: run.state, resultAccepted: run.resultAccepted, requestedOutcome: run.requestedOutcome, leaseUntil: run.leaseUntil, deadline: run.deadline, currentOwner: task.ownerRunId === run.id && task.epoch === run.epoch };
 } });
 export const checkIn = query({ args: runArgs, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["run"]); const { task, run, goal } = await liveRun(ctx, args, actor, ["reserved", "starting", "running"]);
+  const { actor, project } = await authenticate(ctx, args, ["run"], "tasks.checkIn"); const { task, run, goal } = await liveRun(ctx, args, actor, ["reserved", "starting", "running"]);
   const messages = await ctx.db.query("messages").withIndex("by_recipient", q => q.eq("projectId", project.id).eq("recipientTaskId", task.id)).take(101);
   let conflictBlocked = false; try { await noConflicts(ctx, task); } catch { conflictBlocked = true; }
   const selected = boundedRecords(messages.filter(m => (m.recipientEpoch === task.epoch && m.state !== "acknowledged_by_agent") || (m.conflict && (m.resolution !== "accepted" || m.decisionRecipientEpoch !== task.epoch))).slice(0, 100), 2048);
   return { task, run, goal, policyVersion: project.policyVersion, messages: selected.records, conflictBlocked, complete: messages.length <= 100 && selected.complete };
 } });
 export const progress = mutation({ args: { ...runArgs, expectedRevision: v.number(), progress: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); const { task } = await liveRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "tasks.progress"); const { task } = await liveRun(ctx, args, actor);
   return replay(ctx, actor, "tasks.progress", args, async () => {
     bounded(args.progress, 16 * 1024, "progress"); if (task.progressRevision !== args.expectedRevision) fail("IDEMPOTENCY_CONFLICT", "Task progress changed");
     await ctx.db.patch(task._id, { progress: args.progress, progressRevision: task.progressRevision + 1, coverageComplete: false }); return { revision: task.progressRevision + 1 };
@@ -149,7 +150,7 @@ async function acyclic(ctx: MutationCtx, projectId: string, replacements: Map<st
   for (const id of replacements.keys()) await visit(id);
 }
 export const proposeSubtasks = mutation({ args: { ...runArgs, rationale: v.string(), children: v.array(proposedTask) }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["run"]); const { task, run, goal } = await liveRun(ctx, args, actor);
+  const { actor, project } = await authenticate(ctx, args, ["run"], "tasks.proposeSubtasks"); const { task, run, goal } = await liveRun(ctx, args, actor);
   return replay(ctx, actor, "tasks.proposeSubtasks", args, async () => {
     bounded(args.rationale, 4096, "subtask purpose");
     if (run.mode === "manual") fail("UNSUPPORTED_FOR_AUTONOMOUS_EXECUTION", "Prerequisite yielding requires supervised managed execution");
@@ -211,7 +212,7 @@ export async function refreshWaiting(ctx: MutationCtx, waiting: Doc<"tasks">[]) 
 
 // Deterministic scheduler transition, not a project-agent ownership override.
 export const refreshDependencies = mutation({ args: identityArgs, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["agent", "human"]);
+  const { actor } = await authenticate(ctx, args, ["agent", "human"], "tasks.refreshDependencies");
   return replay(ctx, actor, "tasks.refreshDependencies", args, async () => {
     const waiting = await ctx.db.query("tasks").withIndex("by_project_state", q => q.eq("projectId", args.projectId).eq("state", "waiting_dependencies")).take(101);
     const queued = await ctx.db.query("tasks").withIndex("by_project_state", q => q.eq("projectId", args.projectId).eq("state", "queued")).take(101);
@@ -220,7 +221,7 @@ export const refreshDependencies = mutation({ args: identityArgs, handler: async
   });
 } });
 export const finishReplan = mutation({ args: { ...runArgs, result: v.union(v.literal("revised"), v.literal("blocked"), v.literal("failed")), dependencies: v.array(dependency), rationale: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); await boundRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "tasks.finishReplan"); await boundRun(ctx, args, actor);
   return replay(ctx, actor, "tasks.finishReplan", args, async () => {
     const { task, run } = await liveRun(ctx, args, actor);
     bounded(args.rationale, 4096, "replanning result");
@@ -247,7 +248,7 @@ export async function safeBaseRetry(ctx: Pick<QueryCtx, "db">, task: Doc<"tasks"
   return false;
 }
 export const requestResume = mutation({ args: { ...identityArgs, taskId: v.string(), checkpointId: v.optional(v.string()) }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["agent", "human"]);
+  const { actor, project } = await authenticate(ctx, args, ["agent", "human"], "tasks.requestResume");
   return replay(ctx, actor, "tasks.requestResume", args, async () => {
     const task = await taskById(ctx, args.taskId, project.id); await approvedGoal(ctx, task); validateScope(project, task.scope);
     if (task.state !== "blocked" || task.ownerRunId || task.holdRunId || task.reason === "human_recovery_required" || task.reason?.startsWith("NEEDS_HUMAN")) fail("LAUNCH_UNCERTAIN", "Task requires a settled reservation and eligible recovery decision");
