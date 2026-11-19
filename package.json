@@ -10,8 +10,8 @@
     "coord": "dist/src/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "node scripts/build-connect.mjs && tsc -p tsconfig.json",
+    "typecheck": "node scripts/build-connect.mjs && tsc -p tsconfig.json --noEmit",
     "lint": "node scripts/static-check.mjs",
     "test": "npm run build && node --test dist/tests/*.test.js",
     "check": "npm run lint && npm run typecheck && npm test",

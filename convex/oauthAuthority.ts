@@ -25,7 +25,7 @@ export function isOAuth(actor: Doc<"credentials">): boolean {
   if (actor.credentialSource !== "oauth" && (actor.connectionId !== undefined || actor.parentCredentialId !== undefined || actor.oauthScopes !== undefined || actor.absoluteExpiresAt !== undefined)) fail("UNAUTHORIZED", "Incomplete credential origin");
   return actor.credentialSource === "oauth";
 }
-async function currentLink(ctx: AuthorityCtx, link: Doc<"identityLinks"> | null, requireActive = true) {
+export async function currentLink(ctx: AuthorityCtx, link: Doc<"identityLinks"> | null, requireActive = true) {
   if (!link || !Number.isFinite(link.expiresAt) || link.revokedAt !== undefined || link.expiresAt <= Date.now() || (requireActive && !link.active)) fail("UNAUTHORIZED", "Identity link unavailable");
   const user = await ctx.db.get(link.userId);
   const source = await ctx.db.get(link.sourceDocumentId);
@@ -37,7 +37,7 @@ async function currentLink(ctx: AuthorityCtx, link: Doc<"identityLinks"> | null,
   if (!project || project.backendId !== link.backendId) fail("UNAUTHORIZED", "Project unavailable");
   return { link, source, membership };
 }
-async function currentGrant(ctx: AuthorityCtx, userId: string, grantId: string) {
+export async function currentGrant(ctx: AuthorityCtx, userId: string, grantId: string) {
   // The supported API lists only the newest 200. Missing/failed lookup denies;
   // it is not evidence that the user deliberately revoked this grant.
   const grants = await componentQuery(ctx)(components.mcp.grants.list, { userId });
@@ -104,7 +104,7 @@ export async function bearerActor(ctx: AuthorityCtx, bearer: string, backendId: 
 async function auditTransition(ctx: MutationCtx, projectId: string, actorId: string, operation: string, recordId: string) {
   await ctx.db.insert("audit", { projectId, actorId, operation, requestId: recordId, recordId, detail: "accepted", at: Date.now() });
 }
-async function sessionUser(ctx: QueryCtx | MutationCtx) {
+export async function sessionUser(ctx: QueryCtx | MutationCtx) {
   const userId = await getAuthUserId(ctx, components.auth);
   if (!userId) fail("UNAUTHORIZED", "Live browser authentication required");
   const user = await ctx.db.get(userId);
@@ -115,7 +115,8 @@ async function sessionUser(ctx: QueryCtx | MutationCtx) {
 // method must attach this callback, rather than accept a caller's user ID.
 export const createUser = internalMutation({ args: { method: v.object({ name: v.string(), profile: v.any() }) }, returns: v.id("users"), handler: ctx => ctx.db.insert("users", { enabled: true, createdAt: Date.now() }) });
 export const identity = query({ args: {}, handler: async ctx => ({ userId: (await sessionUser(ctx))._id }) });
-export const installLink = internalMutation({ args: { id: v.string(), generation: v.number(), userId: v.id("users"), backendId: v.string(), projectId: v.string(), sourceCredentialId: v.string(), scopes: v.array(v.string()), activationExpiresAt: v.number(), expiresAt: v.number() }, handler: async (ctx, args) => {
+export const installLinkArgs = { id: v.string(), generation: v.number(), userId: v.id("users"), backendId: v.string(), projectId: v.string(), sourceCredentialId: v.string(), scopes: v.array(v.string()), activationExpiresAt: v.number(), expiresAt: v.number() };
+export async function installIdentityLink(ctx: MutationCtx, args: { id: string; generation: number; userId: Doc<"users">["_id"]; backendId: string; projectId: string; sourceCredentialId: string; scopes: string[]; activationExpiresAt: number; expiresAt: number }) {
   stableId(args.id);
   if (!Number.isSafeInteger(args.activationExpiresAt) || !Number.isSafeInteger(args.expiresAt) || !Number.isSafeInteger(args.generation) || args.generation < 1 || args.activationExpiresAt <= Date.now() || args.activationExpiresAt > args.expiresAt || args.expiresAt <= Date.now() || !args.scopes.length || args.scopes.length > OAUTH_SCOPES.length || new Set(args.scopes).size !== args.scopes.length || args.scopes.some(scope => !(OAUTH_SCOPES as readonly string[]).includes(scope))) fail("INVALID_INPUT", "Invalid identity link limits");
   const source = await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", args.sourceCredentialId)).unique();
@@ -138,7 +139,8 @@ export const installLink = internalMutation({ args: { id: v.string(), generation
   await ctx.db.insert("memberships", { linkId, generation: args.generation, userId: args.userId, backendId: args.backendId, projectId: args.projectId, sourceCredentialId: source.id, memberId: source.memberId, expiresAt: args.expiresAt, active: false });
   await auditTransition(ctx, args.projectId, "deployment_owner", "oauth.installLink", linkId);
   return { linkId, generation: args.generation };
-} });
+}
+export const installLink = internalMutation({ args: installLinkArgs, handler: installIdentityLink });
 export const activateLink = mutation({ args: { linkId: v.id("identityLinks"), generation: v.number() }, handler: async (ctx, args) => {
   const user = await sessionUser(ctx);
   const state = await currentLink(ctx, await ctx.db.get(args.linkId), false);
@@ -151,12 +153,12 @@ export const activateLink = mutation({ args: { linkId: v.id("identityLinks"), ge
 } });
 // Authenticated project consent is separate from generic OAuth scopes. There is
 // no Connect UI in this slice: these bounded browser APIs are infrastructure.
-export const consentGrant = mutation({ args: { grantId: v.string(), linkId: v.id("identityLinks"), generation: v.number() }, handler: async (ctx, args) => {
+export async function consentForSession(ctx: MutationCtx, args: { grantId: string; linkId: Doc<"identityLinks">["_id"]; generation: number }, scopeCeiling?: readonly string[]) {
   const user = await sessionUser(ctx);
   const { link, source, membership } = await currentLink(ctx, await ctx.db.get(args.linkId));
   if (link.userId !== user._id || link.generation !== args.generation) fail("FORBIDDEN", "Consent identity mismatch");
   const grant = await currentGrant(ctx, user._id, args.grantId);
-  const scopes = grant.scopes.filter(scope => link.scopes.includes(scope));
+  const scopes = grant.scopes.filter(scope => link.scopes.includes(scope) && (scopeCeiling === undefined || scopeCeiling.includes(scope)));
   const tuple = { grantId: grant._id, userId: user._id, backendId: link.backendId, projectId: link.projectId, resource: grant.resource, clientId: grant.clientId!, linkId: link._id, linkGeneration: link.generation, membershipId: membership._id, membershipGeneration: membership.generation, sourceCredentialId: source.id, memberId: source.memberId, scopes, grantCreatedAt: grant._creationTime, absoluteExpiresAt: Math.min(grant._creationTime + CONNECTION_CAP_MS, link.expiresAt, membership.expiresAt, source.expiresAt) };
   if (!scopes.length || tuple.absoluteExpiresAt <= Date.now()) fail("UNAUTHORIZED", "Consent authority expired");
   const prior = await ctx.db.query("mcpConnections").withIndex("by_grant", q => q.eq("grantId", grant._id)).unique();
@@ -169,8 +171,14 @@ export const consentGrant = mutation({ args: { grantId: v.string(), linkId: v.id
   const connectionId = await ctx.db.insert("mcpConnections", tuple);
   await auditTransition(ctx, link.projectId, user._id, "oauth.consentGrant", connectionId);
   return { connectionId, projectId: link.projectId, absoluteExpiresAt: tuple.absoluteExpiresAt };
+}
+export const consentGrant = mutation({ args: { grantId: v.string(), linkId: v.id("identityLinks"), generation: v.number() }, handler: async (ctx, args) => {
+  const user = await sessionUser(ctx);
+  const handoff = await ctx.db.query("connectHandoffs").withIndex("by_grant", q => q.eq("grantId", args.grantId)).unique();
+  if (handoff?.userId === user._id) fail("FORBIDDEN", "This grant requires its exact reviewed Connect handoff; terminal attempts cannot be bypassed");
+  return consentForSession(ctx, args);
 } });
-export const bind = mutation({ args: { ...identityArgs }, handler: async (ctx, args) => {
+export async function bindOAuth(ctx: MutationCtx, args: import("./auth.js").Identity) {
   if (!args.oauthBearer || args.token !== "") fail("UNAUTHORIZED", "Explicit OAuth bearer required");
   bounded(args.oauthBearer, 4096, "OAuth bearer");
   const verified = await ctx.runQuery(components.mcp.tokens.verify, { hash: await digest(args.oauthBearer), now: Date.now() });
@@ -191,7 +199,8 @@ export const bind = mutation({ args: { ...identityArgs }, handler: async (ctx, a
   await ctx.db.patch(connection!._id, { rootCredentialId: id });
   await auditTransition(ctx, args.projectId, id, "oauth.bind", connection!._id);
   return { credentialId: id, absoluteExpiresAt: connection!.absoluteExpiresAt };
-} });
+}
+export const bind = mutation({ args: { ...identityArgs }, handler: bindOAuth });
 export const revokeConnection = mutation({ args: { connectionId: v.id("mcpConnections") }, handler: async (ctx, args) => {
   const user = await sessionUser(ctx); const connection = await ctx.db.get(args.connectionId);
   if (!connection || connection.userId !== user._id) fail("FORBIDDEN", "Connection unavailable");

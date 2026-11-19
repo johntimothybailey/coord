@@ -6,6 +6,7 @@ import { v } from "convex/values";
 import { boundedMcpClientInfo } from "../src/protocol.js";
 import { components, internal } from "./_generated/api.js";
 import { identityArgs } from "./authArgs.js";
+import { connectIdentity } from "./connect.js";
 import { OAUTH_SCOPES } from "./oauthPolicy.js";
 import { repositoryMemorySource } from "./schema.js";
 
@@ -33,6 +34,26 @@ function toolsFor(bearer: string | undefined) {
     coord_cancel_approval_request: tool({ description: "Withdraw a pending approval request; completed decisions cannot be cancelled.", args: { ...requestArgs, approvalRequestId: v.string() }, scope: "coord:approval-request", annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false }, handler: (ctx, args) => forward(ctx, "approvalRequests:cancel", args, "mutation") }),
   };
 }
+function onboardingTools(bearer: string | undefined) {
+  const args = () => { if (!bearer) throw new Error("Authenticated access bearer required"); return { bearer }; };
+  return {
+    coord_finish_connect: tool({ description: "Finish connecting this exact authenticated OAuth grant. Open its protected browser handoff, confirm project consent, then retry to bind and verify actual project status. OAuth authorization alone is not project access.", annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false }, handler: async ctx => {
+      const result = await ctx.runMutation(internal.connect.finish, args());
+      if (result.state !== "bound") return result;
+      const status = await ctx.runQuery(makeFunctionReference<"query">("projects:status"), connectIdentity(args().bearer, result, result.grantId));
+      const verified = await ctx.runMutation(internal.connect.confirmStatus, args());
+      return { ...verified, status, next: "Refresh or re-list this host connection tools to discover project tools. If the host caches tools, reconnect or restart its connection. Automatic same-conversation refresh is host-dependent and unqualified." };
+    } }),
+    coord_connect_status: tool({ description: "Read the exact current Connect handoff state for this authenticated grant, without guessing another connection.", annotations: { readOnlyHint: true, openWorldHint: false }, handler: ctx => ctx.runQuery(internal.connect.hostStatus, args()) }),
+    coord_cancel_connect: tool({ description: "Cancel only this pending Connect handoff. It does not disconnect an existing connection; reconnect through a fresh OAuth grant after a terminal attempt.", annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false }, handler: ctx => ctx.runMutation(internal.connect.hostCancel, args()) }),
+  };
+}
+class OnboardingMcpServer extends McpServer {
+  override async authenticate(ctx: ToolCtx, request: Request): Promise<McpUser | null> {
+    const bearer = bearerFrom(request); if (!bearer) return null;
+    return ctx.runQuery(internal.connect.inspectAccess, { bearer });
+  }
+}
 // Override only the supported public hook: read-only review must not depend on
 // the package's optional stale-telemetry touch mutation.
 class QueryOnlyMcpServer extends McpServer {
@@ -43,8 +64,8 @@ class QueryOnlyMcpServer extends McpServer {
 }
 const options = {
   name: "coord", version: "0.1.0",
-  consentUrl: process.env.COORD_OAUTH_CONSENT_URL ?? "",
-  instructions: "Review and propose through scoped tools. Binding requires a live browser session, owner-installed project link and exact grant consent. Connect UI is not delivered by this foundation. Human approval requires the protected passkey page.",
+  consentUrl: process.env.COORD_OAUTH_CONSENT_URL ?? (process.env.CONVEX_SITE_URL ? `${process.env.CONVEX_SITE_URL}/connect` : ""),
+  instructions: "Review and propose through scoped tools. Binding requires a live browser session, owner-installed project link and exact grant consent. Use the protected /connect page for sign-in and exact grant-to-project consent. Human approval requires the protected passkey page.",
   scopes: Object.fromEntries(OAUTH_SCOPES.map(scope => [scope, `Restrict existing Coord authority to ${scope.slice(6)} operations in the authenticated project consent.`])),
   accessTokenTtlMs: 5 * 60_000, deviceFlow: false,
 };
@@ -82,25 +103,28 @@ function record(value: unknown): Record<string, unknown> | undefined {
 class RequestScopedMcpServer extends QueryOnlyMcpServer {
   override registerRoutes(http: HttpRouter): void {
     const consentUrl = this.options.consentUrl;
-    if (consentUrl && new URL(consentUrl).protocol !== "https:") throw new Error("Protected OAuth consent requires HTTPS");
+    if (consentUrl && (new URL(consentUrl).protocol !== "https:" || consentUrl !== `${process.env.CONVEX_SITE_URL}/connect`)) throw new Error("Protected OAuth consent must use the exact HTTPS site /connect page");
     const routes = httpRouter();
     super.registerRoutes(routes);
     for (const [path, method, handler] of routes.getRoutes()) {
-      http.route({ path, method, handler: path === `${this.path}/oauth/authorize` && !process.env.COORD_OAUTH_CONSENT_URL
-        ? httpActionGeneric(async () => new Response("Protected OAuth consent is not configured. This foundation does not include a Connect UI.", { status: 503, headers: { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" } }))
+      http.route({ path, method, handler: path === `${this.path}/oauth/authorize` && !consentUrl
+        ? httpActionGeneric(async () => new Response("Protected OAuth consent is not configured for this deployment. Set its exact HTTPS site origin to use the delivered /connect page.", { status: 503, headers: { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" } }))
         : handler });
     }
   }
   override async handleMcp(ctx: ToolCtx, request: Request): Promise<Response> {
     const pendingObservation = observationJson(request);
-    const scoped = new QueryOnlyMcpServer(components.mcp, { ...options, tools: toolsFor(bearerFrom(request)) });
+    const bearer = bearerFrom(request);
+    const access = bearer ? await ctx.runQuery(internal.connect.inspectAccess, { bearer }) : null;
+    const scoped = access?.bound
+      ? new QueryOnlyMcpServer(components.mcp, { ...options, tools: { ...toolsFor(bearer), ...onboardingTools(bearer) }, warnings: false })
+      : new OnboardingMcpServer(components.mcp, { ...options, tools: onboardingTools(bearer), warnings: false });
     const response = await scoped.handleMcp(ctx, request);
     if (response.status !== 200) return response;
     const observed = record(await pendingObservation);
     // This is a server-observed accepted legacy initialize exchange, not a
     // stateful session, executable attestation or human authentication.
     const clientInfo = boundedMcpClientInfo(record(observed?.params)?.clientInfo);
-    const bearer = bearerFrom(request);
     if (observed?.jsonrpc === "2.0" && observed.method === "initialize" && (typeof observed.id === "number" || typeof observed.id === "string") && clientInfo && bearer && response.status === 200) {
       const accepted = record(await observationJson(response)); const result = record(accepted?.result);
       if (accepted?.jsonrpc === "2.0" && accepted.id === observed.id && accepted.error === undefined && typeof result?.protocolVersion === "string" && record(result.serverInfo)?.name === "coord") {

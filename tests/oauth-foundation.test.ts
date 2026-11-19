@@ -18,6 +18,7 @@ import * as lifecycle from "../convex/lifecycle.js";
 import { verifiedRun } from "../convex/artifacts.js";
 import { CONNECTION_CAP_MS, OAUTH_SCOPES, operationScope } from "../convex/oauthPolicy.js";
 import { CAPABILITIES, CLIENT_VERSION, REQUIRED_CHECKS } from "../src/protocol.js";
+import * as connect from "../convex/connect.js";
 import * as mcpConsent from "../convex/mcpConsent.js";
 import { mcpIngress } from "../convex/mcpIngress.js";
 
@@ -64,6 +65,7 @@ class ComponentFixture extends BackendFixture {
   }
   override context(): MutationCtx {
     const ctx = super.context();
+    ctx.db.normalizeId = ((_table: string, id: string) => this.rows.has(id) ? id : null) as typeof ctx.db.normalizeId;
     ctx.auth = { getUserIdentity: async () => this.subject ? { subject: this.subject } : null } as MutationCtx["auth"];
     ctx.runQuery = (async (ref: unknown, args: Record<string, unknown>) => {
       const address = getFunctionAddress(ref).reference ?? "";
@@ -73,6 +75,7 @@ class ComponentFixture extends BackendFixture {
       if (address.endsWith("public/getSession")) return authPublic.getSession._handler(this.componentContext(), args);
       if (address.endsWith("oauth/getAuthRequest")) return mcpOauth.getAuthRequest._handler(this.componentContext(), args);
       const name = getFunctionName(ref as never);
+      if (name === "connect:inspectAccess") return (connect.inspectAccess as unknown as Handler)._handler(this.context(), args);
       if (name === "oauthAuthority:browserIdentity") return (oauth.browserIdentity as unknown as Handler)._handler(this.context(), args);
       if (name === "oauthAuthority:inspectBearer") return this.call(oauth.inspectBearer, args as { bearer: string });
       if (name === "projects:status") return this.call(projects.status, args as ReturnType<typeof request>);

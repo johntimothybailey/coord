@@ -6,5 +6,5 @@
     "outDir": "dist", "rootDir": ".", "skipLibCheck": true,
     "allowJs": true, "sourceMap": true, "types": ["node"]
   },
-  "include": ["src/**/*.ts", "convex/**/*.ts", "convex/_generated/*.js", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "convex/**/*.ts", "convex/_generated/*.js", "tests/**/*.ts", "web/**/*.ts"]
 }
