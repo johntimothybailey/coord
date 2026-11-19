@@ -5,13 +5,13 @@ import { runArgs, identityArgs, authenticate, liveRun, replay, bounded, fail, di
 import { safeBaseRetry, taskById, validateScope, noConflicts, dependencyInput } from "./tasks.js";
 import { manifestValidator, validateManifest, verifiedRun, progressHash, requireVerifiedScan } from "./artifacts.js";
 export const authority = query({ args: runArgs, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["run", "artifact_verifier", "human"]);
+  const { actor, project } = await authenticate(ctx, args, ["run", "artifact_verifier", "human"], "checkpoints.authority");
   const { task, run } = actor.role === "run" ? await liveRun(ctx, args, actor) : await verifiedRun(ctx, args, actor);
   let conflictBlocked = false; try { await noConflicts(ctx, task); } catch { conflictBlocked = true; }
   return { identity: { taskId: task.id, runId: run.id, epoch: task.epoch, goalRevision: task.goalRevision }, executionBase: task.executionBase, progressRevision: task.progressRevision, progressHash: await progressHash(task.progress), policyDigest: project.capturePolicyDigest ?? null, progress: task.progress, taskState: task.state, runMode: run.mode, conflictBlocked };
 } });
 export const prepare = mutation({ args: { ...runArgs, manifest: manifestValidator, summary: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); const { task, run } = await liveRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "checkpoints.prepare"); const { task, run } = await liveRun(ctx, args, actor);
   return replay(ctx, actor, "checkpoints.prepare", args, async () => {
     if (run.mode === "replan") fail("FORBIDDEN", "Replanning runs cannot prepare implementation code artifacts");
     bounded(args.summary, 16 * 1024, "checkpoint summary"); stableId(args.manifest.checkpointId); await validateManifest(args.manifest, task, run);
@@ -25,7 +25,7 @@ export const prepare = mutation({ args: { ...runArgs, manifest: manifestValidato
 } });
 const readback = v.object({ commit: v.string(), tree: v.string(), parent: v.union(v.string(), v.null()), parents: v.optional(v.array(v.string())), ref: v.string(), manifestHash: v.string(), progressHash: v.string(), policyDigest: v.string(), evidenceRef: v.string() });
 export const verifyCode = mutation({ args: { ...runArgs, checkpointId: v.string(), readback }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["artifact_verifier", "human"]); const { task, run } = await verifiedRun(ctx, args, actor);
+  const { actor, project } = await authenticate(ctx, args, ["artifact_verifier", "human"], "checkpoints.verifyCode"); const { task, run } = await verifiedRun(ctx, args, actor);
   return replay(ctx, actor, "checkpoints.verifyCode", args, async () => {
     const checkpoint = await ctx.db.query("checkpoints").withIndex("by_stable_id", q => q.eq("id", args.checkpointId)).unique();
     if (!checkpoint || checkpoint.projectId !== args.projectId || checkpoint.runId !== run.id || checkpoint.epoch !== run.epoch || !["prepared", "code_published"].includes(checkpoint.state)) fail("CHECKPOINT_INCOMPLETE", "Checkpoint is not prepared for this run");
@@ -37,7 +37,7 @@ export const verifyCode = mutation({ args: { ...runArgs, checkpointId: v.string(
   });
 } });
 export const ready = mutation({ args: { ...runArgs, checkpointId: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["artifact_verifier", "human"]); const { task, run } = await verifiedRun(ctx, args, actor);
+  const { actor, project } = await authenticate(ctx, args, ["artifact_verifier", "human"], "checkpoints.ready"); const { task, run } = await verifiedRun(ctx, args, actor);
   return replay(ctx, actor, "checkpoints.ready", args, async () => {
     const checkpoint = await ctx.db.query("checkpoints").withIndex("by_stable_id", q => q.eq("id", args.checkpointId)).unique();
     if (!checkpoint || checkpoint.projectId !== args.projectId || checkpoint.runId !== run.id || checkpoint.epoch !== run.epoch || checkpoint.state !== "code_published") fail("CHECKPOINT_INCOMPLETE", "Verified remote code is required before ready acceptance");
@@ -59,7 +59,7 @@ async function dependencySummaries(ctx: Pick<QueryCtx, "db">, project: Doc<"proj
   return inputs;
 }
 export const getInput = query({ args: { ...identityArgs, taskId: v.string(), dependencyTaskId: v.string(), includeManifest: v.optional(v.boolean()) }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["agent", "human", "run"]);
+  const { actor, project } = await authenticate(ctx, args, ["agent", "human", "run"], "checkpoints.getInput");
   let task: Doc<"tasks">;
   if (actor.role === "run") {
     const run = actor.runId ? await ctx.db.query("runs").withIndex("by_stable_id", q => q.eq("id", actor.runId!)).unique() : null;
@@ -73,7 +73,7 @@ export const getInput = query({ args: { ...identityArgs, taskId: v.string(), dep
 } });
 
 export const getReady = query({ args: { ...identityArgs, taskId: v.string(), checkpointId: v.optional(v.string()) }, handler: async (ctx, args) => {
-  const { project } = await authenticate(ctx, args, ["agent", "human"]);
+  const { project } = await authenticate(ctx, args, ["agent", "human"], "checkpoints.getReady");
   const task = await taskById(ctx, args.taskId, args.projectId); const goal = await approvedGoal(ctx, task);
   validateScope(project, task.scope);
   if (!project.sharingApproved) fail("FORBIDDEN", "Project sharing is not approved");

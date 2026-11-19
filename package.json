@@ -10,16 +10,18 @@
     "coord": "dist/src/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "node scripts/build-connect.mjs && tsc -p tsconfig.json",
+    "typecheck": "node scripts/build-connect.mjs && tsc -p tsconfig.json --noEmit",
     "lint": "node scripts/static-check.mjs",
     "test": "npm run build && node --test dist/tests/*.test.js",
     "check": "npm run lint && npm run typecheck && npm test",
     "doctor": "node dist/src/cli.js doctor --json"
   },
   "dependencies": {
+    "@convex-dev/auth": "2.0.0",
+    "@convex-dev/mcp": "0.1.0-alpha.7",
     "@modelcontextprotocol/sdk": "1.32.2",
-    "convex": "1.49.0",
+    "convex": "1.50.0",
     "zod": "4.6.7"
   },
   "devDependencies": {

@@ -4,7 +4,7 @@
     "strict": true, "noUncheckedIndexedAccess": true, "noUnusedLocals": true,
     "noUnusedParameters": true, "verbatimModuleSyntax": true,
     "outDir": "dist", "rootDir": ".", "skipLibCheck": true,
-    "sourceMap": true, "types": ["node"]
+    "allowJs": true, "sourceMap": true, "types": ["node"]
   },
-  "include": ["src/**/*.ts", "convex/**/*.ts", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "convex/**/*.ts", "convex/_generated/*.js", "tests/**/*.ts", "web/**/*.ts"]
 }

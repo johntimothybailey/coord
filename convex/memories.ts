@@ -8,7 +8,7 @@ import { approveExactRule } from "./ruleApproval.js";
 import { repositoryMemorySource } from "./schema.js";
 const source = v.object({ taskId: v.string(), revision: v.string(), evidenceRef: v.string() });
 export const record = mutation({ args: { ...runArgs, memoryId: v.string(), kind: v.union(v.literal("lesson"), v.literal("decision"), v.literal("rule")), content: v.string(), sources: v.array(source), applicability: v.array(v.string()), confidence: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); await liveRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "memories.record"); await liveRun(ctx, args, actor);
   return replay(ctx, actor, "memories.record", args, async () => {
     stableId(args.memoryId); bounded(args.content, 4096, "memory"); bounded(args.confidence, 64, "confidence");
     if (!args.sources.length || args.sources.length > 20 || args.applicability.length > 50) fail("INVALID_INPUT", "Memory provenance/applicability bounds exceeded");
@@ -23,7 +23,7 @@ export const record = mutation({ args: { ...runArgs, memoryId: v.string(), kind:
 } });
 /** Advisory declaration only: fixed repository evidence is reviewed by the caller/human, not fetched by this mutation. */
 export const proposeRule = mutation({ args: { ...identityArgs, memoryId: v.string(), content: v.string(), sources: v.array(repositoryMemorySource), applicability: v.array(v.string()), confidence: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["agent", "human"]);
+  const { actor, project } = await authenticate(ctx, args, ["agent", "human"], "memories.proposeRule");
   const id = await replay(ctx, actor, "memories.proposeRule", args, async () => {
     stableId(args.memoryId); bounded(args.content, 4096, "rule"); bounded(args.confidence, 64, "confidence");
     if (!args.content.trim() || !args.confidence.trim() || !args.sources.length || args.sources.length > 20 || !args.applicability.length || args.applicability.length > 50) fail("INVALID_INPUT", "Rule provenance/applicability bounds exceeded");
@@ -50,13 +50,13 @@ export const proposeRule = mutation({ args: { ...identityArgs, memoryId: v.strin
 } });
 /** Protected exact read: proposed rules are deliberately absent from approved-rule briefings. */
 export const ruleForApproval = query({ args: { ...identityArgs, memoryId: v.string() }, handler: async (ctx, args) => {
-  const { project } = await authenticate(ctx, args, ["human"]);
+  const { project } = await authenticate(ctx, args, ["human"], "memories.ruleForApproval");
   const memory = await ctx.db.query("memories").withIndex("by_stable_id", q => q.eq("id", args.memoryId)).unique();
   if (!memory || memory.projectId !== project.id || memory.kind !== "rule") fail("NOT_FOUND", "Rule is unavailable in this project");
   return { rule: memory, policyVersion: project.policyVersion };
 } });
 export const approveRule = mutation({ args: { ...identityArgs, memoryId: v.string(), revision: v.number(), hash: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["human"]);
+  const { actor, project } = await authenticate(ctx, args, ["human"], "memories.approveRule");
   return replay(ctx, actor, "memories.approveRule", args, async () => {
     return approveExactRule(ctx, project, actor, args);
   });
@@ -67,11 +67,11 @@ async function approvedRuleProjection(ctx: Pick<QueryCtx, "db">, project: Doc<"p
   return { rules: result.records, ruleTargets: project.ruleTargets, policyVersion: project.policyVersion, complete: records.length <= 200 && result.complete, bytes: result.bytes };
 }
 export const rules = query({ args: runArgs, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["run"]); await liveRun(ctx, args, actor, ["reserved", "starting", "running"]);
+  const { actor, project } = await authenticate(ctx, args, ["run"], "memories.rules"); await liveRun(ctx, args, actor, ["reserved", "starting", "running"]);
   return approvedRuleProjection(ctx, project);
 } });
 export const projectRules = query({ args: identityArgs, handler: async (ctx, args) => {
-  const { project } = await authenticate(ctx, args, ["agent", "human"]);
+  const { project } = await authenticate(ctx, args, ["agent", "human"], "memories.projectRules");
   return approvedRuleProjection(ctx, project);
 } });
 function boundedReview<T>(value: T): T {
@@ -80,7 +80,7 @@ function boundedReview<T>(value: T): T {
 }
 /** Advisory review is project-scoped; it never requires or changes a participating run. */
 export const reviewList = query({ args: { ...identityArgs, kind: v.union(v.literal("rule"), v.literal("lesson")), cursor: v.optional(v.string()) }, handler: async (ctx, args) => {
-  const { project } = await authenticate(ctx, args, ["agent", "human"]);
+  const { project } = await authenticate(ctx, args, ["agent", "human"], "memories.reviewList");
   if (args.kind !== "rule" && args.kind !== "lesson") fail("INVALID_INPUT", "Review requires rules or lessons");
   const page = await ctx.db.query("memories").withIndex("by_project_kind_status", q => q.eq("projectId", project.id).eq("kind", args.kind).eq("status", args.kind === "rule" ? "proposed" : "active")).paginate({ cursor: args.cursor ?? null, numItems: 5 });
   const memories = page.page.map(memory => ({ id: memory.id, kind: memory.kind, status: memory.status, revision: memory.revision, hash: memory.hash, contentPreview: Array.from(memory.content).slice(0, 128).join(""), sourceCount: memory.sources.length, applicabilityCount: memory.applicability.length, requiresExpansion: true }));
@@ -88,7 +88,7 @@ export const reviewList = query({ args: { ...identityArgs, kind: v.union(v.liter
 } });
 /** Reassemble this canonical JSON to review all provenance; the hash binds every chunk to one revision. */
 export const reviewDetail = query({ args: { ...identityArgs, memoryId: v.string(), revision: v.number(), hash: v.string(), offset: v.optional(v.number()) }, handler: async (ctx, args) => {
-  const { project } = await authenticate(ctx, args, ["agent", "human"]);
+  const { project } = await authenticate(ctx, args, ["agent", "human"], "memories.reviewDetail");
   stableId(args.memoryId); integer(args.revision, 1, Number.MAX_SAFE_INTEGER);
   if (!/^[a-f0-9]{64}$/.test(args.hash)) fail("INVALID_INPUT", "Review requires an exact content hash");
   const memory = await ctx.db.query("memories").withIndex("by_stable_id", q => q.eq("id", args.memoryId)).unique();
@@ -102,7 +102,7 @@ export const reviewDetail = query({ args: { ...identityArgs, memoryId: v.string(
   return boundedReview({ memoryId: memory.id, kind: memory.kind, status: memory.status, revision: memory.revision, hash: memory.hash, encoding: "canonical-memory-json" as const, text: text.slice(offset, end), offset, nextOffset: end < text.length ? end : null, complete: end === text.length, sourceCount: memory.sources.length, applicabilityCount: memory.applicability.length, untrusted: true, reviewOnly: true });
 } });
 export const context = query({ args: { ...runArgs, cursor: v.optional(v.string()) }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); const { task } = await liveRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "memories.context"); const { task } = await liveRun(ctx, args, actor);
   const currentTask = { id: task.id, dependencies: task.dependencies };
   const currentTaskBytes = new TextEncoder().encode(canonical(currentTask)).length;
   if (currentTaskBytes > 8 * 1024) fail("COVERAGE_INCOMPLETE", "Declared input metadata exceeds bounded context capacity");
@@ -117,7 +117,7 @@ export const context = query({ args: { ...runArgs, cursor: v.optional(v.string()
   return { currentTask, memories: selected.records, tasks: taskResult.records, bytes: currentTaskBytes + selected.bytes + taskResult.bytes, complete: page.isDone && goalTasks.length <= 100 && selected.complete && taskResult.complete && !truncated, nextCursor: page.isDone ? null : page.continueCursor };
 } });
 export const expand = query({ args: { ...runArgs, memoryId: v.string(), offset: v.number(), sourceOffset: v.optional(v.number()) }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); await liveRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "memories.expand"); await liveRun(ctx, args, actor);
   const memory = await ctx.db.query("memories").withIndex("by_stable_id", q => q.eq("id", args.memoryId)).unique();
   if (!memory || memory.projectId !== args.projectId) fail("NOT_FOUND", "Memory is unavailable in this project");
   if (!Number.isSafeInteger(args.offset) || args.offset < 0 || args.offset > memory.content.length) fail("INVALID_INPUT", "Invalid expansion offset");

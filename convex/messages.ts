@@ -9,7 +9,7 @@ export function boundedRecords<T>(records: T[], maxBytes: number): { records: T[
   return { records: selected, complete: true, bytes };
 }
 export const send = mutation({ args: { ...runArgs, messageId: v.string(), recipientTaskId: v.string(), recipientEpoch: v.number(), type: v.string(), payload: v.string(), conflict: v.boolean() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); const { task } = await liveRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "messages.send"); const { task } = await liveRun(ctx, args, actor);
   return replay(ctx, actor, "messages.send", args, async () => {
     stableId(args.messageId); bounded(args.type, 128, "message type"); bounded(args.payload, 1536, "message payload");
     const recipient = await taskById(ctx, args.recipientTaskId, args.projectId);
@@ -20,7 +20,7 @@ export const send = mutation({ args: { ...runArgs, messageId: v.string(), recipi
   });
 } });
 export const read = query({ args: { ...runArgs, cursor: v.optional(v.string()) }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); const { task } = await liveRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "messages.read"); const { task } = await liveRun(ctx, args, actor);
   const page = await ctx.db.query("messages").withIndex("by_recipient", q => q.eq("projectId", args.projectId).eq("recipientTaskId", task.id)).paginate({ cursor: args.cursor ?? null, numItems: 1 });
   const pending = page.page.filter(m => (m.recipientEpoch === task.epoch && m.state !== "acknowledged_by_agent") || (m.conflict && (m.resolution !== "accepted" || m.decisionRecipientEpoch !== task.epoch)));
   const full = boundedRecords(pending, 2048);
@@ -31,7 +31,7 @@ export const read = query({ args: { ...runArgs, cursor: v.optional(v.string()) }
 
 } });
 export const receipt = mutation({ args: { ...runArgs, messageId: v.string(), state: v.union(v.literal("delivered_to_bridge"), v.literal("offered_to_turn"), v.literal("injected_into_turn"), v.literal("acknowledged_by_agent")) }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); const { task } = await liveRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "messages.receipt"); const { task } = await liveRun(ctx, args, actor);
   return replay(ctx, actor, "messages.receipt", args, async () => {
     const message = await ctx.db.query("messages").withIndex("by_stable_id", q => q.eq("id", args.messageId)).unique();
     if (!message || message.projectId !== args.projectId || message.recipientTaskId !== task.id || message.recipientEpoch !== task.epoch) fail("NOT_FOUND", "Message not found for current recipient epoch");
@@ -40,7 +40,7 @@ export const receipt = mutation({ args: { ...runArgs, messageId: v.string(), sta
   });
 } });
 export const resolve = mutation({ args: { ...runArgs, messageId: v.string(), resolution: v.union(v.literal("accepted"), v.literal("declined"), v.literal("escalated")), decision: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); const { task } = await liveRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "messages.resolve"); const { task } = await liveRun(ctx, args, actor);
   return replay(ctx, actor, "messages.resolve", args, async () => {
     bounded(args.decision, 2048, "coordination decision");
     const message = await ctx.db.query("messages").withIndex("by_stable_id", q => q.eq("id", args.messageId)).unique();
@@ -52,7 +52,7 @@ export const resolve = mutation({ args: { ...runArgs, messageId: v.string(), res
 } });
 
 export const resolveBeforeAdmission = mutation({ args: { ...identityArgs, messageId: v.string(), senderEpoch: v.number(), recipientEpoch: v.number(), decision: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["human"]);
+  const { actor } = await authenticate(ctx, args, ["human"], "messages.resolveBeforeAdmission");
   return replay(ctx, actor, "messages.resolveBeforeAdmission", args, async () => {
     bounded(args.decision, 2048, "coordination decision");
     const message = await ctx.db.query("messages").withIndex("by_stable_id", q => q.eq("id", args.messageId)).unique();
@@ -65,7 +65,7 @@ export const resolveBeforeAdmission = mutation({ args: { ...identityArgs, messag
   });
 } });
 export const expand = query({ args: { ...runArgs, messageId: v.string(), offset: v.number(), section: v.optional(v.union(v.literal("payload"), v.literal("decision"))) }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["run"]); const { task } = await liveRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["run"], "messages.expand"); const { task } = await liveRun(ctx, args, actor);
   const message = await ctx.db.query("messages").withIndex("by_stable_id", q => q.eq("id", args.messageId)).unique();
   if (!message || message.projectId !== args.projectId || (message.recipientTaskId !== task.id && message.senderTaskId !== task.id)) fail("NOT_FOUND", "Message is not visible to this task");
   const text = args.section === "decision" ? message.decision ?? "" : message.payload;

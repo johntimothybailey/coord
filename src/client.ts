@@ -10,9 +10,9 @@ import type { WorkspaceConfig } from "./config.js";
 export class BackendClient {
   readonly #http: ConvexHttpClient;
   readonly #token: string;
-  constructor(readonly config: WorkspaceConfig, token: string) { this.#token = token; this.#http = new ConvexHttpClient(config.backendUrl, { logger: false }); }
+  constructor(readonly config: WorkspaceConfig, token: string, readonly credentialKind: "legacy" | "oauth" = "legacy") { this.#token = token; this.#http = new ConvexHttpClient(config.backendUrl, { logger: false }); }
   private args(payload: Record<string, Value>, requestId: string = randomUUID()): Record<string, Value> {
-    return { ...payload, token: this.#token, protocolVersion: PROTOCOL_VERSION, clientVersion: CLIENT_VERSION, capabilities: [...CAPABILITIES], backendId: this.config.backendId, projectId: this.config.projectId, requestId };
+    return { ...payload, ...(this.credentialKind === "oauth" ? { token: "", oauthBearer: this.#token } : { token: this.#token }), protocolVersion: PROTOCOL_VERSION, clientVersion: CLIENT_VERSION, capabilities: [...CAPABILITIES], backendId: this.config.backendId, projectId: this.config.projectId, requestId };
   }
   async query(name: string, payload: Record<string, Value> = {}): Promise<unknown> { return this.#http.query(makeFunctionReference<"query">(name), this.args(payload)); }
   async mutation(name: string, payload: Record<string, Value>, requestId: string): Promise<unknown> { return this.#http.mutation(makeFunctionReference<"mutation">(name), this.args(payload, requestId)); }

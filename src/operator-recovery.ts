@@ -1,8 +1,7 @@
+import { invokeOwnerCli } from "./owner-cli.js";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { lstat } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { isAbsolute } from "node:path";
 import { decryptVault, encryptVault, generateToken, readSmallFile, syncLocalFile, writeNewPrivateFile } from "./credentials.js";
 import { inspectPlan, parseSetupPlan, planDigest, promptProtected, requireProtectedTerminal, validateRecoveredOperatorBundle } from "./onboarding.js";
 import type { RecoveredOperatorBundle, SetupPlan } from "./onboarding.js";
@@ -15,10 +14,7 @@ const hash = (text: string): string => createHash("sha256").update(text).digest(
 const selection = (plan: SetupPlan, replacedCredentialId: string) => ({ backendId: plan.config.backendId, projectId: plan.config.projectId, repository: plan.config.repository, remote: plan.config.remote, defaultBranch: plan.config.defaultBranch, memberId: plan.humanId, replacedCredentialId });
 interface RecoveryIo extends OperatorIo { ownerCall?: (plan: SetupPlan, operation: "inspect" | "recover", args: Record<string, unknown>) => Promise<unknown> }
 async function ownerCall(plan: SetupPlan, operation: "inspect" | "recover", args: Record<string, unknown>): Promise<unknown> {
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-  // The official CLI alone handles owner authentication. Arguments contain only public selectors/digests.
-  const output = execFileSync(process.execPath, [join(root, "node_modules/convex/bin/main.js"), "run", `operatorRecovery:${operation === "recover" ? "recoverAttempt" : "inspect"}`, JSON.stringify(args), "--deployment", plan.deploymentName, "--typecheck", "disable", "--codegen", "disable"], { cwd: root, stdio: ["ignore", "pipe", "pipe"], timeout: 60_000, maxBuffer: 128 * 1024, encoding: "utf8" });
-  return JSON.parse(output) as unknown;
+  return invokeOwnerCli(plan.deploymentName, `operatorRecovery:${operation === "recover" ? "recoverAttempt" : "inspect"}`, args);
 }
 const unconfirmed = () => new CoordError("NEEDS_HUMAN", "Owner recovery unconfirmed. Preserve the recovery vault and retry this exact operation with --retry; never reset bootstrap or generate another token after an uncertain reply");
 const INSPECT_FIRST = "Preserve the recovery vault and use protected owner inspection before choosing another action; do not retry blindly or generate another token";

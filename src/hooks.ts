@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { canonicalJson } from "./canonical.js";
 import { buildContext, type ContextSource } from "./context.js";
-import { CoordError, DEFAULTS, type Harness, type RunIdentity } from "./protocol.js";
+import { CoordError, DEFAULTS, boundedMcpClientInfo, type Harness, type RunIdentity } from "./protocol.js";
 import type { CoordBackend, RunConnection } from "./mcp.js";
 
 export function backendFailure(error: unknown): CoordError {
@@ -20,7 +20,22 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-export interface CheckInOffer { text: string; messageIds: string[]; blocked: boolean }
+function clientObservation(value: unknown, provenance: "self_reported" | "mcp_handshake") {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const observation = value as Record<string, unknown>;
+  const clientInfo = boundedMcpClientInfo(observation.clientInfo);
+  if (provenance === "self_reported" && observation.reportedOrigin !== "local_mcp_initialize") return undefined;
+  if (observation.provenance !== provenance || !clientInfo || typeof observation.observedAt !== "number" || !Number.isFinite(observation.observedAt) || observation.observedAt < 0) return undefined;
+  return { provenance, clientInfo, observedAt: observation.observedAt, ...(provenance === "self_reported" ? { reportedOrigin: "local_mcp_initialize" } : {}) };
+}
+function observations(response: Record<string, unknown>, run: Record<string, unknown>) {
+  const local = clientObservation(run.clientObservation, "self_reported");
+  const connection = clientObservation(response.connectionClientObservation, "mcp_handshake");
+  const supervisor = run.supervisorObservation && typeof run.supervisorObservation === "object" && !Array.isArray(run.supervisorObservation) ? run.supervisorObservation as Record<string, unknown> : undefined;
+  const spawned = supervisor?.provenance === "supervisor_spawned" && typeof supervisor.observedAt === "number" && Number.isFinite(supervisor.observedAt) && supervisor.observedAt >= 0 ? { provenance: "supervisor_spawned" as const, observedAt: supervisor.observedAt } : undefined;
+  return local || connection || spawned ? { ...(local ? { clientObservation: local } : {}), ...(connection ? { connectionClientObservation: connection } : {}), ...(spawned ? { supervisorObservation: spawned } : {}) } : undefined;
+}
+export interface CheckInOffer { observations?: ReturnType<typeof observations>; text: string; messageIds: string[]; blocked: boolean }
 export function renderCheckIn(value: unknown, identity: RunIdentity): CheckInOffer {
   const response = record(value), task = record(response.task), run = record(response.run);
   if (task.id !== identity.taskId || task.epoch !== identity.epoch || run.id !== identity.runId || run.epoch !== identity.epoch || run.goalRevision !== identity.goalRevision || !Array.isArray(response.messages) || typeof response.complete !== "boolean") throw new CoordError("STALE_EPOCH", "Check-in identity or coverage differs from the admitted run");
@@ -49,7 +64,7 @@ export function renderCheckIn(value: unknown, identity: RunIdentity): CheckInOff
   const context = buildContext(sources, { mode: "update", maxBytes: DEFAULTS.updateBytes - Buffer.byteLength(warning, "utf8") });
   const messageIds = pending.filter(id => context.included.includes(id));
   blocked ||= context.omitted.length > 0;
-  return { text: `${blocked ? warning : ""}${context.text}`, messageIds, blocked };
+  return { text: `${blocked ? warning : ""}${context.text}`, messageIds, blocked, observations: observations(response, run) };
 }
 
 export async function fetchCheckIn(run: RunConnection): Promise<CheckInOffer> {
