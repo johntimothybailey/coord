@@ -93,6 +93,20 @@ class ComponentFixture extends BackendFixture {
   }
   patch(id: string, value: Record<string, unknown>) { const row = this.rows.get(id); assert(row); this.rows.set(id, { ...row, ...value }); }
 }
+// The deleted public oauthAuthority.consentGrant is replaced here by the only consent path
+// that still exists: the real reviewed Connect handoff (finish -> review -> complete). An
+// existing handoff for the same grant is reused so a replay exercises consent replay, not a
+// second ceremony. Returns exactly the old {connectionId, projectId, absoluteExpiresAt}.
+async function reviewedConsent(f: ComponentFixture, args: { grantId: string; bearer: string; linkId: Doc<"identityLinks">["_id"]; generation: number }) {
+  const prior = [...f.rows.values()].find(row => row._table === "connectHandoffs" && row.grantId === args.grantId);
+  const handoffId = prior ? String(prior.id) : (await f.call(connect.finish, { bearer: args.bearer }) as { handoffId: string }).handoffId;
+  const selector = { handoffId, linkId: args.linkId, generation: args.generation };
+  const view = await f.call(connect.review, selector) as { digest: string };
+  const done = await f.call(connect.complete, { ...selector, digest: view.digest }) as { projectId: string; absoluteExpiresAt: number };
+  const connection = [...f.rows.values()].find(row => row._table === "mcpConnections" && row.grantId === args.grantId);
+  assert(connection, "exact reviewed completion is the only writer of project consent");
+  return { connectionId: String(connection._id) as Doc<"mcpConnections">["_id"], projectId: done.projectId, absoluteExpiresAt: done.absoluteExpiresAt };
+}
 async function foundation(grantAge = 1000) {
   const f = new ComponentFixture();
   await f.call(auth.bootstrap, { backendId: "backend", projectId: "project", repository: "https://example.test/repo", remote: "origin", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: [], ruleTargets: [], humanId: "human", humanDigest: await auth.digest(secrets.human), agentId: "agent", agentDigest: await auth.digest(secrets.agent), expiresAt: Date.now() + 3 * CONNECTION_CAP_MS });
@@ -102,7 +116,7 @@ async function foundation(grantAge = 1000) {
   await f.call(oauth.activateLink, link);
   f.table("grants").set("grant", { _id: "grant", _creationTime: Date.now() - grantAge + 0.25, kind: "oauth", userId, clientId: "client", resource, scopes: [...OAUTH_SCOPES], name: "Fixture" });
   f.table("tokens").set("access", { _id: "access", _creationTime: Date.now(), hash: await auth.digest("access-one"), grantId: "grant", kind: "access", expiresAt: Date.now() + 300_000 });
-  const consent = await f.call(oauth.consentGrant, { ...link, grantId: "grant" }) as { connectionId: Doc<"mcpConnections">["_id"]; absoluteExpiresAt: number };
+  const consent = await reviewedConsent(f, { grantId: "grant", bearer: "access-one", ...link });
   const binding = await f.call(oauth.bind, request()) as { credentialId: string; absoluteExpiresAt: number };
   return { f, userId, link, consent, binding };
 }
@@ -188,7 +202,7 @@ test("narrowed target scope denies launch and artifact checks for legacy and oth
     if (caller === "other_connection") {
       f.table("grants").set("grant_two", { _id: "grant_two", _creationTime: Date.now(), kind: "oauth", userId, clientId: "client_two", resource, scopes: ["coord:read", "coord:supervise", "coord:verify"], name: "Other connection" });
       f.table("tokens").set("access_other", { _id: "access_other", _creationTime: Date.now(), hash: await auth.digest("access-other"), grantId: "grant_two", kind: "access", expiresAt: Date.now() + 300_000 });
-      await f.call(oauth.consentGrant, { ...link, grantId: "grant_two" });
+      await reviewedConsent(f, { grantId: "grant_two", bearer: "access-other", ...link });
       const binding = await f.call(oauth.bind, request("", "access-other")) as { credentialId: string };
       supervisor = "8".repeat(64); verifier = "9".repeat(64);
       await f.call(machines.provisionQualification, { backendId: "backend", projectId: "project", memberId: "agent", oauthParentCredentialId: binding.credentialId, machineId: "machine", capacity: 1, modes: ["managed"], key, checks: REQUIRED_CHECKS.managed.map(checkId => ({ schemaVersion: 1 as const, checkId, status: "PASS" as const, mode: "managed" as const, observedAt: new Date(Date.now() - 1000).toISOString(), configurationDigest: "fixture", command: ["fixture"], summary: "Fixture", evidenceRef: "fixture", kind: "real" as const })), evidenceRef: "fixture", expiresAt: Date.now() + 300_000, supervisorId: "other_supervisor", supervisorToken: supervisor, artifactVerifierId: "other_verifier", artifactVerifierToken: verifier });
@@ -204,7 +218,8 @@ test("accepted authority transitions audit once without bearer or profile data",
   const { f, link, binding } = await foundation();
   const before = [...f.rows.values()].filter(row => row._table === "audit").length;
   await f.call(oauth.activateLink, link);
-  await f.call(oauth.consentGrant, { ...link, grantId: "grant" });
+  // A replayed reviewed completion returns the identical consent and audits nothing again.
+  await reviewedConsent(f, { grantId: "grant", bearer: "access-one", ...link });
   assert.deepEqual(await f.call(oauth.bind, request()), binding);
   assert.equal([...f.rows.values()].filter(row => row._table === "audit").length, before);
   const serialized = JSON.stringify([...f.rows.values()]);
@@ -320,7 +335,7 @@ test("OAuth verifier scope is checked on its own live connection while target ru
   const { f, identity, link, userId } = await startRunnable();
   f.table("grants").set("verifier_grant", { _id: "verifier_grant", _creationTime: Date.now(), kind: "oauth", userId, clientId: "verifier_client", resource, scopes: ["coord:read", "coord:supervise", "coord:verify"], name: "Separate verifier connection" });
   f.table("tokens").set("verifier_access", { _id: "verifier_access", _creationTime: Date.now(), hash: await auth.digest("verifier-access"), grantId: "verifier_grant", kind: "access", expiresAt: Date.now() + 300_000 });
-  await f.call(oauth.consentGrant, { ...link, grantId: "verifier_grant" });
+  await reviewedConsent(f, { grantId: "verifier_grant", bearer: "verifier-access", ...link });
   const binding = await f.call(oauth.bind, request("", "verifier-access")) as { credentialId: string };
   const verifierToken = "a".repeat(64);
   await f.call(machines.provisionQualification, { backendId: "backend", projectId: "project", memberId: "agent", oauthParentCredentialId: binding.credentialId, machineId: "machine", capacity: 1, modes: ["managed"], key, checks: REQUIRED_CHECKS.managed.map(checkId => ({ schemaVersion: 1 as const, checkId, status: "PASS" as const, mode: "managed" as const, observedAt: new Date(Date.now() - 1000).toISOString(), configurationDigest: "fixture", command: ["fixture"], summary: "Fixture", evidenceRef: "fixture", kind: "real" as const })), evidenceRef: "fixture", expiresAt: Date.now() + 300_000, supervisorId: "scope_supervisor", supervisorToken: "b".repeat(64), artifactVerifierId: "scope_verifier", artifactVerifierToken: verifierToken });
@@ -354,7 +369,7 @@ test("remote accepted initialize persists backend-observed metadata on exact aut
   const observation = row.clientObservation as { provenance: string; clientInfo: unknown };
   assert.equal(observation.provenance, "mcp_handshake"); assert.deepEqual(observation.clientInfo, info);
   assert.equal(row.absoluteExpiresAt, before.absoluteExpiresAt); assert.equal(row.rootCredentialId, binding.credentialId);
-  assert.deepEqual(await f.call(oauth.consentGrant, { ...link, grantId: "grant" }), consent);
+  assert.deepEqual(await reviewedConsent(f, { grantId: "grant", bearer: "access-one", ...link }), consent);
   assert.deepEqual(f.rows.get(consent.connectionId)!.clientObservation, observation);
   const status = await f.call(tasks.sessionStatus, { ...request(secrets.run), ...identity }) as { connectionClientObservation?: unknown; clientObservation?: { provenance: string }; supervisorObservation?: unknown };
   assert.deepEqual(status.connectionClientObservation, observation);
@@ -417,4 +432,48 @@ test("optional remote observation timeout never blocks successful initialize ind
   const deniedAt = Date.now();
   const denied = await mcpIngress.handleMcp(ctx, new Request(resource, { method: "POST", headers: { Authorization: "Bearer forged" }, body: new ReadableStream({ start() {} }), duplex: "half" } as RequestInit));
   assert.equal(denied.status, 401); assert.ok(Date.now() - deniedAt < 1_000);
+});
+
+const failureCode = (expected: string) => (error: unknown) => denied(error) && (error as { data: { code?: string } }).data.code === expected;
+// Coord's absoluteExpiresAt is an APPLICATION cap, not component-grant revocation: the
+// installed MCP component's refresh logic never reads it, so the host's OAuth grant and its
+// refresh credential still exist at the authorization server after Coord starts refusing the
+// connection. revokeConnection therefore stays available to the same user after expiry, and
+// it is the only remaining credential-cleanup path. grants/revoke is wired to the REAL
+// installed component handler in this fixture, so the grant and token rows are actually
+// deleted here rather than stubbed; deletion is observed, not asserted by proxy.
+test("an expired connection is refused yet its owner can still revoke the component grant that outlived the cap", async () => {
+  const { f, consent } = await foundation();
+  f.table("tokens").set("refresh", { _id: "refresh", _creationTime: Date.now(), hash: await auth.digest("refresh-one"), grantId: "grant", kind: "refresh", expiresAt: Date.now() + 30 * 86_400_000 });
+  assert.equal((await f.call(projects.status, request()) as { project: { id: string } }).project.id, "project");
+  const deadline = Date.now() - 1;
+  f.patch(consent.connectionId, { absoluteExpiresAt: deadline });
+  // Coord refuses every real protected operation on the expired record (currentConnection).
+  await assert.rejects(f.call(projects.status, request()), failureCode("UNAUTHORIZED"));
+  await assert.rejects(f.call(connect.finish, { bearer: "access-one" }), failureCode("UNAUTHORIZED"));
+  // The whole point: app expiry removed nothing at the authorization server.
+  assert(f.table("grants").get("grant"), "the component grant row still exists after the cap passed");
+  assert.deepEqual([...f.table("tokens").keys()].sort(), ["access", "refresh"], "its access and refresh credentials still exist too");
+  const rowsBefore = f.rows.size;
+  const auditBefore = [...f.rows.values()].filter(row => row._table === "audit").length;
+  assert.deepEqual(await f.call(oauth.revokeConnection, { connectionId: consent.connectionId }), { revoked: true });
+  assert.equal(f.table("grants").get("grant"), undefined, "the real installed handler deleted the component grant row");
+  assert.deepEqual([...f.table("tokens").keys()], [], "and the credentials that could still refresh it");
+  const tombstone = f.rows.get(consent.connectionId);
+  assert(tombstone, "the connection row is retained as a tombstone, never deleted");
+  assert.equal(typeof tombstone.revokedAt, "number");
+  assert.equal(tombstone.absoluteExpiresAt, deadline, "revocation moves no deadline");
+  assert.equal(f.rows.size, rowsBefore + 1, "nothing was removed; exactly one audit row was added");
+  assert.equal([...f.rows.values()].filter(row => row._table === "audit").length, auditBefore + 1);
+  assert.deepEqual([...f.rows.values()].filter(row => row._table === "audit" && row.operation === "oauth.revokeConnection").map(row => row.recordId), [consent.connectionId]);
+  // No authority is revived. The refusal now also holds at the component boundary, because
+  // tokens/verify has no grant or token row left to verify the same bearer against.
+  await assert.rejects(f.call(projects.status, request()), failureCode("UNAUTHORIZED"));
+  await assert.rejects(f.call(connect.finish, { bearer: "access-one" }), failureCode("UNAUTHORIZED"));
+  // The access check was not weakened: only the owning user may revoke this record.
+  const stranger = await f.call(oauth.createUser, { method: { name: "fixture", profile: { email: "stranger@example.test" } } }) as Doc<"users">["_id"];
+  f.table("sessions").set("stranger", { _id: "stranger", _creationTime: Date.now(), userId: stranger });
+  f.subject = "stranger";
+  await assert.rejects(f.call(oauth.revokeConnection, { connectionId: consent.connectionId }), failureCode("FORBIDDEN"));
+  assert.equal(f.rows.get(consent.connectionId)!.revokedAt, tombstone.revokedAt, "a refused revocation changes nothing");
 });

@@ -5,7 +5,14 @@ import type { Value } from "convex/values";
 
 type RecordValue = Record<string, unknown>;
 type Link = { linkId: string; generation: number; backendId: string; projectId: string; sourceCredentialId: string; scopes: string[]; activationExpiresAt: number; expiresAt: number; active: boolean };
-type Identity = { userId: string; links: Link[]; connections: { connectionId: string; projectId: string; absoluteExpiresAt: number; revoked: boolean }[] };
+// Every rendered row comes from a page query and carries an explicit selectability verdict.
+type PageLink = Link & { selectable: boolean };
+type Connection = { connectionId: string; projectId: string; absoluteExpiresAt: number; revoked: boolean; expired: boolean };
+// links/connections stay in identity's bounded result for already-open tabs running
+// old JavaScript; this code path deliberately ignores them and renders page one from
+// connect:linkPage / connect:connectionPage so it holds real cursors from the start.
+type Identity = { userId: string; links: Link[]; linksMore: boolean; connections: Connection[]; connectionsMore: boolean };
+type Section = "links" | "connections";
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const object = (value: unknown): RecordValue => { if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid response"); return value as RecordValue; };
 const show = (id: string, visible: boolean) => { $(id).hidden = !visible; };
@@ -53,6 +60,13 @@ function stateMessage(state: string): string {
   const states: Record<string, string> = { pending: "Pending: review and authorize the exact project connection.", authorized_awaiting_host: "Project authorized; awaiting the host. Return to chat and retry finish-connect. This is not connected yet.", connected: "Connected: the host bound this exact project and completed a real status read.", cancelled: "This pending connection was cancelled. It cannot be revived; start a new attempt in chat.", expired: "This attempt expired or its authority is unavailable. Start a new attempt in chat.", revoked: "This connection is revoked. Its next protected operation is refused." };
   return states[state] ?? "Connection state is uncertain. Refresh authoritative status before retrying.";
 }
+// Revocation and the follow-up listing read are independent outcomes: a confirmed revoke
+// whose refresh failed must not claim a page-one restart, and no message may name a
+// control this page does not render. Every variant says the record is retained, not deleted.
+const revokedBase = "This connection is now revoked: its next protected operation is refused. Its record is retained as a revoked tombstone and was not deleted.";
+const revokedNote = `${revokedBase} The connection listing restarted at page one; if that revoked record is not shown there, choose Show more connections to read far enough to see it again.`;
+const revokedCompleteNote = `${revokedBase} The connection listing restarted at page one and shows the complete set of records, so the revoked record is listed there.`;
+const revokedStaleNote = `${revokedBase} Separately, the connection listing could not be refreshed, so this page is not showing current records: choose Reload connections to read the first page again.`;
 export async function startConnect(): Promise<void> {
   const configResponse = await fetch("/connect/config", { cache: "no-store", credentials: "omit" });
   if (!configResponse.ok) throw new Error("Connect origin unavailable");
@@ -83,7 +97,7 @@ export async function startConnect(): Promise<void> {
   const auth = new AuthClient({ mode: "spa", storage: tokenStorage, storageNamespace: "session", authApi: { refreshSession: refreshToken => publicMutation("authCore:refreshSession", { refreshToken }) as ReturnType<import("@convex-dev/auth/browser").SpaAuthApi["refreshSession"]>, signOut: revokeSession } });
   let sessionChange = Promise.resolve();
   let returnClientUrl: string | undefined;
-  let generation = 0, controller: AbortController | undefined, identity: Identity | undefined;
+  let generation = 0, controller: AbortController | undefined;
   let ceremony: { username: string; step: "register" | "authenticate"; options: unknown } | undefined;
   let reviewed: { linkId: string; generation: number; digest: string } | undefined;
   const busy = (value: boolean) => { for (const button of document.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>("button,input,select")) button.disabled = value; $("signout").removeAttribute("disabled"); if (controller) $("abort").removeAttribute("disabled"); };
@@ -118,18 +132,99 @@ export async function startConnect(): Promise<void> {
     parent.append(heading); parent.append(permissions);
   }
   const hideReview = () => { reviewed = undefined; show("binding-summary", false); show("binding-boundary", false); show("binding-details", false); ($("binding-details") as HTMLDetailsElement).open = false; show("complete", false); };
+  // Links and connections page independently: one section's failure or volume never
+  // disables the other, and Disconnect stays reachable when link listing fails.
+  const selectableLinks = new Map<string, Link>();
+  const cursors: Record<Section, string | null> = { links: null, connections: null };
+  const counts = { links: 0, usable: 0, connections: 0 };
+  const footers: Record<Section, HTMLElement> = { links: document.createElement("div"), connections: document.createElement("div") };
+  const connectionNote = document.createElement("p");
+  for (const key of ["links", "connections"] as const) footers[key].className = "actions";
+  connectionNote.hidden = true;
+  const host = (key: Section) => $(key === "links" ? "links" : "connection-list");
+  // The connections status line is created here so no page markup change is needed.
+  const sectionNote = (key: Section, value: string) => { if (key === "links") { text("link-note", value); return; } connectionNote.textContent = value; connectionNote.hidden = !value; };
+  const resetSection = (key: Section) => {
+    cursors[key] = null; counts[key] = 0; footers[key].replaceChildren(); host(key).replaceChildren();
+    if (key === "links") { counts.usable = 0; selectableLinks.clear(); $("project-choice").replaceChildren(); }
+    else { sectionNote("connections", ""); host(key).append(connectionNote); }
+  };
+  const attachFooter = (key: Section) => { host(key).append(footers[key]); };
+  const pageButton = (key: Section, label: string, cursor: string | null) => {
+    footers[key].replaceChildren();
+    const button = document.createElement("button"); button.type = "button"; button.className = "secondary"; button.textContent = label;
+    button.onclick = () => { void attempt(async epoch => { await loadPage(key, cursor, epoch); }); };
+    footers[key].append(button);
+  };
+  // A failed page discards its accumulated rows and stored cursor: recovery re-reads
+  // page one rather than reusing a cursor whose listing is no longer trusted.
+  const sectionFailure = (key: Section) => {
+    resetSection(key); if (key === "links") hideReview();
+    sectionNote(key, key === "links" ? "The project link listing is unavailable or incomplete, so no link is shown or selectable here. No project permission is confirmed. Existing connections below are unaffected; choose Reload project links to read the first page again." : "The connection listing is unavailable or incomplete, so no connection record is shown here. This listing failure alone neither performs nor undoes a disconnect, and confirms no permission. Choose Reload connections to read the first page again.");
+    pageButton(key, key === "links" ? "Reload project links" : "Reload connections", null); attachFooter(key);
+  };
+  const linkNote = () => sectionNote("links", counts.usable ? "Activate the exact pending generation, or choose an active link below." : cursors.links ? "No selectable project link appears on the pages read so far. Choose Show more project links to continue reading your exact recorded links." : counts.links ? "Your recorded project links are listed, but none is currently selectable. Compare the exact generation with the owner receipt in your own protected terminal; no project permission is confirmed here." : "No project link exists. Ask for a nonsecret link plan, compare this user ID, and run the protected coord connect link command in your own operator terminal. Then Refresh status here.");
+  const connectionsNote = () => { if (counts.connections) { sectionNote("connections", ""); return; } sectionNote("connections", cursors.connections ? "No connection record appears on the pages read so far. Choose Show more connections to continue reading your exact recorded connections." : "No connection record exists for this account. A host OAuth grant and exact project consent in this browser create one."); };
+  function renderLink(link: PageLink, usable: boolean) {
+    counts.links++;
+    const fields: [string, string][] = [["Project", link.projectId], ["Backend", link.backendId], ["Agent access source", link.sourceCredentialId], ["Link status", usable ? link.active ? "Active project link" : "Pending activation" : "Not selectable — current authority unavailable"], ["Activation deadline", link.active ? "Already activated" : expiryDescription(link.activationExpiresAt)], ["Link access ends", expiryDescription(link.expiresAt)]];
+    if (!usable) fields.push(["Why no action is offered", "This exact record is listed for completeness. Activation and project selection are withheld because its current authority is not confirmed here; no project permission is implied. Ask the deployment owner to inspect this exact generation."]);
+    const activate = usable && !link.active;
+    item($("links"), link, fields, link.scopes, activate ? "Activate this project link" : undefined, activate ? () => { void attempt(async turn => { await mutate("oauthAuthority:activateLink", { linkId: link.linkId, generation: link.generation }); if (turn === generation) await refresh(turn); }); } : undefined);
+    if (usable) counts.usable++;
+    if (!usable || !link.active) return;
+    selectableLinks.set(link.linkId, link);
+    const option = document.createElement("option"); option.value = link.linkId; option.textContent = `${link.projectId} · ${link.backendId} · generation ${link.generation}`; $("project-choice").append(option);
+  }
+  function renderConnection(connection: Connection) {
+    counts.connections++;
+    // absoluteExpiresAt is Coord's application cap, not component-grant revocation: the
+    // host's OAuth grant and refresh credentials can still exist at the authorization
+    // server after Coord stops honouring this record, and revokeConnection deliberately
+    // remains available to the same user after expiry. Disconnect is that credential
+    // cleanup only; it never extends expiry, revives authority or deletes a tombstone.
+    const removable = !connection.revoked;
+    const state = connection.revoked ? "Revoked record — it was disconnected and its OAuth grant was removed; Coord refuses it" : connection.expired ? "Coord access expired — this is not the same as the grant being revoked: the application cap has passed, so Coord already refuses this connection, but the host's OAuth grant and refresh credentials may still exist at the authorization server, and Disconnect remains available to remove them" : "Registered record — current authority is not confirmed by this listing";
+    // Revoking a connection cannot change links, identity or handoff state, so only the
+    // connections section is re-read: that is what keeps the sections independent.
+    item($("connection-list"), connection, [["Project", connection.projectId], ["Recorded access deadline", expiryDescription(connection.absoluteExpiresAt)], ["Recorded state", state], ["Verify usable access", "Ask the host to read current project status. This record alone does not establish live authority; its exact selector is available below."]], undefined, removable ? "Disconnect this exact connection" : undefined, removable ? () => { void attempt(async turn => { await mutate("oauthAuthority:revokeConnection", { connectionId: connection.connectionId }); if (turn !== generation) return; const reloaded = await loadPage("connections", null, turn); if (turn !== generation) return; text("status", !reloaded ? revokedStaleNote : cursors.connections ? revokedNote : revokedCompleteNote); }); } : undefined);
+  }
+  function appendRows(key: Section, rows: unknown, complete: unknown, cursor: unknown) {
+    if (!Array.isArray(rows)) throw new Error("Invalid listing");
+    for (const value of rows) {
+      const row = object(value);
+      if (key === "links") renderLink(row as unknown as PageLink, row.selectable === true);
+      else renderConnection(row as unknown as Connection);
+    }
+    cursors[key] = complete === true || typeof cursor !== "string" || !cursor ? null : cursor;
+    if (cursors[key]) pageButton(key, key === "links" ? "Show more project links" : "Show more connections", cursors[key]); else footers[key].replaceChildren();
+    if (key === "links") linkNote(); else connectionsNote();
+    attachFooter(key);
+  }
+  // Reports whether this page was actually read and rendered. The failure is still
+  // absorbed into sectionFailure here, so section independence is unchanged; the verdict
+  // only lets a caller avoid describing a listing it did not read. A superseded epoch
+  // reports false as well: nothing was rendered for this turn.
+  async function loadPage(key: Section, cursor: string | null, epoch: number): Promise<boolean> {
+    try {
+      const result = object(await read(key === "links" ? "connect:linkPage" : "connect:connectionPage", cursor === null ? {} : { cursor }));
+      if (epoch !== generation) return false;
+      if (cursor === null) { resetSection(key); if (key === "links") hideReview(); }
+      appendRows(key, result[key], result.complete, result.nextCursor);
+      return true;
+    } catch { if (epoch === generation) sectionFailure(key); return false; }
+  }
   async function refresh(epoch: number, force = false) {
+    // identity supplies only the user ID and the fact that these sections exist; each
+    // listing then reads its own first page, so both start with a real cursor and
+    // either section can fail without hiding the other or Disconnect.
     await attach(force); const current = await read("connect:identity") as Identity;
     if (epoch !== generation) return;
-    identity = current; text("user-id", current.userId); show("signin", false); show("account", true); show("projects", true); show("connections", true);
+    text("user-id", current.userId); show("signin", false); show("account", true); show("projects", true); show("connections", true);
     text("status", "Signed in. Project access requires an exact owner-installed link; login grants no approval authority.");
-    $("links").replaceChildren(); $("project-choice").replaceChildren(); $("connection-list").replaceChildren(); hideReview();
-    text("link-note", current.links.length ? "Activate the exact pending generation, or choose an active link below." : "No project link exists. Ask for a nonsecret link plan, compare this user ID, and run the protected coord connect link command in your own operator terminal. Then Refresh status here.");
-    for (const link of current.links) {
-      item($("links"), link, [["Project", link.projectId], ["Backend", link.backendId], ["Agent access source", link.sourceCredentialId], ["Link status", link.active ? "Active project link" : "Pending activation"], ["Activation deadline", link.active ? "Already activated" : expiryDescription(link.activationExpiresAt)], ["Link access ends", expiryDescription(link.expiresAt)]], link.scopes, link.active ? undefined : "Activate this project link", () => { void attempt(async turn => { await mutate("oauthAuthority:activateLink", { linkId: link.linkId, generation: link.generation }); if (turn === generation) await refresh(turn); }); });
-      if (link.active) { const option = document.createElement("option"); option.value = link.linkId; option.textContent = `${link.projectId} · ${link.backendId} · generation ${link.generation}`; $("project-choice").append(option); }
-    }
-    for (const connection of current.connections) item($("connection-list"), connection, [["Project", connection.projectId], ["Recorded access deadline", expiryDescription(connection.absoluteExpiresAt)], ["Recorded state", connection.revoked ? "Revoked record" : "Registered record — current authority is not confirmed by this listing"], ["Verify usable access", "Ask the host to read current project status. This record alone does not establish live authority; its exact selector is available below."]], undefined, connection.revoked ? undefined : "Disconnect this exact connection", () => { void attempt(async turn => { await mutate("oauthAuthority:revokeConnection", { connectionId: connection.connectionId }); if (turn === generation) await refresh(turn); }); });
+    await loadPage("links", null, epoch);
+    await loadPage("connections", null, epoch);
+    if (epoch !== generation) return;
     if (flow.request) {
       const request = await read("mcpConsent:getAuthRequest", { requestId: flow.request }); if (epoch !== generation) return;
       show("oauth", true); show("return-client", false);
@@ -166,11 +261,11 @@ export async function startConnect(): Promise<void> {
     } finally { if (epoch === generation) { controller = undefined; show("abort", false); text("login", "Continue with passkey"); } }
   }); };
   $("abort").onclick = () => { generation++; controller?.abort(); controller = undefined; ceremony = undefined; show("abort", false); text("login", "Continue with passkey"); busy(false); text("status", "Passkey interaction cancelled locally. A finish request already sent may have completed; sign in again to inspect your account. No project permission is confirmed."); };
-  $("signout").onclick = () => { generation++; controller?.abort(); controller = undefined; ceremony = undefined; identity = undefined; reviewed = undefined; flow = {}; returnClientUrl = undefined; sessionStorage.removeItem(flowKey); client.clearAuth(); for (const id of ["account", "projects", "oauth", "handoff", "connections", "abort"]) show(id, false); text("user-id", ""); $("links").replaceChildren(); $("connection-list").replaceChildren(); text("binding", ""); text("oauth-details", ""); show("signin", true); busy(true); const signOut = auth.signOut(); clearTokens(); sessionChange = sessionChange.catch(() => undefined).then(() => signOut).finally(() => { clearTokens(); busy(false); }); text("status", "Signed out locally. This does not disconnect existing agent grants. Previously submitted actions may have completed; sign in again to inspect authoritative status."); };
+  $("signout").onclick = () => { generation++; controller?.abort(); controller = undefined; ceremony = undefined; reviewed = undefined; flow = {}; returnClientUrl = undefined; sessionStorage.removeItem(flowKey); client.clearAuth(); for (const id of ["account", "projects", "oauth", "handoff", "connections", "abort"]) show(id, false); text("user-id", ""); resetSection("links"); resetSection("connections"); text("link-note", "Loading your exact project links…"); text("binding", ""); text("oauth-details", ""); show("signin", true); busy(true); const signOut = auth.signOut(); clearTokens(); sessionChange = sessionChange.catch(() => undefined).then(() => signOut).finally(() => { clearTokens(); busy(false); }); text("status", "Signed out locally. This does not disconnect existing agent grants. Previously submitted actions may have completed; sign in again to inspect authoritative status."); };
   $("refresh").onclick = () => { void attempt(epoch => refresh(epoch, true)); };
   $("project-choice").onchange = () => { generation++; hideReview(); busy(false); text("handoff-note", "Project selection changed. Review this exact selection again. A request already submitted may have completed; refresh status if uncertain."); };
   $("review").onclick = () => { void attempt(async epoch => {
-    const link = identity?.links.find(link => link.linkId === ($("project-choice") as HTMLSelectElement).value && link.active); if (!link || !flow.handoff) throw new Error("Active project required");
+    const link = selectableLinks.get(($("project-choice") as HTMLSelectElement).value); if (!link || !link.active || !flow.handoff) throw new Error("Active project required");
     const result = object(await read("connect:review", { handoffId: flow.handoff, linkId: link.linkId, generation: link.generation })); if (epoch !== generation) return;
     text("handoff-note", stateMessage(String(result.state)));
     if (result.state !== "pending" || typeof result.digest !== "string") { reviewed = undefined; show("complete", false); return; }

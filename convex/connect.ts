@@ -2,7 +2,7 @@ import { v } from "convex/values";
 import { components } from "./_generated/api.js";
 import { internalMutation, internalQuery, mutation, query } from "./server.js";
 import type { Doc, MutationCtx, QueryCtx } from "./server.js";
-import { authenticate, authorizeActor, bounded, canonical, digest, fail } from "./auth.js";
+import { authenticate, authorizeActor, bounded, canonical, digest, fail, integer } from "./auth.js";
 import { bindOAuth, consentForSession, currentConnection, currentGrant, currentLink, oauthResource, sessionUser, installIdentityLink, installLinkArgs, validateLineage } from "./oauthAuthority.js";
 import type { AuthorityCtx } from "./oauthAuthority.js";
 import { CONNECTION_CAP_MS } from "./oauthPolicy.js";
@@ -57,21 +57,58 @@ async function currentRoot(ctx: AuthorityCtx, connection: Doc<"mcpConnections">,
   await authorizeActor(ctx, identity, root, ["agent"]);
   await validateLineage(ctx, root, connection.projectId, scope);
 }
+const browseArgs = { cursor: v.optional(v.string()), pageSize: v.optional(v.number()) };
+function browseSize(pageSize?: number) { const size = pageSize ?? 5; integer(size, 1, 25); return size; }
+// A browsed range carries no server time: a cutoff recomputed per page would
+// invalidate its cursor. Expiry is classified per row for display only, never
+// to extend authority, which stays a fresh check in currentLink/currentConnection.
+function ownLinks(ctx: QueryCtx | MutationCtx, userId: Doc<"users">["_id"], cursor: string | undefined, size: number) {
+  return ctx.db.query("identityLinks").withIndex("by_user_backend", q => q.eq("userId", userId)).order("desc").paginate({ cursor: cursor ?? null, numItems: size });
+}
+function ownConnections(ctx: QueryCtx | MutationCtx, userId: Doc<"users">["_id"], cursor: string | undefined, size: number) {
+  return ctx.db.query("mcpConnections").withIndex("by_user", q => q.eq("userId", userId)).order("desc").paginate({ cursor: cursor ?? null, numItems: size });
+}
+// Bounded non-paginated reads over the same stable index ranges, for identity only.
+// The 101st row sets a "more" flag; it never refuses, so volume cannot lock a user out.
+function ownLinkRows(ctx: QueryCtx | MutationCtx, userId: Doc<"users">["_id"]) {
+  return ctx.db.query("identityLinks").withIndex("by_user_backend", q => q.eq("userId", userId)).order("desc").take(101);
+}
+function ownConnectionRows(ctx: QueryCtx | MutationCtx, userId: Doc<"users">["_id"]) {
+  return ctx.db.query("mcpConnections").withIndex("by_user", q => q.eq("userId", userId)).order("desc").take(101);
+}
+async function selectableLink(ctx: QueryCtx | MutationCtx, link: Doc<"identityLinks">) {
+  try { await currentLink(ctx, link, false); } catch { return false; /* stale links confer no selectable authority */ }
+  return !(!link.active && link.activationExpiresAt <= Date.now());
+}
+function linkRow(link: Doc<"identityLinks">) {
+  return { linkId: link._id, generation: link.generation, backendId: link.backendId, projectId: link.projectId, sourceCredentialId: link.sourceCredentialId, scopes: link.scopes, activationExpiresAt: link.activationExpiresAt, expiresAt: link.expiresAt, active: link.active };
+}
+function connectionRow(connection: Doc<"mcpConnections">) {
+  return { connectionId: connection._id, projectId: connection.projectId, absoluteExpiresAt: connection.absoluteExpiresAt, revoked: connection.revokedAt !== undefined, expired: connection.absoluteExpiresAt <= Date.now() };
+}
+// Deliberately does not paginate: a reactive query journal is one opaque value per
+// query function, so only one .paginate() per function is safe, and identity already
+// reads two tables. A bounded non-failing read also preserves the pre-repair first
+// page for already-open tabs on old JavaScript; cursors come from linkPage/connectionPage.
 export const identity = query({ args: {}, handler: async ctx => {
   const user = await sessionUser(ctx);
-  const links = await ctx.db.query("identityLinks").withIndex("by_user_backend", q => q.eq("userId", user._id)).take(101);
-  if (links.length > 100) fail("COVERAGE_INCOMPLETE", "Own identity link coverage is incomplete");
+  const links = await ownLinkRows(ctx, user._id);
   const visible = [];
-  for (const link of links) {
-    try {
-      await currentLink(ctx, link, false);
-      if (!link.active && link.activationExpiresAt <= Date.now()) continue;
-      visible.push({ linkId: link._id, generation: link.generation, backendId: link.backendId, projectId: link.projectId, sourceCredentialId: link.sourceCredentialId, scopes: link.scopes, activationExpiresAt: link.activationExpiresAt, expiresAt: link.expiresAt, active: link.active });
-    } catch { /* stale links confer no selectable authority */ }
-  }
-  const connections = await ctx.db.query("mcpConnections").withIndex("by_user", q => q.eq("userId", user._id)).take(101);
-  if (connections.length > 100) fail("COVERAGE_INCOMPLETE", "Own connection coverage is incomplete");
-  return { userId: user._id, links: visible, connections: connections.map(connection => ({ connectionId: connection._id, projectId: connection.projectId, absoluteExpiresAt: connection.absoluteExpiresAt, revoked: connection.revokedAt !== undefined })) };
+  for (const link of links.slice(0, 100)) if (await selectableLink(ctx, link)) visible.push(linkRow(link));
+  const connections = await ownConnectionRows(ctx, user._id);
+  return { userId: user._id, links: visible, linksMore: links.length > 100, connections: connections.slice(0, 100).map(connectionRow), connectionsMore: connections.length > 100 };
+} });
+export const linkPage = query({ args: browseArgs, handler: async (ctx, args) => {
+  const user = await sessionUser(ctx);
+  const page = await ownLinks(ctx, user._id, args.cursor, browseSize(args.pageSize));
+  const links = [];
+  for (const link of page.page) links.push({ ...linkRow(link), selectable: await selectableLink(ctx, link) });
+  return { links, complete: page.isDone, nextCursor: page.isDone ? null : page.continueCursor };
+} });
+export const connectionPage = query({ args: browseArgs, handler: async (ctx, args) => {
+  const user = await sessionUser(ctx);
+  const page = await ownConnections(ctx, user._id, args.cursor, browseSize(args.pageSize));
+  return { connections: page.page.map(connectionRow), complete: page.isDone, nextCursor: page.isDone ? null : page.continueCursor };
 } });
 export const review = query({ args: reviewArgs, handler: async (ctx, args) => {
   const handoff = await ownHandoff(ctx, args.handoffId);
@@ -194,13 +231,20 @@ async function ownerInspection(ctx: QueryCtx | MutationCtx, args: { userId: Doc<
   const user = await ctx.db.get(args.userId);
   const source = await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", args.sourceCredentialId)).unique();
   const project = await ctx.db.query("projects").withIndex("by_stable_id", q => q.eq("id", args.projectId)).unique();
-  const prior = await ctx.db.query("identityLinks").withIndex("by_user_backend", q => q.eq("userId", args.userId).eq("backendId", args.backendId)).take(101);
-  if (prior.length > 100) fail("COVERAGE_INCOMPLETE", "Owner link history exceeds bounded review");
+  const newest = await ctx.db.query("identityLinks").withIndex("by_user_backend_generation", q => q.eq("userId", args.userId).eq("backendId", args.backendId)).order("desc").first();
+  // Every unrevoked generation installation will revoke must stay reviewable; a
+  // history preview window may omit older rows, this affected set never does.
+  const unrevoked = await ctx.db.query("identityLinks").withIndex("by_user_backend_revoked", q => q.eq("userId", args.userId).eq("backendId", args.backendId).eq("revokedAt", undefined)).take(101);
+  if (unrevoked.length > 100) fail("COVERAGE_INCOMPLETE", "Owner link replacement exceeds bounded review");
+  const history = await ctx.db.query("identityLinks").withIndex("by_user_backend_generation", q => q.eq("userId", args.userId).eq("backendId", args.backendId)).order("desc").take(21);
   if (!user || !source || !project || source.backendId !== args.backendId || project.backendId !== args.backendId) fail("NOT_FOUND", "Owner link selection unavailable");
   const sourceView = { documentId: source._id, credentialId: source.id, memberId: source.memberId, role: source.role, projectIds: source.projectIds, expiresAt: source.expiresAt, revokedAt: source.revokedAt ?? null, lapsedAt: source.lapsedAt ?? null };
-  const existing = prior.map(link => ({ id: link.id, generation: link.generation, projectId: link.projectId, sourceCredentialId: link.sourceCredentialId, active: link.active, revokedAt: link.revokedAt ?? null, expiresAt: link.expiresAt })).sort((a, b) => a.generation - b.generation || a.id.localeCompare(b.id));
-  const review = { userId: args.userId, backendId: args.backendId, projectId: args.projectId, sourceCredentialId: args.sourceCredentialId, userEnabled: user.enabled && user.disabledAt === undefined, source: sourceView, project: { repository: project.repository, remote: project.remote, defaultBranch: project.defaultBranch }, existing };
-  return { review, digest: await digest(canonical(review)), highestGeneration: Math.max(0, ...prior.map(link => link.generation)) };
+  const ordering = (a: { generation: number; id: string }, b: { generation: number; id: string }) => a.generation - b.generation || a.id.localeCompare(b.id);
+  const affected = unrevoked.map(link => ({ id: link.id, generation: link.generation, projectId: link.projectId, sourceCredentialId: link.sourceCredentialId, active: link.active, expiresAt: link.expiresAt })).sort(ordering);
+  const existing = history.slice(0, 20).map(link => ({ id: link.id, generation: link.generation, projectId: link.projectId, sourceCredentialId: link.sourceCredentialId, active: link.active, revokedAt: link.revokedAt ?? null, expiresAt: link.expiresAt })).sort(ordering);
+  const highestGeneration = newest?.generation ?? 0;
+  const review = { userId: args.userId, backendId: args.backendId, projectId: args.projectId, sourceCredentialId: args.sourceCredentialId, userEnabled: user.enabled && user.disabledAt === undefined, highestGeneration, source: sourceView, project: { repository: project.repository, remote: project.remote, defaultBranch: project.defaultBranch }, affected, existing, existingTruncated: history.length > 20 };
+  return { review, digest: await digest(canonical(review)), highestGeneration };
 }
 export const inspectOwnerLink = internalQuery({ args: ownerSelection, handler: ownerInspection });
 export const installOwnerLink = internalMutation({ args: { ...installLinkArgs, expectedStateDigest: v.string() }, handler: async (ctx, args) => {

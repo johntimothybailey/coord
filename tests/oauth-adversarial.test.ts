@@ -6,6 +6,7 @@ import type { MutationCtx, Doc } from "../convex/server.js";
 import * as auth from "../convex/auth.js";
 import * as oauth from "../convex/oauthAuthority.js";
 import * as goals from "../convex/goals.js";
+import * as connect from "../convex/connect.js";
 import { CAPABILITIES, CLIENT_VERSION } from "../src/protocol.js";
 import { CONNECTION_CAP_MS } from "../convex/oauthPolicy.js";
 
@@ -24,6 +25,7 @@ class OAuthFixture extends BackendFixture {
   verificationTimes: number[] = [];
   override context(): MutationCtx {
     const ctx = super.context();
+    ctx.db.normalizeId = ((_table: string, id: string) => this.rows.has(id) ? id : null) as typeof ctx.db.normalizeId;
     ctx.auth = { getUserIdentity: async () => this.browserUser ? { subject: "synthetic-session" } : null } as MutationCtx["auth"];
     ctx.runQuery = (async (reference: unknown, args: Record<string, unknown>) => {
       const address = getFunctionAddress(reference).reference ?? "";
@@ -44,6 +46,20 @@ class OAuthFixture extends BackendFixture {
 let serial = 0;
 const request = (token = "", oauthBearer: string | undefined = token ? undefined : "synthetic-bearer") => ({ token, ...(oauthBearer === undefined ? {} : { oauthBearer }), protocolVersion: 1, clientVersion: CLIENT_VERSION, capabilities: [...CAPABILITIES], backendId: "backend", projectId: "project", requestId: `adversarial_${++serial}` });
 const denied = (code = "UNAUTHORIZED") => (error: unknown) => !!error && typeof error === "object" && "data" in error && (error.data as { code?: string }).code === code;
+// Project consent has exactly one creator now: connect.complete after an exact
+// server-recomputed review. This helper performs that real flow (finish -> review ->
+// complete) and returns the old {connectionId, projectId, absoluteExpiresAt} shape.
+async function reviewedConsent(f: OAuthFixture, args: { grantId: string; bearer: string; linkId: Doc<"identityLinks">["_id"]; generation: number }) {
+  const prior = [...f.rows.values()].find(row => row._table === "connectHandoffs" && row.grantId === args.grantId);
+  const handoffId = prior ? String(prior.id) : (await f.call(connect.finish, { bearer: args.bearer }) as { handoffId: string }).handoffId;
+  const selector = { handoffId, linkId: args.linkId, generation: args.generation };
+  const view = await f.call(connect.review, selector) as { digest: string };
+  const done = await f.call(connect.complete, { ...selector, digest: view.digest }) as { projectId: string; absoluteExpiresAt: number };
+  const connection = [...f.rows.values()].find(row => row._table === "mcpConnections" && row.grantId === args.grantId);
+  assert(connection, "exact reviewed completion is the only writer of project consent");
+  return { connectionId: String(connection._id) as Doc<"mcpConnections">["_id"], projectId: done.projectId, absoluteExpiresAt: done.absoluteExpiresAt };
+}
+const ownHandoffId = (f: OAuthFixture) => String([...f.rows.values()].find(row => row._table === "connectHandoffs")!.id);
 async function setup(bind = true, fractionalTime = 0) {
   const f = new OAuthFixture();
   await f.call(auth.bootstrap, { backendId: "backend", projectId: "project", repository: "fixture/repo", remote: "origin", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: [], ruleTargets: ["AGENTS.md"], humanId: "human", humanDigest: await auth.digest(humanToken), agentId: "agent", agentDigest: await auth.digest(agentToken), expiresAt: Date.now() + 3 * CONNECTION_CAP_MS });
@@ -55,29 +71,56 @@ async function setup(bind = true, fractionalTime = 0) {
   f.grants.push(grant);
   const access = { ...grant, grantId: grant._id, kind: "access" };
   f.tokens.set(await auth.digest("synthetic-bearer"), access);
-  const consent = await f.call(oauth.consentGrant, { grantId: grant._id, ...link }) as { connectionId: Doc<"mcpConnections">["_id"]; absoluteExpiresAt: number };
+  const consent = await reviewedConsent(f, { grantId: grant._id, bearer: "synthetic-bearer", ...link });
   if (bind) await f.call(oauth.bind, request());
   return { f, userId, link, grant, access, consent };
 }
 
 test("browser identity and live session are required for activation, consent and identity", async () => {
-  const { f, link, userId } = await setup(false);
+  const { f, link, userId, consent } = await setup(false);
+  const handoffId = ownHandoffId(f);
   for (const state of ["absent", "expired", "foreign"] as const) {
     f.browserUser = state === "absent" ? null : state === "foreign" ? await (f.call(oauth.createUser, { method: { name: "fixture", profile: {} } }) as Promise<Doc<"users">["_id"]>) : userId;
     f.sessionLive = state !== "expired";
+    const before = structuredClone(f.rows);
     await assert.rejects(f.call(oauth.activateLink, link), denied());
-    await assert.rejects(f.call(oauth.consentGrant, { ...link, grantId: "grant" }), denied(state === "foreign" ? "FORBIDDEN" : "UNAUTHORIZED"));
+    // MOVED from consentForSession: consent now exists only behind the exact reviewed
+    // handoff, so a foreign browser session is refused by ownHandoff (NOT_FOUND) and an
+    // absent or dead session by sessionUser (UNAUTHORIZED). The preserved invariant is
+    // that no browser other than the owning one can turn this grant into project consent.
+    const code = state === "foreign" ? "NOT_FOUND" : "UNAUTHORIZED";
+    await assert.rejects(f.call(connect.review, { handoffId, ...link }), denied(code));
+    await assert.rejects(f.call(connect.complete, { handoffId, ...link, digest: "f".repeat(64) }), denied(code));
+    assert.deepEqual(f.rows, before);
   }
-  f.browserUser = null;
+  // Bearer-only onboarding with no browser session at all still creates no consent.
+  f.browserUser = null; f.sessionLive = true;
+  f.rows.delete(consent.connectionId);
+  assert.equal((await f.call(connect.finish, { bearer: "synthetic-bearer" }) as { handoffId: string }).handoffId, handoffId);
+  assert(![...f.rows.values()].some(row => row._table === "mcpConnections"));
   await assert.rejects(f.call(oauth.identity, {}), denied());
 });
 
 test("consent rejects foreign grant, stale generation and wrong resource", async () => {
-  const { f, link, grant } = await setup(false);
-  await assert.rejects(f.call(oauth.consentGrant, { ...link, generation: 2, grantId: "grant" }), denied("FORBIDDEN"));
-  await assert.rejects(f.call(oauth.consentGrant, { ...link, grantId: "foreign" }), denied());
+  const { f, link, grant, access } = await setup(false);
+  const handoffId = ownHandoffId(f);
+  const before = structuredClone(f.rows);
+  // MOVED from consentForSession's FORBIDDEN identity mismatch: a stale generation is now
+  // refused by reviewTuple, still FORBIDDEN, before any consent write.
+  await assert.rejects(f.call(connect.review, { handoffId, ...link, generation: 2 }), denied("FORBIDDEN"));
+  await assert.rejects(f.call(connect.complete, { handoffId, ...link, generation: 2, digest: "f".repeat(64) }), denied("FORBIDDEN"));
+  // MOVED from currentGrant inside consentForSession: no caller can name a grant any more.
+  // The handoff's grant comes from the verified bearer, so a foreign grant is refused by
+  // verifiedAccess inside finish and no handoff for it is ever created.
+  f.tokens.set(await auth.digest("foreign-bearer"), { ...access, grantId: "foreign" });
+  await assert.rejects(f.call(connect.finish, { bearer: "foreign-bearer" }), denied());
+  assert(![...f.rows.values()].some(row => row._table === "connectHandoffs" && row.grantId === "foreign"));
+  // MOVED likewise: a grant whose resource is not this deployment's is refused in finish,
+  // and the preserved handoff cannot complete against it either.
   grant.resource = "https://foreign.example/mcp";
-  await assert.rejects(f.call(oauth.consentGrant, { ...link, grantId: "grant" }), denied());
+  await assert.rejects(f.call(connect.finish, { bearer: "synthetic-bearer" }), denied());
+  await assert.rejects(f.call(connect.complete, { handoffId, ...link, digest: "f".repeat(64) }), denied());
+  assert.deepEqual(f.rows, before);
 });
 
 test("binding rejects forged bearer identity, kind, client, resource and project", async () => {
@@ -216,11 +259,30 @@ test("a valid bearer cannot create its own missing browser consent", async () =>
 
 test("an already elapsed grant cap cannot be revived by a new browser consent", async () => {
   const { f, consent, grant, link } = await setup(false);
+  const handoffId = ownHandoffId(f);
   f.rows.delete(consent.connectionId);
   grant._creationTime = Date.now() - CONNECTION_CAP_MS - 1;
   const before = structuredClone(f.rows);
-  await assert.rejects(f.call(oauth.consentGrant, { ...link, grantId: grant._id }), denied());
+  // MOVED from consentForSession's expired-ceiling check: the elapsed cap is refused by
+  // verifiedAccess inside finish, and the preserved handoff's own grant comparison refuses
+  // replay. Either way an elapsed 24-hour cap can never be restarted by a browser.
+  await assert.rejects(f.call(connect.finish, { bearer: "synthetic-bearer" }), denied());
+  await assert.rejects(f.call(connect.complete, { handoffId, ...link, digest: "f".repeat(64) }), denied());
   assert.deepEqual(f.rows, before);
+  assert(![...f.rows.values()].some(row => row._table === "mcpConnections"));
+});
+
+test("a revoked consent cannot be recreated by replaying its exact reviewed completion", async () => {
+  const { f, consent, link } = await setup(false);
+  const handoffId = ownHandoffId(f);
+  const view = await f.call(connect.review, { handoffId, ...link }) as { digest: string };
+  f.patch(consent.connectionId, { revokedAt: Date.now() });
+  const before = structuredClone(f.rows);
+  // The exact digest still matches, so the refusal comes from currentConnection on the
+  // immutable prior record: a revoked consent is a tombstone, never a free slot.
+  await assert.rejects(f.call(connect.complete, { handoffId, ...link, digest: view.digest }), denied());
+  assert.deepEqual(f.rows, before);
+  assert.equal([...f.rows.values()].filter(row => row._table === "mcpConnections").length, 1);
 });
 
 test("replacing a link generation cuts off an existing child and cannot reassign its grant", async () => {
@@ -231,8 +293,14 @@ test("replacing a link generation cuts off an existing child and cannot reassign
   assert.equal(typeof f.rows.get(link.linkId)?.revokedAt, "number");
   await assert.rejects(f.call(auth.handshake, request(childToken)), denied());
   await f.call(oauth.activateLink, replacement);
+  const handoffId = ownHandoffId(f);
   const beforeRetry = structuredClone(f.rows);
-  await assert.rejects(f.call(oauth.consentGrant, { ...replacement, grantId: grant._id }), denied());
+  // MOVED from consentForSession's immutable-consent check: the completed handoff's reviewed
+  // tuple cannot change, so reassigning this grant to the replacement generation is refused
+  // as IDEMPOTENCY_CONFLICT, and a fresh host finish still denies on the revoked link.
+  await assert.rejects(f.call(connect.review, { handoffId, ...replacement }), denied("IDEMPOTENCY_CONFLICT"));
+  await assert.rejects(f.call(connect.complete, { handoffId, ...replacement, digest: "f".repeat(64) }), denied("IDEMPOTENCY_CONFLICT"));
+  await assert.rejects(f.call(connect.finish, { bearer: "synthetic-bearer" }), denied());
   await assert.rejects(f.call(auth.handshake, request(childToken)), denied());
   assert.deepEqual(f.rows, beforeRetry);
   assert.deepEqual(f.rows.get(consent.connectionId), originalConnection, "the original grant binding remains as a tombstone");

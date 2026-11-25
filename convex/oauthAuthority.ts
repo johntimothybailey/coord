@@ -131,10 +131,13 @@ export async function installIdentityLink(ctx: MutationCtx, args: { id: string; 
     if (revokedAt !== undefined || canonical(stored) !== canonical(tuple)) fail("IDEMPOTENCY_CONFLICT", "Link identity already used");
     await currentLink(ctx, existing, false); return { linkId: _id, generation: existing.generation };
   }
-  const prior = await ctx.db.query("identityLinks").withIndex("by_user_backend", q => q.eq("userId", args.userId).eq("backendId", args.backendId)).take(101);
-  if (prior.length > 100 || prior.some(link => link.generation >= args.generation)) fail("IDEMPOTENCY_CONFLICT", "Link generation must advance");
+  const newest = await ctx.db.query("identityLinks").withIndex("by_user_backend_generation", q => q.eq("userId", args.userId).eq("backendId", args.backendId)).order("desc").first();
+  if (newest && newest.generation >= args.generation) fail("IDEMPOTENCY_CONFLICT", "Link generation must advance");
   // A replacement is a fresh immutable generation; old descendants stay dead.
-  for (const link of prior) if (link.revokedAt === undefined) await ctx.db.patch(link._id, { revokedAt: Date.now() });
+  // Only unrevoked rows are enumerated: expiry alone is never a revocation.
+  const unrevoked = await ctx.db.query("identityLinks").withIndex("by_user_backend_revoked", q => q.eq("userId", args.userId).eq("backendId", args.backendId).eq("revokedAt", undefined)).take(101);
+  if (unrevoked.length > 100) fail("COVERAGE_INCOMPLETE", "Prior link revocation exceeds bounded replacement");
+  for (const link of unrevoked) await ctx.db.patch(link._id, { revokedAt: Date.now() });
   const linkId = await ctx.db.insert("identityLinks", { ...tuple, active: false });
   await ctx.db.insert("memberships", { linkId, generation: args.generation, userId: args.userId, backendId: args.backendId, projectId: args.projectId, sourceCredentialId: source.id, memberId: source.memberId, expiresAt: args.expiresAt, active: false });
   await auditTransition(ctx, args.projectId, "deployment_owner", "oauth.installLink", linkId);
@@ -151,14 +154,15 @@ export const activateLink = mutation({ args: { linkId: v.id("identityLinks"), ge
   }
   return { active: true, projectId: state.link.projectId, generation: state.link.generation };
 } });
-// Authenticated project consent is separate from generic OAuth scopes. There is
-// no Connect UI in this slice: these bounded browser APIs are infrastructure.
-export async function consentForSession(ctx: MutationCtx, args: { grantId: string; linkId: Doc<"identityLinks">["_id"]; generation: number }, scopeCeiling?: readonly string[]) {
+// Consent is created only by connect.complete, after exact server-recomputed
+// review; connect.finish may still adopt a pre-existing handoff-less connection
+// as a grandfathered record. No un-ceilinged consent path remains callable.
+export async function consentForSession(ctx: MutationCtx, args: { grantId: string; linkId: Doc<"identityLinks">["_id"]; generation: number }, scopeCeiling: readonly string[]) {
   const user = await sessionUser(ctx);
   const { link, source, membership } = await currentLink(ctx, await ctx.db.get(args.linkId));
   if (link.userId !== user._id || link.generation !== args.generation) fail("FORBIDDEN", "Consent identity mismatch");
   const grant = await currentGrant(ctx, user._id, args.grantId);
-  const scopes = grant.scopes.filter(scope => link.scopes.includes(scope) && (scopeCeiling === undefined || scopeCeiling.includes(scope)));
+  const scopes = grant.scopes.filter(scope => link.scopes.includes(scope) && scopeCeiling.includes(scope));
   const tuple = { grantId: grant._id, userId: user._id, backendId: link.backendId, projectId: link.projectId, resource: grant.resource, clientId: grant.clientId!, linkId: link._id, linkGeneration: link.generation, membershipId: membership._id, membershipGeneration: membership.generation, sourceCredentialId: source.id, memberId: source.memberId, scopes, grantCreatedAt: grant._creationTime, absoluteExpiresAt: Math.min(grant._creationTime + CONNECTION_CAP_MS, link.expiresAt, membership.expiresAt, source.expiresAt) };
   if (!scopes.length || tuple.absoluteExpiresAt <= Date.now()) fail("UNAUTHORIZED", "Consent authority expired");
   const prior = await ctx.db.query("mcpConnections").withIndex("by_grant", q => q.eq("grantId", grant._id)).unique();
@@ -172,12 +176,6 @@ export async function consentForSession(ctx: MutationCtx, args: { grantId: strin
   await auditTransition(ctx, link.projectId, user._id, "oauth.consentGrant", connectionId);
   return { connectionId, projectId: link.projectId, absoluteExpiresAt: tuple.absoluteExpiresAt };
 }
-export const consentGrant = mutation({ args: { grantId: v.string(), linkId: v.id("identityLinks"), generation: v.number() }, handler: async (ctx, args) => {
-  const user = await sessionUser(ctx);
-  const handoff = await ctx.db.query("connectHandoffs").withIndex("by_grant", q => q.eq("grantId", args.grantId)).unique();
-  if (handoff?.userId === user._id) fail("FORBIDDEN", "This grant requires its exact reviewed Connect handoff; terminal attempts cannot be bypassed");
-  return consentForSession(ctx, args);
-} });
 export async function bindOAuth(ctx: MutationCtx, args: import("./auth.js").Identity) {
   if (!args.oauthBearer || args.token !== "") fail("UNAUTHORIZED", "Explicit OAuth bearer required");
   bounded(args.oauthBearer, 4096, "OAuth bearer");

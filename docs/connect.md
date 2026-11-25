@@ -111,6 +111,42 @@ Expect **Project authorized; awaiting the host**. Return to chat and ask **“Fi
 | Refresh the host bearer during ordinary use | Existing immutable consent/cap remains; refresh grants no new project or scope. |
 | Request approval of a rule | Existing separate protected approval ceremony remains mandatory. Connect login/consent cannot approve it. |
 
+## 6. Listing scale, pagination and expiry exclusion
+
+Project links and connections are listed per signed-in user as independently paginated sections. Neither section's volume nor failure can disable the other, so **Disconnect** stays reachable even when the link listing cannot be read.
+
+Listing order follows each index, and the two sections differ. Connections are **newest first within your account**. Project links are ordered by the user-and-backend index, so they appear in **backend groups**, and only within one backend are they newest first. A link on a different backend can therefore sit several pages away regardless of when it was installed. Nothing in Coord guarantees that an account uses a single backend, so do not assume a globally newest-first link order; identify a link by its exact generation and backend from the expandable record details rather than by its position in the list. Each page holds five records by default; the page size is bounded by the server and a value outside its range is refused rather than clamped. The paginated query carries no time value in its index range, so a page boundary crossed after a record expires cannot invalidate the listing.
+
+Because connections are newest first, the connection records that appear on later pages are the **oldest** ones. A browser tab opened before a deployment keeps its old JavaScript and reads a single bounded first page of up to one hundred records with no pagination controls; it degrades to that page rather than failing, and reloading the tab restores the paginated controls. Any listing refusal clears only its own section and offers a reload that re-reads page one, so a cursor whose listing is no longer trusted is never reused.
+
+Expiry and revocation are classified for display only. A listed record is never evidence of current authority: every protected operation rechecks the exact current grant, link, membership, source and cap at fresh server time.
+
+**Pagination walkthrough (human-executable).** With the host registered and one active project link:
+
+1. Repeat the section 3 and section 4 sequence until **six** separate connections exist for the same browser account. Each host OAuth login produces its own grant and its own connection; do not reuse a single grant.
+2. Open `/connect` and sign in. Expect **Existing project connections** to list exactly five records and show a **Show more connections** control.
+3. Choose **Show more connections**. Expect the sixth and oldest record to be appended below the first five, the control to disappear, and no record to be duplicated or replaced.
+4. Expand **Exact record selectors and limits** on that second-page record and record its exact connection ID as a nonsecret receipt. No owner-side command reports connection IDs, so this browser record is the authoritative selector; you will compare it again in step 6 to prove the same record was retained.
+5. Choose **Disconnect this exact connection** on that second-page record. Expect a status line confirming the connection is revoked, that its record is retained as a revoked tombstone and was not deleted, and that the listing has restarted at page one. Expect the five newest records to be listed again with the revoked one no longer among them.
+6. Choose **Show more connections** again and locate that same record. Expect it to be present as a revoked record with no Disconnect control, proving the tombstone was retained rather than deleted. Expand **Exact record selectors and limits** and confirm the connection ID matches the one you recorded in step 4.
+7. In chat, ask the host bound to the disconnected grant for project status. Expect refusal. Ask a host bound to one of the remaining connections. Expect a normal status read.
+8. Choose **Refresh status**. Expect both listings to restart from the first page with no stale cursor reused and no partially rendered list.
+
+**Expired access and credential cleanup, without a clock change (human-executable).** This needs a separately owner-approved short-lived test link; it does not require waiting twenty-four hours and must never be done by changing a clock.
+
+Coord's absolute deadline is an **application** cap, not revocation of the OAuth grant. When it passes, Coord refuses the connection, but the authorization server may still hold the host's grant and refresh credentials, because the installed component's refresh logic does not enforce Coord's cap. Disconnect therefore stays available on any record that has not been revoked, and it is the only way to remove that remaining grant.
+
+1. Prepare and install a link whose `--expires-at` is only a few minutes ahead, following section 2. The connection cap is the lesser of the grant's original twenty-four hours and that link's expiry.
+2. Complete a connection against it and confirm a normal project status read in chat.
+3. Wait for the link expiry to pass, then choose **Refresh status**. Expect that connection to be shown as **Coord access expired**, stating that Coord already refuses it while the host's OAuth grant and refresh credentials may still exist at the authorization server. Expect **Disconnect this exact connection** to still be offered, because that grant is what remains to clean up.
+4. Ask the host for project status. Expect refusal. Expect no listing, refresh or reconnect attempt to extend the original cap.
+5. Choose **Disconnect this exact connection** on that expired record. Expect revocation to be confirmed, the record to become a revoked tombstone rather than disappear, and the component OAuth grant to be removed. Expect no access to be revived and no deadline to move: a disconnect after expiry is credential cleanup, never a restoration.
+6. Ask the host for project status again. Expect refusal, for the same reason as before and now also because the grant is gone.
+
+**Owner review at scale (human-executable).** Run `coord connect inspect-owner` for a prepared plan and confirm it displays the authoritative highest generation, the exact next generation, the **complete** set of unrevoked links the installation would revoke, and the bounded history preview — including its explicit statement when older generations exist outside that preview. Confirm the exact digest, then install with `coord connect link` and compare the receipt.
+
+**Accurately classified as not human-validated by this repair.** Behaviour beyond one hundred historical connections or link generations is **software-verified / human-PENDING**. A human cannot reasonably perform one hundred and one real OAuth ceremonies or one hundred and one protected owner confirmations, and this repair seeds no live data. Separately authorized isolated test data could corroborate it later. Offline fixtures simulate index ordering and cursor sequencing; they do not establish Convex cursor validation, index behaviour, transaction contention or deployed component wiring.
+
 For a real 24-hour-cap boundary check, record the authoritative cap and schedule a bounded soak against the approved target. Software time fixtures are not a substitute for that observation. Record only nonsecret IDs, scopes, timestamps, displayed states and authoritative receipts; do not record bearer/JWT/refresh tokens, authorization codes, passkey responses or vault credentials.
 
 After recording the required observations, disconnect each temporary connection through the browser. Its card shows the project and recorded deadline; expand **Exact record selectors and limits** to match the exact connection ID. An unrevoked listing is registered metadata, not proof of current usable authority. Remove only the temporary host registration with `codex mcp remove coord-connect-validation`. Removal is host configuration cleanup, not proof of server revocation. Preserve uncertain receipts/plans until reconciled. Any test-account, project or deployment deletion requires separate explicit authorization.

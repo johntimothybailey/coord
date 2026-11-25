@@ -6,11 +6,21 @@ import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { connectOwnerCommand, parseLinkPlan, linkPlanDigest } from "../src/connect-owner.js";
+import { CoordError } from "../src/protocol.js";
 
 function plan() { return { schemaVersion: 1 as const, deploymentName: "fixture-deployment", link: { id: "exact_link", generation: 1, userId: "publicUser123", backendId: "backend", projectId: "project", sourceCredentialId: "agent", scopes: ["coord:read"], activationExpiresAt: Date.now() + 60_000, expiresAt: Date.now() + 120_000 } }; }
-function inspection(input: ReturnType<typeof plan>, highestGeneration = 0) {
-  const review = { userId: input.link.userId, backendId: input.link.backendId, projectId: input.link.projectId, sourceCredentialId: input.link.sourceCredentialId, userEnabled: true, source: { documentId: "publicDoc123", credentialId: "agent", memberId: "member", role: "agent", projectIds: ["project"], expiresAt: input.link.expiresAt + 1000, revokedAt: null, lapsedAt: null }, project: { repository: "https://example.test/repo", remote: "origin", defaultBranch: "main" }, existing: highestGeneration ? [{ id: "prior", generation: highestGeneration, projectId: "project", sourceCredentialId: "agent", active: true, revokedAt: null, expiresAt: input.link.expiresAt }] : [] };
-  return { review, highestGeneration, digest: createHash("sha256").update(canonicalJson(review)).digest("hex") };
+// New reviewed shape: an authoritative highestGeneration, the complete affected unrevoked
+// set, a bounded history preview and its truncation flag. `before` makes a self-consistent
+// change (the digest covers it, so only safeOwnerReview's own validation can refuse it);
+// `after` changes the review once the digest is fixed, which must break digest parity.
+function inspection(input: ReturnType<typeof plan>, highestGeneration = 0, options: { generations?: number[]; truncated?: boolean; before?: (review: Record<string, unknown>) => void; after?: (review: Record<string, unknown>) => void } = {}) {
+  const generations = options.generations ?? (highestGeneration ? [highestGeneration] : []);
+  const row = (generation: number) => ({ id: `prior_${generation}`, generation, projectId: input.link.projectId, sourceCredentialId: input.link.sourceCredentialId, active: true, expiresAt: input.link.expiresAt });
+  const review: Record<string, unknown> = { userId: input.link.userId, backendId: input.link.backendId, projectId: input.link.projectId, sourceCredentialId: input.link.sourceCredentialId, userEnabled: true, highestGeneration, source: { documentId: "publicDoc123", credentialId: "agent", memberId: "member", role: "agent", projectIds: ["project"], expiresAt: input.link.expiresAt + 1000, revokedAt: null, lapsedAt: null }, project: { repository: "https://example.test/repo", remote: "origin", defaultBranch: "main" }, affected: generations.map(row), existing: generations.map(generation => ({ ...row(generation), revokedAt: null })), existingTruncated: options.truncated ?? false };
+  options.before?.(review);
+  const digest = createHash("sha256").update(canonicalJson(review)).digest("hex");
+  options.after?.(review);
+  return { review, highestGeneration, digest };
 }
 const confirm = async (label: string) => label.slice("Type ".length, label.indexOf(" to authorize"));
 
@@ -109,6 +119,49 @@ test("protected owner inspection provides the executable next-generation answer 
     const output: string[] = [], calls: string[] = [];
     await connectOwnerCommand(["inspect-owner", target], { prompt: async () => { throw new Error("Inspection has no confirmation action"); }, write: text => output.push(text), ownerCall: async (_deployment, operation) => { calls.push(operation); return inspection(input, 4); } });
     assert.deepEqual(calls, ["connect:inspectOwnerLink"]);
-    assert.match(output.join(""), /"nextGeneration":5/); assert.match(output.join(""), /No authority was installed or changed/);
+    const report = output.join("");
+    assert.match(report, /"nextGeneration":5/); assert.match(report, /No authority was installed or changed/);
+    assert.match(report, /Authoritative highest installed generation: 4/); assert.match(report, /Exact next generation: 5/);
+    assert.match(report, /Complete affected unrevoked links that installing the next generation revokes \(1;/);
+    assert.match(report, /generation 4 · link prior_4 · project project · source agent · activated/);
+    assert.match(report, /Generation history preview — at most the newest 20 generations, revoked ones included \(1\)/);
+    assert.doesNotMatch(report, /Older generations exist outside this preview/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("owner review rejects malformed generation state, oversized affected sets and server order that breaks digest parity", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "coord-connect-shape-")));
+  try {
+    const input = plan(), target = join(root, "plan.json"); await writeFile(target, JSON.stringify(input));
+    const bad: [string, "INVALID_INPUT" | "BLOCKED_ENV", () => ReturnType<typeof inspection>][] = [
+      // safeOwnerReview's own validation refuses these outright, before any confirmation.
+      ["missing existingTruncated", "INVALID_INPUT", () => inspection(input, 4, { before: review => { delete review.existingTruncated; } })],
+      ["non-boolean existingTruncated", "INVALID_INPUT", () => inspection(input, 4, { before: review => { review.existingTruncated = "yes"; } })],
+      ["fractional highestGeneration", "INVALID_INPUT", () => inspection(input, 4, { before: review => { review.highestGeneration = 4.5; } })],
+      ["negative highestGeneration", "INVALID_INPUT", () => inspection(input, 4, { before: review => { review.highestGeneration = -1; } })],
+      ["oversized affected set", "INVALID_INPUT", () => inspection(input, 4, { before: review => { review.affected = Array.from({ length: 101 }, (_unused, index) => ({ id: `over_${index}`, generation: index + 1, projectId: "project", sourceCredentialId: "agent", active: true, expiresAt: input.link.expiresAt })); } })],
+      ["oversized history preview", "INVALID_INPUT", () => inspection(input, 21, { generations: Array.from({ length: 21 }, (_unused, index) => index + 1) })],
+      // An affected row carrying revokedAt contradicts the unrevoked-by-contract shape: the
+      // safe reconstruction drops the field, so digest parity fails and nothing is installed.
+      ["affected row carrying revokedAt", "BLOCKED_ENV", () => inspection(input, 4, { before: review => { (review.affected as Record<string, unknown>[])[0]!.revokedAt = null; } })],
+      // The preview holds the newest generations, so its maximum must be the authority.
+      ["highestGeneration disagreeing with existing", "BLOCKED_ENV", () => inspection(input, 4, { after: review => { review.highestGeneration = 7; } })],
+      ["highestGeneration above the preview", "BLOCKED_ENV", () => inspection(input, 7, { generations: [4] })],
+      // Array order is the server's and is never re-sorted locally, so a reordered server
+      // array cannot silently match the digest it was supposed to cover.
+      ["reordered affected array", "BLOCKED_ENV", () => inspection(input, 5, { generations: [4, 5], after: review => { (review.affected as unknown[]).reverse(); } })],
+      ["reordered history array", "BLOCKED_ENV", () => inspection(input, 5, { generations: [4, 5], after: review => { (review.existing as unknown[]).reverse(); } })],
+    ];
+    for (const [label, expected, make] of bad) {
+      let prompts = 0, installs = 0; const output: string[] = [];
+      await assert.rejects(connectOwnerCommand(["inspect-owner", target], { write: text => output.push(text), prompt: async label2 => { prompts++; return label2; }, ownerCall: async (_deployment, operation) => { if (operation === "connect:inspectOwnerLink") return make(); installs++; return {}; } }), error => error instanceof CoordError && error.code === expected, label);
+      assert.equal(prompts, 0, label); assert.equal(installs, 0, label);
+      assert(!output.join("").includes("Authoritative highest installed generation"), label);
+    }
+    // The same review, unchanged, is accepted: the refusals above are not blanket failures.
+    const accepted: string[] = [];
+    await connectOwnerCommand(["inspect-owner", target], { write: text => accepted.push(text), prompt: async () => { throw new Error("Inspection has no confirmation action"); }, ownerCall: async () => inspection(input, 5, { generations: [4, 5], truncated: true }) });
+    assert.match(accepted.join(""), /Complete affected unrevoked links that installing the next generation revokes \(2;/);
+    assert.match(accepted.join(""), /Older generations exist outside this preview and are not displayed/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

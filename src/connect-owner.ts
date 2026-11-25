@@ -27,15 +27,31 @@ export function parseLinkPlan(value: unknown): LinkPlan {
 export const linkPlanDigest = (plan: LinkPlan): string => createHash("sha256").update(canonicalJson(plan)).digest("hex");
 function safeOwnerReview(value: unknown, plan: LinkPlan) {
   const review = object(value), source = object(review.source), project = object(review.project);
-  if (review.userId !== plan.link.userId || review.backendId !== plan.link.backendId || review.projectId !== plan.link.projectId || review.sourceCredentialId !== plan.link.sourceCredentialId || typeof review.userEnabled !== "boolean" || source.credentialId !== plan.link.sourceCredentialId || source.role !== "agent" || typeof source.memberId !== "string" || typeof source.documentId !== "string" || !Array.isArray(source.projectIds) || source.projectIds.some(id => typeof id !== "string" || id.length > 128) || !source.projectIds.includes(plan.link.projectId) || !Number.isFinite(source.expiresAt) || !Array.isArray(review.existing) || review.existing.length > 100) invalid();
+  if (review.userId !== plan.link.userId || review.backendId !== plan.link.backendId || review.projectId !== plan.link.projectId || review.sourceCredentialId !== plan.link.sourceCredentialId || typeof review.userEnabled !== "boolean" || source.credentialId !== plan.link.sourceCredentialId || source.role !== "agent" || typeof source.memberId !== "string" || typeof source.documentId !== "string" || !Array.isArray(source.projectIds) || source.projectIds.some(id => typeof id !== "string" || id.length > 128) || !source.projectIds.includes(plan.link.projectId) || !Number.isFinite(source.expiresAt) || !Number.isSafeInteger(review.highestGeneration) || Number(review.highestGeneration) < 0 || typeof review.existingTruncated !== "boolean" || !Array.isArray(review.affected) || review.affected.length > 100 || !Array.isArray(review.existing) || review.existing.length > 20) invalid();
   const text = (value: unknown, max: number) => { if (typeof value !== "string" || !value || value.length > max || /[\x00-\x1f\x7f]/u.test(value)) invalid(); return value as string; };
   const nullableTime = (value: unknown) => { if (value !== null && !Number.isFinite(value)) invalid(); return value as number | null; };
-  const existing = (review.existing as unknown[]).map((value: unknown) => {
+  // Array order is the server's; canonicalJson preserves it, so never re-sort here.
+  const generationRow = (value: unknown) => {
     const row = object(value);
     if (!Number.isSafeInteger(row.generation) || Number(row.generation) < 1 || typeof row.active !== "boolean" || !Number.isFinite(row.expiresAt)) invalid();
-    return { id: text(row.id, 128), generation: Number(row.generation), projectId: text(row.projectId, 128), sourceCredentialId: text(row.sourceCredentialId, 128), active: row.active, revokedAt: nullableTime(row.revokedAt), expiresAt: Number(row.expiresAt) };
-  });
-  return { userId: plan.link.userId, backendId: plan.link.backendId, projectId: plan.link.projectId, sourceCredentialId: plan.link.sourceCredentialId, userEnabled: review.userEnabled, source: { documentId: text(source.documentId, 128), credentialId: plan.link.sourceCredentialId, memberId: text(source.memberId, 128), role: "agent", projectIds: (source.projectIds as string[]).map(id => text(id, 128)), expiresAt: Number(source.expiresAt), revokedAt: nullableTime(source.revokedAt), lapsedAt: nullableTime(source.lapsedAt) }, project: { repository: text(project.repository, 2048), remote: text(project.remote, 2048), defaultBranch: text(project.defaultBranch, 256) }, existing };
+    return { row, id: text(row.id, 128), generation: Number(row.generation), projectId: text(row.projectId, 128), sourceCredentialId: text(row.sourceCredentialId, 128), active: row.active as boolean, expiresAt: Number(row.expiresAt) };
+  };
+  // Every affected entry is unrevoked by contract, so no revokedAt field exists on it.
+  const affected = (review.affected as unknown[]).map((value: unknown) => { const { row: _unused, ...link } = generationRow(value); return link; });
+  const existing = (review.existing as unknown[]).map((value: unknown) => { const { row, ...link } = generationRow(value); return { ...link, revokedAt: nullableTime(row.revokedAt) }; });
+  return { userId: plan.link.userId, backendId: plan.link.backendId, projectId: plan.link.projectId, sourceCredentialId: plan.link.sourceCredentialId, userEnabled: review.userEnabled, highestGeneration: Number(review.highestGeneration), source: { documentId: text(source.documentId, 128), credentialId: plan.link.sourceCredentialId, memberId: text(source.memberId, 128), role: "agent", projectIds: (source.projectIds as string[]).map(id => text(id, 128)), expiresAt: Number(source.expiresAt), revokedAt: nullableTime(source.revokedAt), lapsedAt: nullableTime(source.lapsedAt) }, project: { repository: text(project.repository, 2048), remote: text(project.remote, 2048), defaultBranch: text(project.defaultBranch, 256) }, affected, existing, existingTruncated: review.existingTruncated };
+}
+type OwnerReview = ReturnType<typeof safeOwnerReview>;
+const isoTime = (value: number) => Number.isFinite(new Date(value).getTime()) ? new Date(value).toISOString() : `unavailable (${value} ms since epoch)`;
+// Human review text: the complete affected unrevoked set is displayed in full because
+// the confirmation must cover every current binding this installation ends.
+function reviewReport(reviewed: OwnerReview, highestGeneration: number): string {
+  const rows = (items: { id: string; generation: number; projectId: string; sourceCredentialId: string; active: boolean; expiresAt: number; revokedAt?: number | null }[]) =>
+    items.length ? items.map(row => `  generation ${row.generation} · link ${row.id} · project ${row.projectId} · source ${row.sourceCredentialId} · ${row.active ? "activated" : "not activated"} · access ends ${isoTime(row.expiresAt)}${row.revokedAt === undefined ? "" : row.revokedAt === null ? " · unrevoked" : ` · revoked ${isoTime(row.revokedAt)}`}\n`).join("") : "  (none)\n";
+  return `Authoritative highest installed generation: ${highestGeneration}\nExact next generation: ${highestGeneration + 1}\n`
+    + `Complete affected unrevoked links that installing the next generation revokes (${reviewed.affected.length}; their connections and delegated children end with them):\n${rows(reviewed.affected)}`
+    + `Generation history preview — at most the newest 20 generations, revoked ones included (${reviewed.existing.length}):\n${rows(reviewed.existing)}`
+    + (reviewed.existingTruncated ? "Older generations exist outside this preview and are not displayed. Every unrevoked link is already listed in the complete affected set above.\n" : "");
 }
 export const CONNECT_OWNER_USAGE = "Usage: coord connect plan --deployment <name> --backend <id> --project <id> --user <public-app-user-id> --source <existing-agent-id> --generation <n> --scopes <comma-separated-scopes> --activation-expires-at <ISO-8601> --expires-at <ISO-8601> --out <new-absolute-plan.json> | connect inspect-plan|inspect-owner <plan.json> | connect link <plan.json>";
 interface ConnectOwnerIo extends OperatorIo { ownerCall?: (deployment: string, operation: "connect:installOwnerLink" | "connect:inspectOwnerLink" | "connect:inspectLink", args: Record<string, unknown>) => Promise<unknown> }
@@ -69,13 +85,14 @@ export async function connectOwnerCommand(args: string[], io: ConnectOwnerIo = {
     try { inspection = object(await call(plan.deploymentName, "connect:inspectOwnerLink", { userId: plan.link.userId, backendId: plan.link.backendId, projectId: plan.link.projectId, sourceCredentialId: plan.link.sourceCredentialId })); }
     catch { throw new CoordError("NEEDS_HUMAN", "Protected owner inspection failed. Verify the selected owner account in your separate terminal; preserve this exact plan. No installation was attempted"); }
     const reviewed = safeOwnerReview(inspection.review, plan);
+    // The preview holds the newest generations, so its maximum is still authoritative.
     const highestGeneration = Math.max(0, ...reviewed.existing.map(link => link.generation));
-    if (inspection.highestGeneration !== highestGeneration || typeof inspection.digest !== "string" || createHash("sha256").update(canonicalJson(reviewed)).digest("hex") !== inspection.digest) throw new CoordError("BLOCKED_ENV", "Protected owner inspection digest or generation did not match the exact safe review");
+    if (inspection.highestGeneration !== highestGeneration || reviewed.highestGeneration !== highestGeneration || typeof inspection.digest !== "string" || createHash("sha256").update(canonicalJson(reviewed)).digest("hex") !== inspection.digest) throw new CoordError("BLOCKED_ENV", "Protected owner inspection digest or generation did not match the exact safe review");
     return { reviewed, digest: inspection.digest, highestGeneration };
   };
   if (command === "inspect-owner") {
     const inspected = await inspect();
-    write(`${canonicalJson({ ...inspected, nextGeneration: inspected.highestGeneration + 1, sourceExpiryIso: new Date(inspected.reviewed.source.expiresAt).toISOString() })}\nOwner inspection only. No authority was installed or changed.\n`); return;
+    write(`${canonicalJson({ ...inspected, nextGeneration: inspected.highestGeneration + 1, sourceExpiryIso: new Date(inspected.reviewed.source.expiresAt).toISOString() })}\n${reviewReport(inspected.reviewed, inspected.highestGeneration)}Owner inspection only. No authority was installed or changed.\n`); return;
   }
   // An exact existing installation can be verified without a second mutation.
   const readback = async (): Promise<Record<string, unknown> | null> => {
@@ -89,7 +106,7 @@ export async function connectOwnerCommand(args: string[], io: ConnectOwnerIo = {
     if (plan.link.generation !== inspected.highestGeneration + 1) throw new CoordError("IDEMPOTENCY_CONFLICT", `The reviewed next generation is ${inspected.highestGeneration + 1}, not this plan's generation. Nothing was installed. Use connect inspect-owner with this preserved plan before explicitly preparing a new plan`);
     const reviewed = inspected.reviewed;
     stateDigest = inspected.digest;
-    write(`Current protected owner review: ${canonicalJson(reviewed)}\nInstalling this generation revokes ALL prior unrevoked links for this exact user/backend, including their existing connections and children.\n`);
+    write(`Current protected owner review: ${canonicalJson(reviewed)}\n${reviewReport(reviewed, inspected.highestGeneration)}Installing this generation revokes ALL prior unrevoked links for this exact user/backend, including their existing connections and children.\n`);
   } else write("An existing link with this exact ID will be read back; no replacement generation will be installed.\n");
   const phrase = `link ${plan.link.projectId} ${plan.link.userId} ${hash}${stateDigest ? ` ${stateDigest}` : ""}`;
   if (await prompt(`Type ${phrase} to authorize exactly the displayed link and replacement effects: `, false) !== phrase) throw new CoordError("NEEDS_HUMAN", "Exact Connect link confirmation did not match");

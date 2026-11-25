@@ -10,10 +10,12 @@ const site = "https://connect-ui.convex.site", backend = "https://connect-ui.con
 // or Convex deployment is qualified by these tests.
 class Element {
   textContent = ""; open = false; hidden = false; disabled = false; value = ""; className = ""; type = ""; children: Element[] = [];
+  parent?: Element;
   onclick?: () => void; onchange?: () => void; onsubmit?: (event: { preventDefault(): void }) => void;
   constructor(readonly tag: string) {}
-  append(child: Element) { this.children.push(child); if (this.tag === "select" && !this.value) this.value = child.value; }
-  replaceChildren() { this.children = []; this.value = ""; }
+  append(child: Element) { child.parent?.detach(child); child.parent = this; this.children.push(child); if (this.tag === "select" && !this.value) this.value = child.value; }
+  detach(child: Element) { const index = this.children.indexOf(child); if (index >= 0) this.children.splice(index, 1); }
+  replaceChildren() { for (const child of this.children) child.parent = undefined; this.children = []; this.value = ""; }
   removeAttribute(name: string) { if (name === "disabled") this.disabled = false; }
 }
 class Storage {
@@ -26,17 +28,32 @@ class Storage {
 }
 async function until(check: () => boolean) { for (let i = 0; i < 100; i++) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 2)); } assert.fail("Browser fixture did not settle"); }
 const content = (element: Element): string => [element.textContent, ...element.children.map(content)].join(" ");
+const descend = (element: Element): Element[] => [element, ...element.children.flatMap(descend)];
+const control = (element: Element, label: string) => descend(element).find(child => child.tag === "button" && child.textContent === label);
+const cards = (element: Element) => element.children.filter(child => child.className === "item");
+const selector = (card: Element, key: "connectionId" | "linkId") => String((JSON.parse(descend(card).find(child => child.tag === "pre")!.textContent) as Record<string, unknown>)[key]);
 const tokens = { accessToken: "fixture.access.signature", refreshToken: "private-refresh-canary", refreshTokenExpiresAt: Date.now() + 600_000, userId: "public-user" };
-async function browser(query = "", options: { existing?: boolean; nativeNull?: boolean; review?: () => Promise<unknown>; finish?: () => Promise<unknown> } = {}) {
+type Row = Record<string, unknown>;
+type Section = "links" | "connections";
+async function browser(query = "", options: { existing?: boolean; nativeNull?: boolean; review?: () => Promise<unknown>; finish?: () => Promise<unknown>; listing?: { links?: Row[][]; connections?: Row[][]; malformed?: Section } } = {}) {
   const saved = new Map<string, PropertyDescriptor | undefined>();
   const install = (name: string, value: unknown) => { saved.set(name, Object.getOwnPropertyDescriptor(globalThis, name)); Object.defineProperty(globalThis, name, { configurable: true, writable: true, value }); };
   const elements = new Map<string, Element>(), all: Element[] = [];
   for (const match of connectHtml.matchAll(/<(\w+)[^>]*\bid="([^"]+)"([^>]*)>/g)) { const element = new Element(match[1]!); element.hidden = match[3]!.includes("hidden"); elements.set(match[2]!, element); all.push(element); }
   const storage = new Storage(), calls: { path: string; args: Record<string, unknown> }[] = [];
   const history: string[] = [], navigation: string[] = [];
-  const link = { linkId: "link", generation: 1, backendId: "backend", projectId: "project", sourceCredentialId: "agent", scopes: ["coord:read"], activationExpiresAt: Date.now() + 60_000, expiresAt: Date.now() + 600_000, active: false };
-  const connection = { connectionId: "connection", projectId: "project", absoluteExpiresAt: Date.now() + 600_000, revoked: false };
-  let state = "pending", nativeCalls = 0;
+  // Page rows always carry an explicit selectability verdict; links classify on it alone.
+  const link = { linkId: "link", generation: 1, backendId: "backend", projectId: "project", sourceCredentialId: "agent", scopes: ["coord:read"], activationExpiresAt: Date.now() + 60_000, expiresAt: Date.now() + 600_000, active: false, selectable: true };
+  const connection = { connectionId: "connection", projectId: "project", absoluteExpiresAt: Date.now() + 600_000, revoked: false, expired: false };
+  let state = "pending", nativeCalls = 0, failPage: Section | null = null;
+  // Each section is an independent list of pages served by connect:linkPage /
+  // connect:connectionPage. identity serves no page and no cursor at all.
+  const pageOf = (key: Section, cursor: unknown) => {
+    const all = options.listing?.[key] ?? [[key === "links" ? link : connection] as Row[]];
+    const index = typeof cursor === "string" && cursor ? Number(cursor) : 0;
+    const complete = index >= all.length - 1;
+    return { rows: all[index] ?? [], complete, nextCursor: complete ? null : String(index + 1) };
+  };
   const credential = { id: "public-key-id", rawId: new Uint8Array([1, 2]).buffer, response: { clientDataJSON: new Uint8Array([3]).buffer, attestationObject: new Uint8Array([4]).buffer, authenticatorData: new Uint8Array([5]).buffer, signature: new Uint8Array([6]).buffer, userHandle: null, getTransports: () => ["internal"] } };
   install("window", { isSecureContext: true, addEventListener() {}, removeEventListener() {} });
   install("PublicKeyCredential", class {});
@@ -54,9 +71,26 @@ async function browser(query = "", options: { existing?: boolean; nativeNull?: b
       case "authSignin:finishSignUpWithUsernamePasskey": case "authSignin:finishSignInWithUsernamePasskey": value = options.finish ? await options.finish() : { status: "complete", tokens }; break;
       case "authCore:refreshSession": value = { kind: "rotated", tokens }; break;
       case "authCore:signOut": value = null; break;
-      case "connect:identity": value = { userId: "public-user", links: [link], connections: [connection] }; break;
+      case "connect:identity": {
+        // New contract: no pagination, no cursor, no completion flag and no pageSize
+        // argument. A bounded non-failing read of at most 100 rows per list plus a "more"
+        // boolean, kept only so a tab on old JavaScript still sees its records. This client
+        // reads userId and deliberately ignores both lists.
+        assert.deepEqual(args, {}, "identity is called with no arguments");
+        const links = (options.listing?.links ?? [[link] as Row[]]).flat();
+        const connections = (options.listing?.connections ?? [[connection] as Row[]]).flat();
+        const visible = links.filter(row => row.selectable !== false).slice(0, 100).map(({ selectable: _verdict, ...row }) => row);
+        value = { userId: "public-user", links: visible, linksMore: links.length > 100, connections: connections.slice(0, 100), connectionsMore: connections.length > 100 };
+        break;
+      }
+      // malformed makes one section's own page query return an unreadable listing. Rendering
+      // comes from the page queries now, so this is where a broken section originates.
+      case "connect:linkPage": { if (failPage === "links") throw new Error("Synthetic listing failure"); const page = pageOf("links", args.cursor); value = options.listing?.malformed === "links" ? { links: "unavailable", complete: true, nextCursor: null } : { links: page.rows, complete: page.complete, nextCursor: page.nextCursor }; break; }
+      case "connect:connectionPage": { if (failPage === "connections") throw new Error("Synthetic listing failure"); const page = pageOf("connections", args.cursor); value = options.listing?.malformed === "connections" ? { connections: "unavailable", complete: true, nextCursor: null } : { connections: page.rows, complete: page.complete, nextCursor: page.nextCursor }; break; }
       case "oauthAuthority:activateLink": link.active = true; value = { active: true }; break;
-      case "oauthAuthority:revokeConnection": connection.revoked = true; value = { revoked: true }; break;
+      // Revocation marks the exact record the caller named, as the backend does, and deletes
+      // nothing: a revoked connection stays listed as a tombstone on the next page read.
+      case "oauthAuthority:revokeConnection": { if (args.connectionId === connection.connectionId) connection.revoked = true; for (const page of options.listing?.connections ?? []) for (const row of page) if (row.connectionId === args.connectionId) row.revoked = true; value = { revoked: true }; break; }
       case "connect:status": value = { state }; break;
       case "connect:review": value = options.review ? await options.review() : { state, review: { handoffId: args.handoffId, grantId: "grant", userId: "public-user", clientId: "client", resource: backend.replace(".cloud", ".site") + "/mcp", grantCreatedAt: Date.now() - 1_000, backendId: "backend", projectId: "project", sourceCredentialId: "agent", linkId: "link", generation: 1, scopes: ["coord:read"], absoluteExpiresAt: connection.absoluteExpiresAt }, digest: "d".repeat(64) }; break;
       case "connect:complete": state = "authorized_awaiting_host"; value = { state, projectId: "project", absoluteExpiresAt: connection.absoluteExpiresAt }; break;
@@ -70,7 +104,7 @@ async function browser(query = "", options: { existing?: boolean; nativeNull?: b
   const get = (id: string) => elements.get(id)!;
   await startConnect();
   const submit = async () => { get("signin-form").onsubmit!({ preventDefault() {} }); await until(() => !get("login").disabled); };
-  return { get, calls, storage, navigation, history, all, link, connection, get nativeCalls() { return nativeCalls; }, setState(value: string) { state = value; }, submit, restore() { for (const [name, descriptor] of saved) descriptor ? Object.defineProperty(globalThis, name, descriptor) : Reflect.deleteProperty(globalThis, name); } };
+  return { get, calls, storage, navigation, history, all, link, connection, get nativeCalls() { return nativeCalls; }, setState(value: string) { state = value; }, setFailPage(value: Section | null) { failPage = value; }, submit, restore() { for (const [name, descriptor] of saved) descriptor ? Object.defineProperty(globalThis, name, descriptor) : Reflect.deleteProperty(globalThis, name); } };
 }
 
 test("Connect routes derive public origins, preserve security headers and version fixed assets without changing approval routes", async () => {
@@ -191,4 +225,223 @@ test("scope and expiry summaries explain permissions without inventing authority
   assert.match(expiryDescription(undefined), /Expiry unavailable/);
   assert.equal(connectHtml.includes('<details id="binding-details" open'), false);
   assert.equal(connectHtml.includes('<details id="oauth-exact" open'), false);
+});
+
+test("paged listings offer Show more only with a live cursor, append the next page and withhold actions from non-current records", async () => {
+  const current = { connectionId: "connection-current", projectId: "project", absoluteExpiresAt: Date.now() + 600_000, revoked: false, expired: false };
+  const expired = { connectionId: "connection-expired", projectId: "project", absoluteExpiresAt: Date.now() - 1_000, revoked: false, expired: true };
+  const revoked = { connectionId: "connection-revoked", projectId: "project", absoluteExpiresAt: Date.now() + 600_000, revoked: true, expired: false };
+  const active = { linkId: "active-link", generation: 2, backendId: "backend", projectId: "project", sourceCredentialId: "agent", scopes: ["coord:read"], activationExpiresAt: Date.now() + 60_000, expiresAt: Date.now() + 600_000, active: true, selectable: true };
+  const stale = { ...active, linkId: "stale-link", generation: 1, selectable: false };
+  const f = await browser("", { listing: { links: [[active], [stale]], connections: [[current], [expired, revoked]] } });
+  try {
+    f.get("username").value = "paged"; await f.submit(); await f.submit();
+    assert(control(f.get("links"), "Show more project links"), "a live link cursor offers Show more");
+    assert(control(f.get("connection-list"), "Show more connections"), "a live connection cursor offers Show more");
+    assert.equal(cards(f.get("connection-list")).length, 1);
+    assert(control(f.get("connection-list"), "Disconnect this exact connection"), "an unrevoked record offers Disconnect");
+    control(f.get("connection-list"), "Show more connections")!.onclick!();
+    await until(() => cards(f.get("connection-list")).length === 3);
+    // The second page appends; no record is replaced and the exhausted cursor drops the control.
+    assert.deepEqual(cards(f.get("connection-list")).map(card => selector(card, "connectionId")), [current.connectionId, expired.connectionId, revoked.connectionId]);
+    assert.equal(control(f.get("connection-list"), "Show more connections"), undefined);
+    // Expiry is Coord's application cap, not grant revocation, so credential cleanup stays
+    // offered on the expired record; only the revoked tombstone has nothing left to remove.
+    assert.deepEqual(cards(f.get("connection-list")).filter(card => control(card, "Disconnect this exact connection")).map(card => selector(card, "connectionId")), [current.connectionId, expired.connectionId]);
+    assert.match(content(f.get("connection-list")), /Coord access expired — this is not the same as the grant being revoked/);
+    assert.match(content(f.get("connection-list")), /Revoked record — it was disconnected and its OAuth grant was removed/);
+    // A non-selectable link is listed as a card with no Activate button and stays out of the select.
+    assert.deepEqual(f.get("project-choice").children.map(option => option.value), ["active-link"]);
+    control(f.get("links"), "Show more project links")!.onclick!();
+    await until(() => cards(f.get("links")).length === 2);
+    const listed = cards(f.get("links"));
+    assert.deepEqual(listed.map(card => selector(card, "linkId")), ["active-link", "stale-link"]);
+    assert.equal(control(listed[1]!, "Activate this project link"), undefined);
+    assert.match(content(listed[1]!), /Not selectable — current authority unavailable/);
+    assert.match(content(listed[1]!), /no project permission is implied/);
+    assert.deepEqual(f.get("project-choice").children.map(option => option.value), ["active-link"]);
+    assert.equal(control(f.get("links"), "Show more project links"), undefined);
+  } finally { f.restore(); }
+});
+
+test("a failed listing page clears only its own section and offers a reload that re-reads page one", async () => {
+  const first = { connectionId: "connection-one", projectId: "project", absoluteExpiresAt: Date.now() + 600_000, revoked: false, expired: false };
+  const next = { connectionId: "connection-two", projectId: "project", absoluteExpiresAt: Date.now() + 600_000, revoked: false, expired: false };
+  const f = await browser("", { listing: { connections: [[first], [next]] } });
+  try {
+    f.get("username").value = "failing"; await f.submit(); await f.submit();
+    assert.equal(cards(f.get("connection-list")).length, 1);
+    f.setFailPage("connections");
+    control(f.get("connection-list"), "Show more connections")!.onclick!();
+    await until(() => !!control(f.get("connection-list"), "Reload connections"));
+    // The failed section discards its rows and its cursor, and claims nothing.
+    assert.equal(cards(f.get("connection-list")).length, 0);
+    assert.match(content(f.get("connection-list")), /The connection listing is unavailable or incomplete/);
+    assert.match(content(f.get("connection-list")), /listing failure alone neither performs nor undoes a disconnect/);
+    assert.equal(control(f.get("connection-list"), "Show more connections"), undefined);
+    assert.equal(cards(f.get("links")).length, 1, "the link section is unaffected");
+    assert.match(f.get("link-note").textContent, /Activate the exact pending generation/);
+    f.setFailPage(null);
+    const before = f.calls.length;
+    control(f.get("connection-list"), "Reload connections")!.onclick!();
+    await until(() => cards(f.get("connection-list")).length === 1);
+    assert.deepEqual(f.calls.slice(before).filter(call => call.path === "connect:connectionPage").map(call => call.args), [{}], "recovery re-reads page one with no cursor");
+    assert.deepEqual(cards(f.get("connection-list")).map(card => selector(card, "connectionId")), [first.connectionId]);
+    assert(control(f.get("connection-list"), "Show more connections"), "the live cursor is offered again");
+  } finally { f.restore(); }
+});
+
+test("an unreadable link listing leaves connections listed and Disconnect reachable", async () => {
+  const f = await browser("", { listing: { malformed: "links" } });
+  try {
+    f.get("username").value = "degraded"; await f.submit(); await f.submit();
+    assert.equal(cards(f.get("links")).length, 0);
+    assert.match(f.get("link-note").textContent, /The project link listing is unavailable or incomplete/);
+    assert.match(f.get("link-note").textContent, /No project permission is confirmed/);
+    assert(control(f.get("links"), "Reload project links"));
+    assert.equal(f.get("project-choice").children.length, 0);
+    assert.equal(cards(f.get("connection-list")).length, 1);
+    assert(control(f.get("connection-list"), "Disconnect this exact connection"), "Disconnect stays reachable when the link listing fails");
+  } finally { f.restore(); }
+});
+
+test("an unreadable connection listing leaves the project links listed and selectable", async () => {
+  // The symmetric case: a malformed connections listing must not disable the links section.
+  const f = await browser("", { listing: { malformed: "connections" } });
+  try {
+    f.get("username").value = "degraded-connections"; await f.submit(); await f.submit();
+    assert.equal(cards(f.get("connection-list")).length, 0);
+    assert.match(content(f.get("connection-list")), /The connection listing is unavailable or incomplete/);
+    assert.match(content(f.get("connection-list")), /listing failure alone neither performs nor undoes a disconnect/);
+    assert(control(f.get("connection-list"), "Reload connections"));
+    assert.equal(control(f.get("connection-list"), "Show more connections"), undefined);
+    assert.equal(cards(f.get("links")).length, 1, "the link section stays rendered");
+    assert.match(f.get("link-note").textContent, /Activate the exact pending generation/);
+    assert(control(f.get("links"), "Activate this project link"), "the link section stays usable");
+  } finally { f.restore(); }
+});
+
+// Revocation and the follow-up listing read are independent outcomes, so exactly one of
+// three post-disconnect messages is reported. All three confirm the revocation and say the
+// record is retained as a tombstone; they differ only in what they claim about the listing,
+// and none may name a control this page does not render.
+test("a successful disconnect whose reload leaves a live cursor names Show more connections", async () => {
+  const target = { connectionId: "connection-page-one", projectId: "project", absoluteExpiresAt: Date.now() + 600_000, revoked: false, expired: false };
+  const later = { connectionId: "connection-page-two", projectId: "project", absoluteExpiresAt: Date.now() + 600_000, revoked: false, expired: false };
+  const f = await browser("", { listing: { connections: [[target], [later]] } });
+  try {
+    f.get("username").value = "disconnecting-paged"; await f.submit(); await f.submit();
+    control(f.get("connection-list"), "Disconnect this exact connection")!.onclick!();
+    await until(() => /revoked tombstone/.test(f.get("status").textContent));
+    const status = f.get("status").textContent;
+    assert.match(status, /This connection is now revoked: its next protected operation is refused/);
+    assert.match(status, /record is retained as a revoked tombstone and was not deleted/);
+    assert.match(status, /The connection listing restarted at page one/);
+    // More records exist beyond page one, so the revoked record may not be visible there.
+    assert.match(status, /if that revoked record is not shown there, choose Show more connections/);
+    assert.doesNotMatch(status, /could not be refreshed/, "the reload succeeded");
+    assert.doesNotMatch(status, /complete set of records/, "an unexhausted cursor shows no complete set");
+    assert(control(f.get("connection-list"), "Show more connections"), "the named control is actually rendered");
+    assert.equal(target.revoked, true);
+    assert.match(content(f.get("connection-list")), /Revoked record — it was disconnected and its OAuth grant was removed/);
+    assert.equal(control(f.get("connection-list"), "Disconnect this exact connection"), undefined, "a revoked record offers no Disconnect");
+  } finally { f.restore(); }
+});
+
+test("a successful disconnect whose reload exhausts the listing states the complete set is shown", async () => {
+  const f = await browser("");
+  try {
+    f.get("username").value = "disconnecting-single"; await f.submit(); await f.submit();
+    control(f.get("connection-list"), "Disconnect this exact connection")!.onclick!();
+    await until(() => /revoked tombstone/.test(f.get("status").textContent));
+    const status = f.get("status").textContent;
+    assert.match(status, /This connection is now revoked: its next protected operation is refused/);
+    assert.match(status, /record is retained as a revoked tombstone and was not deleted/);
+    assert.match(status, /restarted at page one and shows the complete set of records, so the revoked record is listed there/);
+    // With one page there is no Show more control, so the note must not name one.
+    assert.doesNotMatch(status, /Show more connections/);
+    assert.doesNotMatch(status, /could not be refreshed/, "the reload succeeded");
+    assert.equal(control(f.get("connection-list"), "Show more connections"), undefined);
+    assert.equal(f.connection.revoked, true);
+    assert.match(content(f.get("connection-list")), /Revoked record — it was disconnected and its OAuth grant was removed/);
+    assert.equal(control(f.get("connection-list"), "Disconnect this exact connection"), undefined, "a revoked record offers no Disconnect");
+  } finally { f.restore(); }
+});
+
+test("a confirmed disconnect whose reload fails reports both outcomes separately and claims no page one", async () => {
+  const target = { connectionId: "connection-stale", projectId: "project", absoluteExpiresAt: Date.now() + 600_000, revoked: false, expired: false };
+  // The page read fails only on the post-disconnect reload: the listing the human is looking
+  // at was rendered from a good read, and the revoke itself already succeeded.
+  const listing: { connections?: Row[][]; malformed?: Section } = { connections: [[target]] };
+  const f = await browser("", { listing });
+  try {
+    f.get("username").value = "disconnect-stale"; await f.submit(); await f.submit();
+    assert.equal(cards(f.get("connection-list")).length, 1);
+    listing.malformed = "connections";
+    control(f.get("connection-list"), "Disconnect this exact connection")!.onclick!();
+    await until(() => /revoked tombstone/.test(f.get("status").textContent));
+    const status = f.get("status").textContent;
+    assert.match(status, /This connection is now revoked: its next protected operation is refused/);
+    assert.match(status, /record is retained as a revoked tombstone and was not deleted/);
+    assert.match(status, /Separately, the connection listing could not be refreshed, so this page is not showing current records/);
+    assert.match(status, /choose Reload connections to read the first page again/);
+    // A read that failed rendered no page one, so the note cannot claim one.
+    assert.doesNotMatch(status, /restarted at page one/);
+    assert.doesNotMatch(status, /complete set of records/);
+    assert.doesNotMatch(status, /Show more connections/);
+    assert.equal(target.revoked, true, "the revocation itself was confirmed");
+    assert.equal(cards(f.get("connection-list")).length, 0);
+    assert(control(f.get("connection-list"), "Reload connections"), "the only named control is rendered");
+    assert.equal(control(f.get("connection-list"), "Show more connections"), undefined);
+    // The failed section still claims nothing about the disconnect it did not read.
+    assert.match(content(f.get("connection-list")), /listing failure alone neither performs nor undoes a disconnect/);
+  } finally { f.restore(); }
+});
+
+test("an expired unrevoked connection keeps Disconnect for credential cleanup while a revoked one offers none", async () => {
+  // absoluteExpiresAt is Coord's application cap: the host's OAuth grant and refresh
+  // credentials can outlive it, so the one control that removes them must stay offered.
+  const expired = { connectionId: "connection-expired", projectId: "project", absoluteExpiresAt: Date.now() - 1_000, revoked: false, expired: true };
+  const revoked = { connectionId: "connection-revoked", projectId: "project", absoluteExpiresAt: Date.now() + 600_000, revoked: true, expired: false };
+  const f = await browser("", { listing: { connections: [[expired, revoked]] } });
+  try {
+    f.get("username").value = "expired-unrevoked"; await f.submit(); await f.submit();
+    const [expiredCard, revokedCard] = cards(f.get("connection-list")) as [Element, Element];
+    assert.deepEqual([expiredCard, revokedCard].map(card => selector(card, "connectionId")), [expired.connectionId, revoked.connectionId]);
+    assert.match(content(expiredCard), /Coord access expired — this is not the same as the grant being revoked/);
+    assert.match(content(expiredCard), /Coord already refuses this connection/);
+    assert.match(content(expiredCard), /may still exist at the authorization server, and Disconnect remains available to remove them/);
+    assert(control(expiredCard, "Disconnect this exact connection"), "expiry alone never removes the host grant, so cleanup stays available");
+    assert.doesNotMatch(content(expiredCard), /its OAuth grant was removed/, "an expired record makes no removal claim");
+    assert.match(content(revokedCard), /Revoked record — it was disconnected and its OAuth grant was removed; Coord refuses it/);
+    assert.equal(control(revokedCard, "Disconnect this exact connection"), undefined, "only a revoked record has nothing left to remove");
+    assert.doesNotMatch(content(f.get("connection-list")), /nothing left to disconnect/);
+    // Disconnecting the expired record is a real revocation, not a no-op.
+    control(expiredCard, "Disconnect this exact connection")!.onclick!();
+    await until(() => /revoked tombstone/.test(f.get("status").textContent));
+    assert.deepEqual(f.calls.filter(call => call.path === "oauthAuthority:revokeConnection").map(call => call.args), [{ connectionId: expired.connectionId }]);
+    assert.equal(expired.revoked, true);
+    assert.equal(cards(f.get("connection-list")).filter(card => control(card, "Disconnect this exact connection")).length, 0);
+  } finally { f.restore(); }
+});
+
+test("listed link rows that are not selectable never claim that no project link exists", async () => {
+  const unusable = { linkId: "unusable-link", generation: 3, backendId: "backend", projectId: "project", sourceCredentialId: "agent", scopes: ["coord:read"], activationExpiresAt: Date.now() - 1_000, expiresAt: Date.now() + 600_000, active: false, selectable: false };
+  const listed = await browser("", { listing: { links: [[unusable]] } });
+  try {
+    listed.get("username").value = "none-selectable"; await listed.submit(); await listed.submit();
+    assert.equal(cards(listed.get("links")).length, 1, "the exact record is still listed");
+    assert.match(listed.get("link-note").textContent, /listed, but none is currently selectable/);
+    assert.doesNotMatch(listed.get("link-note").textContent, /No project link exists/);
+    assert.equal(listed.get("project-choice").children.length, 0);
+    assert.equal(control(listed.get("links"), "Activate this project link"), undefined);
+    assert.equal(control(listed.get("links"), "Show more project links"), undefined);
+  } finally { listed.restore(); }
+  // "No project link exists" stays reserved for an account with no link row at all.
+  const empty = await browser("", { listing: { links: [[]] } });
+  try {
+    empty.get("username").value = "no-links"; await empty.submit(); await empty.submit();
+    assert.equal(cards(empty.get("links")).length, 0);
+    assert.match(empty.get("link-note").textContent, /No project link exists/);
+  } finally { empty.restore(); }
 });
