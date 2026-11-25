@@ -165,3 +165,41 @@ test("owner review rejects malformed generation state, oversized affected sets a
     assert.match(accepted.join(""), /Older generations exist outside this preview and are not displayed/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+// The owner's normal Connect entry point selects one supported workflow combination:
+// read alone, read with rule proposal and/or read with human approval routing. An
+// unsupported selection is refused with a clear message, never quietly reduced.
+test("the owner plan accepts only a supported Connect permission selection and names each selected permission's purpose", async () => {
+  const supported = [["coord:read"], ["coord:read", "coord:propose"], ["coord:read", "coord:approval-request"], ["coord:read", "coord:propose", "coord:approval-request"]];
+  for (const scopes of supported) {
+    const parsed = parseLinkPlan({ ...plan(), link: { ...plan().link, scopes } });
+    assert.deepEqual(parsed.link.scopes, scopes, scopes.join(","));
+  }
+  const unsupported = [[], ["coord:run"], ["coord:read", "coord:run"], ["coord:propose"], ["coord:approval-request"], ["coord:read", "coord:read"], ["coord:read", "coord:propose", "coord:approval-request", "coord:message"], ["coord:read", "coord:unknown"], ["coord:propose", "coord:read"]];
+  for (const scopes of unsupported) {
+    assert.throws(() => parseLinkPlan({ ...plan(), link: { ...plan().link, scopes } }), error => error instanceof CoordError && error.code === "INVALID_INPUT", scopes.join(",") || "(empty)");
+  }
+  // The refusal explains the supported selection rather than silently clamping it.
+  try { parseLinkPlan({ ...plan(), link: { ...plan().link, scopes: ["coord:read", "coord:run"] } }); assert.fail("expected refusal"); }
+  catch (error) { assert(error instanceof CoordError); assert.match(error.message, /does not offer execution, supervision, artifact, verification or messaging/); assert.match(error.message, /coord:read/); }
+  // Preparing and inspecting a plan states what each selected permission allows.
+  const root = await realpath(await mkdtemp(join(tmpdir(), "coord-connect-scopes-")));
+  try {
+    const input = plan(), target = join(root, "plan.json");
+    const output: string[] = [];
+    const args = ["plan", "--deployment", input.deploymentName, "--backend", "backend", "--project", "project", "--user", input.link.userId, "--source", "agent", "--generation", "1", "--scopes", "coord:read,coord:approval-request", "--activation-expires-at", new Date(input.link.activationExpiresAt).toISOString(), "--expires-at", new Date(input.link.expiresAt).toISOString(), "--out", target];
+    await connectOwnerCommand(args, { write: text => output.push(text) });
+    const prepared = output.join("");
+    assert.match(prepared, /Permissions this link selects \(2\)/);
+    assert.match(prepared, /coord:read — Read this project's status/);
+    assert.match(prepared, /coord:approval-request — Route an exact rule revision/);
+    assert.match(prepared, /does not offer execution, supervision, artifact, verification or messaging/);
+    const inspected: string[] = [];
+    await connectOwnerCommand(["inspect-plan", target], { write: text => inspected.push(text), prompt: async label => label });
+    assert.match(inspected.join(""), /Permissions this link selects \(2\)/);
+    // An unsupported selection is refused before any file is written.
+    const refused = join(root, "refused.json");
+    await assert.rejects(connectOwnerCommand(["plan", "--deployment", input.deploymentName, "--backend", "backend", "--project", "project", "--user", input.link.userId, "--source", "agent", "--generation", "1", "--scopes", "coord:read,coord:run", "--activation-expires-at", new Date(input.link.activationExpiresAt).toISOString(), "--expires-at", new Date(input.link.expiresAt).toISOString(), "--out", refused], { write: () => {} }), error => error instanceof CoordError && error.code === "INVALID_INPUT");
+    await assert.rejects(readFile(refused, "utf8"));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

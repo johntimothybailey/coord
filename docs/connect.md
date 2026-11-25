@@ -21,7 +21,7 @@ The last command prints a loopback-only URL. Open that exact URL. Every screen b
 
 ## Prepare one authorized test target
 
-The agent prepares nonsecret files and commands; the human approves the target and performs protected interactions. The target sheet must identify the deployment name, backend/project IDs, existing source agent credential ID, exact site/backend origins, selected host, scope list including `coord:read`, activation deadline and link expiry. It must also identify a disposable workspace and any preexisting registration/configuration that must be preserved.
+The agent prepares nonsecret files and commands; the human approves the target and performs protected interactions. The target sheet must identify the deployment name, backend/project IDs, existing source agent credential ID, exact site/backend origins, selected host, the chosen Connect workflow and its permission selection, activation deadline and link expiry. It must also identify a disposable workspace and any preexisting registration/configuration that must be preserved.
 
 The backend requires its real `CONVEX_SITE_URL` and `CONVEX_CLOUD_URL`. The Connect page reads those server-derived exact HTTPS origins through `/connect/config`; browser arguments cannot choose a different backend. The Auth2 relying party is the exact site hostname. The OAuth consent URL is that site's `/connect`. No external logo, script CDN or private Auth2 browser helper is used.
 
@@ -75,6 +75,16 @@ Return to `/connect`, choose **Refresh status**, and inspect **2. Project access
 
 Use a distinct temporary host name, such as `coord-connect-validation`, without replacing an existing `coord` entry. The maintainer supplies the selected target's expanded command. For the inspected Codex CLI interface:
 
+Choose the permissions for the workflow being validated. Connect offers these and no others:
+
+| Permission | Choose it for | It does not |
+|---|---|---|
+| `coord:read` | Always. Connect needs it to verify actual project access. | Change anything. |
+| `coord:propose` | A rule-proposal workflow. | Approve a proposal. |
+| `coord:approval-request` | Routing an exact rule to a human for a protected passkey decision, and withdrawing that request. | Make the decision. |
+
+Request only what the chosen workflow needs; the supported selections are `coord:read`, `coord:read` with either of the other two, or all three. Execution, supervision, artifact, verification and messaging permissions are not offered through Connect, so a login that asks for them is consented only to the offered subset and the browser names what it left out before you authorize. For a read-only walkthrough, request `coord:read` alone.
+
 ```text
 codex mcp add coord-connect-validation --url <selected-exact-HTTPS-site>/mcp
 codex mcp login coord-connect-validation --scopes coord:read --oauth-client-registration dcr
@@ -103,6 +113,9 @@ Expect **Project authorized; awaiting the host**. Return to chat and ask **“Fi
 | Open a handoff while signed in as a different user | Unavailable/refused; no foreign project tuple or access. |
 | Review a project link belonging to another user/backend or an obsolete generation | Refused; no replacement or implicit activation. |
 | Connect with only `coord:read`, then request a proposal/mutation in chat | Missing tool, insufficient scope or backend refusal; no mutation. |
+| Register a host asking for an execution, supervision, artifact, verification or messaging permission | Connect does not offer it. The review lists it under the permissions it is leaving out, and the connection receives only the offered subset. |
+| Ask the owner for a link selecting a permission outside the Connect offer | The plan is refused with the supported selections named, and no file or authority is written. |
+| Ask an agent to withdraw an approval request another person made through the same source agent | Refused. Only the person who asked, or a project human, can withdraw it. |
 | Cancel a pending attempt, then retry its old link | Cancelled terminal state; no new consent. |
 | Open an expired attempt | Expired/unavailable; start a new host attempt. Never change clocks to fake qualification. |
 | Lose a reply after authorize/complete/link | **Outcome uncertain**; refresh/read status for that exact ID before retrying. No rollback claim. |
@@ -142,6 +155,16 @@ Coord's absolute deadline is an **application** cap, not revocation of the OAuth
 4. Ask the host for project status. Expect refusal. Expect no listing, refresh or reconnect attempt to extend the original cap.
 5. Choose **Disconnect this exact connection** on that expired record. Expect revocation to be confirmed, the record to become a revoked tombstone rather than disappear, and the component OAuth grant to be removed. Expect no access to be revived and no deadline to move: a disconnect after expiry is credential cleanup, never a restoration.
 6. Ask the host for project status again. Expect refusal, for the same reason as before and now also because the grant is gone.
+
+**Who asked is recorded, per person (human-executable).** With two separate signed-in people connected to the same project through the same source agent:
+
+1. As the first person, ask in chat for approval of an exact proposed rule. Expect the returned request to name that person's application user ID as its requester and the source agent's member as the acting agent, shown separately.
+2. Ask the host to read that request back. Expect the same requester and acting agent, and the same request digest.
+3. Ask the same person's agent to request the same rule again with the same request ID. Expect one unchanged request, not a second one.
+4. As the second person, ask to withdraw that request. Expect refusal: sharing the source agent does not transfer ownership.
+5. As the first person, withdraw it. Expect confirmation naming that person. A request already approved or denied cannot be withdrawn by anyone.
+
+A request made through a legacy project credential records no person. Expect it to be reported as delegated-member attribution only, to refuse withdrawal by any signed-in person, and to remain withdrawable by an authorized project human.
 
 **Owner review at scale (human-executable).** Run `coord connect inspect-owner` for a prepared plan and confirm it displays the authoritative highest generation, the exact next generation, the **complete** set of unrevoked links the installation would revoke, and the bounded history preview — including its explicit statement when older generations exist outside that preview. Confirm the exact digest, then install with `coord connect link` and compare the receipt.
 

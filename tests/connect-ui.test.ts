@@ -135,13 +135,13 @@ test("browser confirms account creation, activates exact own link, reviews bindi
     f.get("username").value = "new-user"; await f.submit();
     assert.match(f.get("status").textContent, /username is new/); assert.equal(f.get("login").textContent, "Create account with passkey"); assert.equal(f.nativeCalls, 0);
     await f.submit(); assert.equal(f.get("user-id").textContent, "public-user"); assert.equal(f.nativeCalls, 1); assert.equal(f.get("account").hidden, false);
-    assert.match(content(f.get("links")), /Agent access source agent/); assert.match(content(f.get("links")), /UTC/); assert.match(content(f.get("links")), /Read project status/);
+    assert.match(content(f.get("links")), /Agent access source agent/); assert.match(content(f.get("links")), /UTC/); assert.match(content(f.get("links")), /Read this project's status, approved rules/);
     assert.equal(f.get("links").children[0]!.children.find(child => child.tag === "details")!.open, false);
     assert.match(content(f.get("connection-list")), /Registered record — current authority is not confirmed/);
     f.get("links").children[0]!.children.find(child => child.tag === "button")!.onclick!(); await until(() => f.link.active && !f.get("refresh").disabled);
     f.get("review").onclick!(); await until(() => !f.get("complete").hidden); assert.match(f.get("binding").textContent, /"projectId": "project"/);
     const readable = content(f.get("binding-summary"));
-    assert.match(readable, /Project project/); assert.match(readable, /Backend backend/); assert.match(readable, /Agent access source agent/); assert.match(readable, /UTC/); assert.match(readable, /browser-clock estimate/); assert.match(readable, /Read project status/);
+    assert.match(readable, /Project project/); assert.match(readable, /Backend backend/); assert.match(readable, /Agent access source agent/); assert.match(readable, /UTC/); assert.match(readable, /browser-clock estimate/); assert.match(readable, /Read this project's status, approved rules/);
     assert.equal(f.get("binding-details").hidden, false); assert.equal(f.get("binding-details").open, false);
     for (const field of ["grantId", "userId", "resource", "generation", "digest"]) assert.match(f.get("binding").textContent, new RegExp(field));
     assert.match(f.get("binding-boundary").textContent || connectHtml, /no human approval authority/);
@@ -159,7 +159,7 @@ test("OAuth labels stay text, denial remains separate and authorization codes ne
   const f = await browser("?request=mcp_req_fixture", { existing: true });
   try {
     f.get("username").value = "existing"; await f.submit(); assert.equal(f.get("login").textContent, "Sign in with passkey"); await f.submit();
-    assert.match(f.get("oauth-details").textContent, /<img src=untrusted>/); assert.match(content(f.get("oauth-summary")), /unverified label/); assert.match(content(f.get("oauth-summary")), /Read project status/); assert.match(content(f.get("oauth-summary")), /pending/); assert.equal(f.get("oauth-exact").open, false); f.get("oauth-deny").onclick!(); await until(() => !f.get("return-client").hidden);
+    assert.match(f.get("oauth-details").textContent, /<img src=untrusted>/); assert.match(content(f.get("oauth-summary")), /unverified label/); assert.match(content(f.get("oauth-summary")), /Read this project's status, approved rules/); assert.match(content(f.get("oauth-summary")), /pending/); assert.equal(f.get("oauth-exact").open, false); f.get("oauth-deny").onclick!(); await until(() => !f.get("return-client").hidden);
     assert.match(f.get("status").textContent, /denied/); assert.equal(f.calls.find(call => call.path === "mcpConsent:authorize")?.args.approve, false);
     assert(!f.all.some(element => /private-code-canary|private-state-canary/.test(element.textContent))); assert(!JSON.stringify([...f.storage.items]).includes("private-code-canary"));
     f.get("return-client").onclick!(); assert.match(f.navigation[0]!, /code=private-code-canary/);
@@ -218,8 +218,11 @@ test("a late project review cannot authorize a changed selection", async () => {
 
 
 test("scope and expiry summaries explain permissions without inventing authority or an OAuth request deadline", () => {
-  assert.match(scopeDescription("coord:approval-request"), /does not approve/);
+  assert.match(scopeDescription("coord:approval-request"), /routing for a human decision; it can never make the decision/);
+  assert.match(scopeDescription("coord:propose"), /a proposal approves nothing by itself/);
+  // The five permissions Connect no longer offers keep an accurate description and say so.
   assert.match(scopeDescription("coord:run"), /separately admitted, qualified/);
+  assert.match(scopeDescription("coord:run"), /Connect does not offer this permission for a new connection/);
   assert.match(scopeDescription("unknown"), /Unrecognized permission/);
   assert.match(expiryDescription(Date.UTC(2026, 10, 18, 5, 0), Date.UTC(2026, 10, 18, 4, 0)), /2026-11-18 05:00:00.000 UTC · about 1 hour 0 minutes remaining/);
   assert.match(expiryDescription(undefined), /Expiry unavailable/);

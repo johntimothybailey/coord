@@ -1,5 +1,8 @@
+import { OAUTH_SCOPE_NAMES } from "../src/oauth-scopes.js";
 // Closed server-selected operation map. Scopes only restrict existing role gates.
-export const OAUTH_SCOPES = ["coord:read", "coord:propose", "coord:approval-request", "coord:run", "coord:supervise", "coord:artifact", "coord:verify", "coord:message"] as const;
+// The full eight-scope policy is unchanged; the narrower Connect consent profile
+// in src/oauth-scopes.ts bounds only what Connect offers and newly consents.
+export const OAUTH_SCOPES = OAUTH_SCOPE_NAMES;
 export const CONNECTION_CAP_MS = 24 * 3600_000;
 export const MAX_ANCESTORS = 8;
 const groups: Record<string, readonly string[]> = {

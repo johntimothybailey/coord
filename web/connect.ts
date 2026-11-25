@@ -2,6 +2,7 @@ import { AuthClient } from "@convex-dev/auth/browser";
 import { ConvexHttpClient } from "convex/browser";
 import { makeFunctionReference } from "convex/server";
 import type { Value } from "convex/values";
+import { CONNECT_OFFERED_SCOPES, CONNECT_OFFER_SUMMARY, CONNECT_SCOPE_PURPOSE } from "../src/oauth-scopes.js";
 
 type RecordValue = Record<string, unknown>;
 type Link = { linkId: string; generation: number; backendId: string; projectId: string; sourceCredentialId: string; scopes: string[]; activationExpiresAt: number; expiresAt: number; active: boolean };
@@ -35,18 +36,22 @@ export function credentialResponse(credential: PublicKeyCredential, register: bo
   const response = credential.response as AuthenticatorAssertionResponse;
   return { ...base, response: { clientDataJSON: encode64(response.clientDataJSON), authenticatorData: encode64(response.authenticatorData), signature: encode64(response.signature), ...(response.userHandle ? { userHandle: encode64(response.userHandle) } : {}) } };
 }
+// The three permissions Connect offers reuse the one shared human-facing definition.
+// The remaining five are still described here so an existing wider record keeps an
+// accurate description instead of being relabelled, and each says Connect no longer
+// offers it for a new connection.
 export function scopeDescription(scope: string): string {
+  const notOffered = " Connect does not offer this permission for a new connection.";
+  if ((CONNECT_OFFERED_SCOPES as readonly string[]).includes(scope)) return CONNECT_SCOPE_PURPOSE[scope]!;
   const descriptions: Record<string, string> = {
-    "coord:read": "Read project status, rules, reviewable guidance, checkpoint artifacts and machine capability information.",
-    "coord:propose": "Draft goals, tasks and source-backed rules; proposals still require applicable approvals.",
-    "coord:approval-request": "Request or cancel exact rule approval; this does not approve a rule.",
     "coord:run": "Participate in separately admitted, qualified tasks: admit eligible tasks, renew leases, record progress and lessons, propose or replan subtasks, and request finalization or resume.",
     "coord:supervise": "Authorize launches, monitor managed runs and report or confirm stops within machine and supervisor role limits.",
     "coord:artifact": "Prepare checkpoints, upload file scans and request publication for authorized runs.",
     "coord:verify": "Independently verify scans, checkpoints and publications; mark artifacts ready and accept verified publications within verifier role limits.",
     "coord:message": "Send, read, acknowledge and resolve coordination messages for authorized runs.",
   };
-  return descriptions[scope] ?? `Unrecognized permission: ${scope}. Review the exact request; no additional authority is implied.`;
+  const described = descriptions[scope];
+  return described === undefined ? `Unrecognized permission: ${scope}. Review the exact request; no additional authority is implied.` : `${described}${notOffered}`;
 }
 export function expiryDescription(value: unknown, now = Date.now()): string {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isFinite(new Date(value).getTime())) return "Expiry unavailable — refresh authoritative status before continuing.";
@@ -270,7 +275,11 @@ export async function startConnect(): Promise<void> {
     text("handoff-note", stateMessage(String(result.state)));
     if (result.state !== "pending" || typeof result.digest !== "string") { reviewed = undefined; show("complete", false); return; }
     reviewed = { linkId: link.linkId, generation: link.generation, digest: result.digest }; const tuple = object(result.review);
-    decisionSummary("binding-summary", [["Project", String(tuple.projectId)], ["Backend", String(tuple.backendId)], ["Agent access source", String(tuple.sourceCredentialId)], ["Access ends — absolute deadline", expiryDescription(tuple.absoluteExpiresAt)]], tuple.scopes);
+    const offer = result.offer === null || result.offer === undefined ? undefined : object(result.offer);
+    const excluded = Array.isArray(offer?.excluded) ? (offer.excluded as unknown[]).map(String) : [];
+    const disclosure: [string, string][] = [["What Connect offers", CONNECT_OFFER_SUMMARY]];
+    if (excluded.length) disclosure.push(["Requested but not included", `${excluded.join(", ")} — Connect does not offer these, so this connection will not receive them. Authorizing below consents only to the operations listed under Permitted operations.`]);
+    decisionSummary("binding-summary", [["Project", String(tuple.projectId)], ["Backend", String(tuple.backendId)], ["Agent access source", String(tuple.sourceCredentialId)], ["Access ends — absolute deadline", expiryDescription(tuple.absoluteExpiresAt)], ...disclosure], tuple.scopes);
     text("binding", display({ ...tuple, digest: result.digest })); show("binding-summary", true); show("binding-boundary", true); show("binding-details", true); ($("binding-details") as HTMLDetailsElement).open = false; show("complete", true);
   }); };
   $("complete").onclick = () => { void attempt(async epoch => { if (!reviewed || !flow.handoff) throw new Error("Exact review required"); const result = object(await mutate("connect:complete", { handoffId: flow.handoff, ...reviewed })); if (epoch !== generation) return; reviewed = undefined; show("complete", false); show("review", false); show("cancel", false); text("status", stateMessage(String(result.state))); text("handoff-note", stateMessage(String(result.state))); }); };

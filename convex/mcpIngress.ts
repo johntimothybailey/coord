@@ -7,7 +7,7 @@ import { boundedMcpClientInfo } from "../src/protocol.js";
 import { components, internal } from "./_generated/api.js";
 import { identityArgs } from "./authArgs.js";
 import { connectIdentity } from "./connect.js";
-import { OAUTH_SCOPES } from "./oauthPolicy.js";
+import { CONNECT_OFFERED_SCOPES, CONNECT_OFFER_SUMMARY, CONNECT_SCOPE_PURPOSE } from "../src/oauth-scopes.js";
 import { repositoryMemorySource } from "./schema.js";
 
 const { token: _token, oauthBearer: _bearer, ...requestArgs } = identityArgs;
@@ -65,8 +65,10 @@ class QueryOnlyMcpServer extends McpServer {
 const options = {
   name: "coord", version: "0.1.0",
   consentUrl: process.env.COORD_OAUTH_CONSENT_URL ?? (process.env.CONVEX_SITE_URL ? `${process.env.CONVEX_SITE_URL}/connect` : ""),
-  instructions: "Review and propose through scoped tools. Binding requires a live browser session, owner-installed project link and exact grant consent. Use the protected /connect page for sign-in and exact grant-to-project consent. Human approval requires the protected passkey page.",
-  scopes: Object.fromEntries(OAUTH_SCOPES.map(scope => [scope, `Restrict existing Coord authority to ${scope.slice(6)} operations in the authenticated project consent.`])),
+  instructions: `Review and propose through scoped tools. Binding requires a live browser session, owner-installed project link and exact grant consent. Use the protected /connect page for sign-in and exact grant-to-project consent. Human approval requires the protected passkey page. ${CONNECT_OFFER_SUMMARY}`,
+  // Connect advertises only the permissions its delivered workflows need, each with
+  // its human-facing purpose. The backend policy still maps all eight scope names.
+  scopes: Object.fromEntries(CONNECT_OFFERED_SCOPES.map(scope => [scope, CONNECT_SCOPE_PURPOSE[scope]!])),
   accessTokenTtlMs: 5 * 60_000, deviceFlow: false,
 };
 // Optional observation is bounded independently of the SDK's own request parser.

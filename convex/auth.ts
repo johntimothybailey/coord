@@ -28,7 +28,10 @@ export async function digest(value: string): Promise<string> {
 }
 export function tokenFormat(value: string): void { if (!/^[a-f0-9]{64}$/.test(value)) fail("UNAUTHORIZED", "Invalid credential"); }
 export const canonical = canonicalJson;
-export async function authenticate(ctx: AuthorityCtx, args: Identity, roles: readonly Doc<"credentials">["role"][], operation?: string): Promise<{ actor: Doc<"credentials">; project: Doc<"projects"> }> {
+// personUserId is the server-derived signed-in application user this operation acts
+// for, present only on the authenticated Connect route. actor stays the acting
+// credential, so person and acting agent remain separately attributable.
+export async function authenticate(ctx: AuthorityCtx, args: Identity, roles: readonly Doc<"credentials">["role"][], operation?: string): Promise<{ actor: Doc<"credentials">; project: Doc<"projects">; personUserId?: string }> {
   stableId(args.requestId);
   let actor: Doc<"credentials"> | null;
   if (args.oauthBearer !== undefined) {
@@ -41,8 +44,8 @@ export async function authenticate(ctx: AuthorityCtx, args: Identity, roles: rea
     if (actor && isOAuth(actor) && !actor.parentCredentialId) fail("UNAUTHORIZED", "OAuth roots require a current bearer");
   }
   const authorized = await authorizeActor(ctx, args, actor, roles);
-  await authorizeOAuth(ctx, authorized.actor, args.projectId, operation);
-  return authorized;
+  const personUserId = await authorizeOAuth(ctx, authorized.actor, args.projectId, operation);
+  return { ...authorized, personUserId };
 }
 export async function authorizeActor(ctx: Pick<QueryCtx, "db">, args: RequestIdentity, actor: Doc<"credentials"> | null, roles: readonly Doc<"credentials">["role"][]): Promise<{ actor: Doc<"credentials">; project: Doc<"projects"> }> {
   stableId(args.requestId);

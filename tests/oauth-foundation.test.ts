@@ -17,6 +17,7 @@ import * as checkpoints from "../convex/checkpoints.js";
 import * as lifecycle from "../convex/lifecycle.js";
 import { verifiedRun } from "../convex/artifacts.js";
 import { CONNECTION_CAP_MS, OAUTH_SCOPES, operationScope } from "../convex/oauthPolicy.js";
+import { CONNECT_OFFERED_SCOPES } from "../src/oauth-scopes.js";
 import { CAPABILITIES, CLIENT_VERSION, REQUIRED_CHECKS } from "../src/protocol.js";
 import * as connect from "../convex/connect.js";
 import * as mcpConsent from "../convex/mcpConsent.js";
@@ -107,7 +108,17 @@ async function reviewedConsent(f: ComponentFixture, args: { grantId: string; bea
   assert(connection, "exact reviewed completion is the only writer of project consent");
   return { connectionId: String(connection._id) as Doc<"mcpConnections">["_id"], projectId: done.projectId, absoluteExpiresAt: done.absoluteExpiresAt };
 }
-async function foundation(grantAge = 1000) {
+// Connect now offers only read, propose and approval-request, so the real reviewed flow
+// can no longer produce an execution-scoped connection. Tests that must keep proving
+// downstream role/lineage enforcement for the other five scope families consent through
+// the internal ceiling helper's own documented contract, passing the full backend policy
+// as its REQUIRED ceiling. connect.complete remains its only production caller, and no
+// connection row is hand-written here.
+async function ceilingConsent(f: ComponentFixture, args: { grantId: string; linkId: Doc<"identityLinks">["_id"]; generation: number }) {
+  const result = await oauth.consentForSession(f.context(), args, OAUTH_SCOPES);
+  return { connectionId: result.connectionId, projectId: result.projectId, absoluteExpiresAt: result.absoluteExpiresAt };
+}
+async function foundation(grantAge = 1000, consentPath: "connect_offer" | "full_policy_ceiling" = "connect_offer") {
   const f = new ComponentFixture();
   await f.call(auth.bootstrap, { backendId: "backend", projectId: "project", repository: "https://example.test/repo", remote: "origin", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: [], ruleTargets: [], humanId: "human", humanDigest: await auth.digest(secrets.human), agentId: "agent", agentDigest: await auth.digest(secrets.agent), expiresAt: Date.now() + 3 * CONNECTION_CAP_MS });
   const userId = await f.call(oauth.createUser, { method: { name: "fixture", profile: { email: "never-authority@example.test" } } }) as Doc<"users">["_id"];
@@ -116,12 +127,12 @@ async function foundation(grantAge = 1000) {
   await f.call(oauth.activateLink, link);
   f.table("grants").set("grant", { _id: "grant", _creationTime: Date.now() - grantAge + 0.25, kind: "oauth", userId, clientId: "client", resource, scopes: [...OAUTH_SCOPES], name: "Fixture" });
   f.table("tokens").set("access", { _id: "access", _creationTime: Date.now(), hash: await auth.digest("access-one"), grantId: "grant", kind: "access", expiresAt: Date.now() + 300_000 });
-  const consent = await reviewedConsent(f, { grantId: "grant", bearer: "access-one", ...link });
+  const consent = consentPath === "connect_offer" ? await reviewedConsent(f, { grantId: "grant", bearer: "access-one", ...link }) : await ceilingConsent(f, { grantId: "grant", ...link });
   const binding = await f.call(oauth.bind, request()) as { credentialId: string; absoluteExpiresAt: number };
   return { f, userId, link, consent, binding };
 }
 async function runnable(grantAge = 1000) {
-  const state = await foundation(grantAge), { f, binding } = state;
+  const state = await foundation(grantAge, "full_policy_ceiling"), { f, binding } = state;
   await f.call(projects.configure, { ...request(secrets.human), repository: "https://example.test/repo", remote: "origin", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: [], ruleTargets: [], sharingApproved: true, capturePolicyDigest: "d".repeat(64), capacity: 2, taskCap: 10 });
   const goal = await f.call(goals.propose, { ...request(), goalId: "goal", expectedRevision: 0, content: "Fixture", taskLimit: 5, runTimeoutMs: 1800_000 }) as { revision: number; hash: string };
   await f.call(goals.approve, { ...request(secrets.human), goalId: "goal", ...goal });
@@ -202,7 +213,7 @@ test("narrowed target scope denies launch and artifact checks for legacy and oth
     if (caller === "other_connection") {
       f.table("grants").set("grant_two", { _id: "grant_two", _creationTime: Date.now(), kind: "oauth", userId, clientId: "client_two", resource, scopes: ["coord:read", "coord:supervise", "coord:verify"], name: "Other connection" });
       f.table("tokens").set("access_other", { _id: "access_other", _creationTime: Date.now(), hash: await auth.digest("access-other"), grantId: "grant_two", kind: "access", expiresAt: Date.now() + 300_000 });
-      await reviewedConsent(f, { grantId: "grant_two", bearer: "access-other", ...link });
+      await ceilingConsent(f, { grantId: "grant_two", ...link });
       const binding = await f.call(oauth.bind, request("", "access-other")) as { credentialId: string };
       supervisor = "8".repeat(64); verifier = "9".repeat(64);
       await f.call(machines.provisionQualification, { backendId: "backend", projectId: "project", memberId: "agent", oauthParentCredentialId: binding.credentialId, machineId: "machine", capacity: 1, modes: ["managed"], key, checks: REQUIRED_CHECKS.managed.map(checkId => ({ schemaVersion: 1 as const, checkId, status: "PASS" as const, mode: "managed" as const, observedAt: new Date(Date.now() - 1000).toISOString(), configurationDigest: "fixture", command: ["fixture"], summary: "Fixture", evidenceRef: "fixture", kind: "real" as const })), evidenceRef: "fixture", expiresAt: Date.now() + 300_000, supervisorId: "other_supervisor", supervisorToken: supervisor, artifactVerifierId: "other_verifier", artifactVerifierToken: verifier });
@@ -335,7 +346,7 @@ test("OAuth verifier scope is checked on its own live connection while target ru
   const { f, identity, link, userId } = await startRunnable();
   f.table("grants").set("verifier_grant", { _id: "verifier_grant", _creationTime: Date.now(), kind: "oauth", userId, clientId: "verifier_client", resource, scopes: ["coord:read", "coord:supervise", "coord:verify"], name: "Separate verifier connection" });
   f.table("tokens").set("verifier_access", { _id: "verifier_access", _creationTime: Date.now(), hash: await auth.digest("verifier-access"), grantId: "verifier_grant", kind: "access", expiresAt: Date.now() + 300_000 });
-  await reviewedConsent(f, { grantId: "verifier_grant", bearer: "verifier-access", ...link });
+  await ceilingConsent(f, { grantId: "verifier_grant", ...link });
   const binding = await f.call(oauth.bind, request("", "verifier-access")) as { credentialId: string };
   const verifierToken = "a".repeat(64);
   await f.call(machines.provisionQualification, { backendId: "backend", projectId: "project", memberId: "agent", oauthParentCredentialId: binding.credentialId, machineId: "machine", capacity: 1, modes: ["managed"], key, checks: REQUIRED_CHECKS.managed.map(checkId => ({ schemaVersion: 1 as const, checkId, status: "PASS" as const, mode: "managed" as const, observedAt: new Date(Date.now() - 1000).toISOString(), configurationDigest: "fixture", command: ["fixture"], summary: "Fixture", evidenceRef: "fixture", kind: "real" as const })), evidenceRef: "fixture", expiresAt: Date.now() + 300_000, supervisorId: "scope_supervisor", supervisorToken: "b".repeat(64), artifactVerifierId: "scope_verifier", artifactVerifierToken: verifierToken });
@@ -369,7 +380,9 @@ test("remote accepted initialize persists backend-observed metadata on exact aut
   const observation = row.clientObservation as { provenance: string; clientInfo: unknown };
   assert.equal(observation.provenance, "mcp_handshake"); assert.deepEqual(observation.clientInfo, info);
   assert.equal(row.absoluteExpiresAt, before.absoluteExpiresAt); assert.equal(row.rootCredentialId, binding.credentialId);
-  assert.deepEqual(await reviewedConsent(f, { grantId: "grant", bearer: "access-one", ...link }), consent);
+  // Replayed through the same consent path that created this wider connection, so the
+  // assertion still proves telemetry changed no consent field.
+  assert.deepEqual(await ceilingConsent(f, { grantId: "grant", ...link }), consent);
   assert.deepEqual(f.rows.get(consent.connectionId)!.clientObservation, observation);
   const status = await f.call(tasks.sessionStatus, { ...request(secrets.run), ...identity }) as { connectionClientObservation?: unknown; clientObservation?: { provenance: string }; supervisorObservation?: unknown };
   assert.deepEqual(status.connectionClientObservation, observation);
@@ -476,4 +489,111 @@ test("an expired connection is refused yet its owner can still revoke the compon
   f.subject = "stranger";
   await assert.rejects(f.call(oauth.revokeConnection, { connectionId: consent.connectionId }), failureCode("FORBIDDEN"));
   assert.equal(f.rows.get(consent.connectionId)!.revokedAt, tombstone.revokedAt, "a refused revocation changes nothing");
+});
+
+// Person-specific requester ownership. Two people can share one source agent, so the
+// delegated member is not an identity: the signed-in application user the server
+// derived is recorded as the requester and the acting agent is recorded separately.
+const sharing = { repository: "https://example.test/repo", remote: "origin", defaultBranch: "main", allowedPaths: ["src"], excludedPaths: [], ruleTargets: [], sharingApproved: true, capturePolicyDigest: "d".repeat(64), capacity: 2, taskCap: 10 };
+const ruleSource = { kind: "repository" as const, repository: "https://example.test/repo", revision: "a".repeat(40), path: "src/work.ts", contentHash: "b".repeat(64) };
+async function approvable(f: ComponentFixture, memoryId: string, identity: ReturnType<typeof request>) {
+  const proposed = await f.call(memories.proposeRule, { ...identity, memoryId, content: `Keep ${memoryId} focused.`, sources: [ruleSource], applicability: ["src/work.ts"], confidence: "Fixture declaration" }) as { memoryId: string; revision: number; hash: string };
+  return proposed;
+}
+/** A second signed-in person on the SAME source agent, through the real Connect flow. */
+async function secondPerson(f: ComponentFixture, bearer: string) {
+  const userId = await f.call(oauth.createUser, { method: { name: "fixture", profile: {} } }) as Doc<"users">["_id"];
+  f.table("sessions").set("session", { _id: "session", _creationTime: Date.now(), userId });
+  const link = await f.call(oauth.installLink, { id: "link_other_person", generation: 1, userId, backendId: "backend", projectId: "project", sourceCredentialId: "agent", scopes: [...CONNECT_OFFERED_SCOPES], activationExpiresAt: Date.now() + 60_000, expiresAt: Date.now() + 2 * CONNECTION_CAP_MS }) as { linkId: Doc<"identityLinks">["_id"]; generation: number };
+  await f.call(oauth.activateLink, link);
+  f.table("grants").set("grant_other_person", { _id: "grant_other_person", _creationTime: Date.now(), kind: "oauth", userId, clientId: "client_other_person", resource, scopes: [...CONNECT_OFFERED_SCOPES], name: "Second person" });
+  f.table("tokens").set("access_other_person", { _id: "access_other_person", _creationTime: Date.now(), hash: await auth.digest(bearer), grantId: "grant_other_person", kind: "access", expiresAt: Date.now() + 300_000 });
+  await reviewedConsent(f, { grantId: "grant_other_person", bearer, ...link });
+  await f.call(oauth.bind, request("", bearer));
+  return { userId, link };
+}
+
+test("an approval request records the signed-in person who asked, attributes the acting agent separately, and two people sharing one source stay independent", async () => {
+  const { f, userId } = await foundation();
+  await f.call(projects.configure, { ...request(secrets.human), ...sharing });
+  const other = await secondPerson(f, "access-other-person");
+  const rootFor = (connectionId: string) => [...f.rows.values()].find(row => row._table === "credentials" && row.connectionId === connectionId)!;
+  // Both people reach the project through the one delegated member, so the member can
+  // never distinguish them. Their application users differ.
+  const connections = [...f.rows.values()].filter(row => row._table === "mcpConnections");
+  assert.equal(connections.length, 2);
+  assert.deepEqual(new Set(connections.map(row => row.memberId)), new Set(["agent"]));
+  assert.notEqual(userId, other.userId);
+  for (const connection of connections) assert.equal(rootFor(String(connection._id)).memberId, "agent");
+
+  const proposed = await approvable(f, "owned_rule", request());
+  const exact = { ...request(), ...proposed };
+  const created = await f.call(approvalRequests.requestRule, exact) as { state: string; requestDigest: string; requester: Record<string, unknown>; envelope: Record<string, unknown> };
+  assert.equal(created.state, "pending");
+  assert.deepEqual(created.requester, { userId, identified: true, actingMemberId: "agent", attribution: "signed_in_person" });
+  assert.equal(created.envelope.requesterUserId, userId);
+  assert.equal(created.envelope.requestedBy, "agent");
+  // Authoritative readback agrees, including the envelope digest recomputed over the
+  // recorded person, so the exact revision and hash binding is unchanged.
+  const readback = await f.call(approvalRequests.get, { ...request(), approvalRequestId: exact.requestId }) as typeof created;
+  assert.deepEqual(readback.requester, created.requester);
+  assert.deepEqual(readback.envelope, created.envelope);
+  assert.equal(readback.requestDigest, created.requestDigest);
+  assert.equal(readback.envelope.memoryId, proposed.memoryId);
+  assert.equal(readback.envelope.revision, proposed.revision);
+  assert.equal(readback.envelope.hash, proposed.hash);
+  // Same person, same requestId: one stable idempotent replay, never a second request.
+  const replayed = await f.call(approvalRequests.requestRule, exact);
+  assert.deepEqual(replayed, created);
+  assert.equal([...f.rows.values()].filter(row => row._table === "approvalRequests").length, 1);
+
+  // The other person shares the delegated member and still never owns this request.
+  const before = structuredClone(f.rows);
+  await assert.rejects(f.call(approvalRequests.cancel, { ...request("", "access-other-person"), approvalRequestId: exact.requestId }), scopeDenied);
+  assert.deepEqual(f.rows, before);
+  // The person who asked can withdraw it, and the receipt names them.
+  const cancelled = await f.call(approvalRequests.cancel, { ...request(), approvalRequestId: exact.requestId }) as { state: string; requester: { userId: string } };
+  assert.equal(cancelled.state, "cancelled");
+  assert.equal(cancelled.requester.userId, userId);
+});
+
+test("a request that identifies no person stays safe, its historical envelope digest is unchanged, and a completed decision is still protected", async () => {
+  const { f } = await foundation();
+  await f.call(projects.configure, { ...request(secrets.human), ...sharing });
+  await secondPerson(f, "access-other-person");
+  // The legacy agent entry point identifies no application user. Nothing is invented.
+  const legacy = await approvable(f, "legacy_rule", request(secrets.agent));
+  const exact = { ...request(secrets.agent), ...legacy };
+  const created = await f.call(approvalRequests.requestRule, exact) as { requestDigest: string; requester: Record<string, unknown>; envelope: Record<string, unknown> };
+  assert.equal("requesterUserId" in created.envelope, false);
+  assert.deepEqual(created.requester, { userId: null, identified: false, actingMemberId: "agent", attribution: "delegated_member_only" });
+  // The stored digest is exactly the digest of the pre-change envelope field list, so
+  // every historical record still verifies and an already-issued approval link and its
+  // challenge keep binding the same value.
+  const historical = { schemaVersion: 1, id: exact.requestId, action: "approve_rule", backendId: "backend", projectId: "project", repository: sharing.repository, remote: sharing.remote, defaultBranch: sharing.defaultBranch, memoryId: legacy.memoryId, revision: legacy.revision, hash: legacy.hash, requestedBy: "agent", createdAt: created.envelope.createdAt, expiresAt: created.envelope.expiresAt };
+  assert.equal(created.requestDigest, await auth.digest(auth.canonical(historical)));
+
+  // A signed-in person sharing that delegated member cannot withdraw an unidentified
+  // record: the shared member does not stand in for an identified person.
+  const before = structuredClone(f.rows);
+  await assert.rejects(f.call(approvalRequests.cancel, { ...request(), approvalRequestId: exact.requestId }), scopeDenied);
+  await assert.rejects(f.call(approvalRequests.cancel, { ...request("", "access-other-person"), approvalRequestId: exact.requestId }), scopeDenied);
+  assert.deepEqual(f.rows, before);
+  // The authorized project human keeps the cancellation path.
+  assert.equal((await f.call(approvalRequests.cancel, { ...request(secrets.human), approvalRequestId: exact.requestId }) as { state: string }).state, "cancelled");
+
+  // The legacy entry point that made a record still owns it by delegated member.
+  const second = await approvable(f, "legacy_rule_two", request(secrets.agent));
+  const legacyOwned = { ...request(secrets.agent), ...second };
+  await f.call(approvalRequests.requestRule, legacyOwned);
+  assert.equal((await f.call(approvalRequests.cancel, { ...request(secrets.agent), approvalRequestId: legacyOwned.requestId }) as { state: string }).state, "cancelled");
+
+  // A completed human decision resists cancellation from the person who asked for it.
+  const third = await approvable(f, "decided_rule", request());
+  const decided = { ...request(), ...third };
+  await f.call(approvalRequests.requestRule, decided);
+  f.patch(f.find("approvalRequests", decided.requestId)._id, { state: "approved", decidedBy: "human", decidedAt: Date.now() });
+  await assert.rejects(f.call(approvalRequests.cancel, { ...request(), approvalRequestId: decided.requestId }), scopeDenied);
+  await assert.rejects(f.call(approvalRequests.cancel, { ...request(secrets.human), approvalRequestId: decided.requestId }), scopeDenied);
+  assert.equal(f.find("approvalRequests", decided.requestId).state, "approved");
 });

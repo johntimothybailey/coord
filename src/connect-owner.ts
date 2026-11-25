@@ -5,9 +5,9 @@ import { readSmallFile, writeNewPrivateFile } from "./credentials.js";
 import { promptProtected, requireProtectedTerminal } from "./onboarding.js";
 import { invokeOwnerCli } from "./owner-cli.js";
 import { CoordError } from "./protocol.js";
+import { CONNECT_OFFERED_SCOPES, CONNECT_OFFER_SUMMARY, CONNECT_SCOPE_PURPOSE, connectConsentSelection } from "./oauth-scopes.js";
 import type { OperatorIo } from "./approval.js";
 
-const scopes = ["coord:read", "coord:propose", "coord:approval-request", "coord:run", "coord:supervise", "coord:artifact", "coord:verify", "coord:message"];
 export interface LinkPlan {
   schemaVersion: 1;
   deploymentName: string;
@@ -21,7 +21,13 @@ export function parseLinkPlan(value: unknown): LinkPlan {
   const link = object(plan.link); keys(link, ["id", "generation", "userId", "backendId", "projectId", "sourceCredentialId", "scopes", "activationExpiresAt", "expiresAt"]);
   if (plan.schemaVersion !== 1 || typeof plan.deploymentName !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(plan.deploymentName)) invalid();
   for (const key of ["id", "backendId", "projectId", "sourceCredentialId"]) if (typeof link[key] !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(link[key] as string)) invalid();
-  if (typeof link.userId !== "string" || !/^[a-zA-Z0-9]{1,128}$/.test(link.userId) || !Number.isSafeInteger(link.generation) || Number(link.generation) < 1 || !Number.isSafeInteger(link.activationExpiresAt) || !Number.isSafeInteger(link.expiresAt) || Number(link.activationExpiresAt) <= 0 || Number(link.activationExpiresAt) > Number(link.expiresAt) || Number(link.expiresAt) <= 0 || !Number.isFinite(new Date(Number(link.activationExpiresAt)).getTime()) || !Number.isFinite(new Date(Number(link.expiresAt)).getTime()) || !Array.isArray(link.scopes) || !link.scopes.length || link.scopes.length > scopes.length || new Set(link.scopes).size !== link.scopes.length || link.scopes.some(scope => typeof scope !== "string" || !scopes.includes(scope)) || !link.scopes.includes("coord:read")) invalid();
+  if (typeof link.userId !== "string" || !/^[a-zA-Z0-9]{1,128}$/.test(link.userId) || !Number.isSafeInteger(link.generation) || Number(link.generation) < 1 || !Number.isSafeInteger(link.activationExpiresAt) || !Number.isSafeInteger(link.expiresAt) || Number(link.activationExpiresAt) <= 0 || Number(link.activationExpiresAt) > Number(link.expiresAt) || Number(link.expiresAt) <= 0 || !Number.isFinite(new Date(Number(link.activationExpiresAt)).getTime()) || !Number.isFinite(new Date(Number(link.expiresAt)).getTime()) || !Array.isArray(link.scopes)) invalid();
+  // A Connect link selects one supported workflow combination: read alone, or read
+  // with rule proposal and/or human approval routing. Anything else is refused here,
+  // never reduced silently, so the owner confirms exactly what they chose.
+  const selection = connectConsentSelection(link.scopes as unknown[]);
+  if (!selection) throw new CoordError("INVALID_INPUT", `Unsupported Connect permission selection. ${CONNECT_OFFER_SUMMARY} Use --scopes with ${CONNECT_OFFERED_SCOPES[0]}, optionally adding ${CONNECT_OFFERED_SCOPES.slice(1).join(" and/or ")}.`);
+  if (selection.join(",") !== (link.scopes as string[]).join(",")) invalid();
   return structuredClone(plan) as unknown as LinkPlan;
 }
 export const linkPlanDigest = (plan: LinkPlan): string => createHash("sha256").update(canonicalJson(plan)).digest("hex");
@@ -53,6 +59,9 @@ function reviewReport(reviewed: OwnerReview, highestGeneration: number): string 
     + `Generation history preview — at most the newest 20 generations, revoked ones included (${reviewed.existing.length}):\n${rows(reviewed.existing)}`
     + (reviewed.existingTruncated ? "Older generations exist outside this preview and are not displayed. Every unrevoked link is already listed in the complete affected set above.\n" : "");
 }
+function permissionReport(selected: string[]): string {
+  return `Permissions this link selects (${selected.length}):\n${selected.map(scope => `  ${scope} — ${CONNECT_SCOPE_PURPOSE[scope]}\n`).join("")}${CONNECT_OFFER_SUMMARY}\n`;
+}
 export const CONNECT_OWNER_USAGE = "Usage: coord connect plan --deployment <name> --backend <id> --project <id> --user <public-app-user-id> --source <existing-agent-id> --generation <n> --scopes <comma-separated-scopes> --activation-expires-at <ISO-8601> --expires-at <ISO-8601> --out <new-absolute-plan.json> | connect inspect-plan|inspect-owner <plan.json> | connect link <plan.json>";
 interface ConnectOwnerIo extends OperatorIo { ownerCall?: (deployment: string, operation: "connect:installOwnerLink" | "connect:inspectOwnerLink" | "connect:inspectLink", args: Record<string, unknown>) => Promise<unknown> }
 export async function connectOwnerCommand(args: string[], io: ConnectOwnerIo = {}): Promise<void> {
@@ -70,12 +79,12 @@ export async function connectOwnerCommand(args: string[], io: ConnectOwnerIo = {
     const plan = parseLinkPlan({ schemaVersion: 1, deploymentName: values.get("--deployment"), link: { id: randomUUID(), generation: Number(values.get("--generation")), userId: values.get("--user"), backendId: values.get("--backend"), projectId: values.get("--project"), sourceCredentialId: values.get("--source"), scopes: values.get("--scopes")!.split(","), activationExpiresAt: Date.parse(values.get("--activation-expires-at")!), expiresAt: Date.parse(values.get("--expires-at")!) } });
     if (plan.link.activationExpiresAt <= Date.now() || plan.link.expiresAt <= Date.now()) invalid();
     await writeNewPrivateFile(values.get("--out")!, `${JSON.stringify(plan, null, 2)}\n`);
-    write(`Prepared nonsecret Connect link plan ${linkPlanDigest(plan)}. No authority was installed.\n`); return;
+    write(`${permissionReport(plan.link.scopes)}Prepared nonsecret Connect link plan ${linkPlanDigest(plan)}. No authority was installed.\n`); return;
   }
   if (!rest[0] || rest.length !== 1 || !["inspect-plan", "inspect-owner", "link"].includes(command ?? "")) throw new CoordError("INVALID_INPUT", CONNECT_OWNER_USAGE);
   if ((command === "link" || command === "inspect-owner") && !io.prompt) requireProtectedTerminal();
   const plan = parseLinkPlan(JSON.parse(await readSmallFile(rest[0]))), hash = linkPlanDigest(plan);
-  write(`${JSON.stringify(plan, null, 2)}\nActivation deadline: ${new Date(plan.link.activationExpiresAt).toISOString()} (${plan.link.activationExpiresAt} ms since epoch)\nAuthority deadline: ${new Date(plan.link.expiresAt).toISOString()} (${plan.link.expiresAt} ms since epoch)\nExact plan digest: ${hash}\n`);
+  write(`${JSON.stringify(plan, null, 2)}\nActivation deadline: ${new Date(plan.link.activationExpiresAt).toISOString()} (${plan.link.activationExpiresAt} ms since epoch)\nAuthority deadline: ${new Date(plan.link.expiresAt).toISOString()} (${plan.link.expiresAt} ms since epoch)\n${permissionReport(plan.link.scopes)}Exact plan digest: ${hash}\n`);
   if (command === "inspect-plan") { write("Inspection only; no authority installed. Compare this public app user ID independently with the protected browser.\n"); return; }
   const prompt = io.prompt ?? promptProtected;
   write("One-time protected owner linking. Independently match the browser app user ID, deployment, project, existing agent, scopes and limits. This grants agent project access, never human approval authority. No vault is read.\n");

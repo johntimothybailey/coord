@@ -6,6 +6,7 @@ import { authenticate, authorizeActor, bounded, canonical, digest, fail, integer
 import { bindOAuth, consentForSession, currentConnection, currentGrant, currentLink, oauthResource, sessionUser, installIdentityLink, installLinkArgs, validateLineage } from "./oauthAuthority.js";
 import type { AuthorityCtx } from "./oauthAuthority.js";
 import { CONNECTION_CAP_MS } from "./oauthPolicy.js";
+import { CONNECT_BASELINE_SCOPE, CONNECT_OFFER_SUMMARY, CONNECT_SCOPE_PURPOSE, connectConsentSelection, connectExcludedScopes, connectOfferedSubset } from "../src/oauth-scopes.js";
 import { CAPABILITIES, CLIENT_VERSION, PROTOCOL_VERSION } from "../src/protocol.js";
 
 export const HANDOFF_TTL_MS = 10 * 60_000;
@@ -44,10 +45,21 @@ async function reviewTuple(ctx: QueryCtx | MutationCtx, handoff: Doc<"connectHan
   const grant = await handoffGrant(ctx, handoff);
   const { link, source, membership } = await currentLink(ctx, await ctx.db.get(linkId));
   if (link.userId !== handoff.userId || link.generation !== generation) fail("FORBIDDEN", "Exact own project link required");
-  const scopes = handoff.originalScopes.filter(scope => grant.scopes.includes(scope) && link.scopes.includes(scope));
-  if (!scopes.includes("coord:read")) fail("FORBIDDEN", "Connect requires current read scope to verify project access");
+  // Workflow-limited Connect consent: read is the baseline, and proposal or human
+  // approval routing is included only when that workflow was actually requested and
+  // the owner's link selected it. A permission Connect does not offer is excluded
+  // here rather than silently consented, and the exclusion is disclosed below.
+  const eligible = handoff.originalScopes.filter(scope => grant.scopes.includes(scope) && link.scopes.includes(scope));
+  const scopes = connectOfferedSubset(eligible);
+  if (!scopes.includes(CONNECT_BASELINE_SCOPE)) fail("FORBIDDEN", "Connect requires current read scope to verify project access");
   const review = { handoffId: handoff.id, grantId: grant._id, userId: handoff.userId, clientId: handoff.clientId, resource: handoff.resource, grantCreatedAt: handoff.grantCreatedAt, backendId: link.backendId, projectId: link.projectId, sourceCredentialId: source.id, linkId: link._id, generation: link.generation, scopes, absoluteExpiresAt: Math.min(handoff.absoluteExpiresAt, link.expiresAt, source.expiresAt, membership.expiresAt) };
-  return { review, digest: await digest(canonical(review)) };
+  // Disclosure sits outside the digested tuple: the digest still covers exactly the
+  // reviewed fields, so an already-issued review binding keeps its existing shape.
+  // excluded names the permissions this host's own OAuth grant holds that Connect does
+  // not offer, so the human reads what their host asked for and will not receive. A
+  // narrower owner link is a separate ceiling and is already visible in the scope list.
+  const offer = { summary: CONNECT_OFFER_SUMMARY, granted: scopes.map(scope => ({ scope, purpose: CONNECT_SCOPE_PURPOSE[scope]! })), excluded: connectExcludedScopes(grant.scopes) };
+  return { review, digest: await digest(canonical(review)), offer };
 }
 async function currentRoot(ctx: AuthorityCtx, connection: Doc<"mcpConnections">, scope?: string) {
   if (!connection.rootCredentialId) fail("UNAUTHORIZED", "Connect root is not bound");
@@ -112,7 +124,7 @@ export const connectionPage = query({ args: browseArgs, handler: async (ctx, arg
 } });
 export const review = query({ args: reviewArgs, handler: async (ctx, args) => {
   const handoff = await ownHandoff(ctx, args.handoffId);
-  if (stateOf(handoff) !== "pending" && handoff.state !== "completed") return { state: stateOf(handoff), review: null, digest: null };
+  if (stateOf(handoff) !== "pending" && handoff.state !== "completed") return { state: stateOf(handoff), review: null, digest: null, offer: null };
   const tuple = await reviewTuple(ctx, handoff, args.linkId, args.generation);
   if (handoff.state === "completed" && (handoff.linkId !== args.linkId || handoff.generation !== args.generation || handoff.reviewDigest !== tuple.digest)) fail("IDEMPOTENCY_CONFLICT", "Completed Connect tuple cannot change");
   return { state: stateOf(handoff), ...tuple };
@@ -124,7 +136,9 @@ export const complete = mutation({ args: { ...reviewArgs, digest: v.string() }, 
   if (args.digest !== tuple.digest || (handoff.state === "completed" && (handoff.linkId !== args.linkId || handoff.generation !== args.generation || handoff.reviewDigest !== args.digest))) fail("IDEMPOTENCY_CONFLICT", "Review changed; inspect the exact Connect tuple again");
   // Direct helper reuse keeps session, current grant/link and app writes in one
   // authoritative transaction. No earlier browser/action check grants authority.
-  const consent = await consentForSession(ctx, { grantId: handoff.grantId, linkId: args.linkId, generation: args.generation }, handoff.originalScopes);
+  // The ceiling is narrowed with the same shared definition the review used, so a
+  // stale wider handoff cannot consent more than the browser was shown.
+  const consent = await consentForSession(ctx, { grantId: handoff.grantId, linkId: args.linkId, generation: args.generation }, connectOfferedSubset(handoff.originalScopes));
   if (consent.absoluteExpiresAt !== tuple.review.absoluteExpiresAt) fail("IDEMPOTENCY_CONFLICT", "Consent ceiling changed");
   if (handoff.state !== "completed") await ctx.db.patch(handoff._id, { state: "completed", linkId: args.linkId, generation: args.generation, reviewDigest: args.digest });
   return { state: stateOf({ ...handoff, state: "completed" }), projectId: consent.projectId, absoluteExpiresAt: consent.absoluteExpiresAt };
@@ -175,7 +189,7 @@ export const finish = internalMutation({ args: { bearer: v.string() }, handler: 
     const bytes = crypto.getRandomValues(new Uint8Array(32));
     const id = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
     const now = Date.now(), absoluteExpiresAt = access.grant._creationTime + CONNECTION_CAP_MS;
-    const rowId = await ctx.db.insert("connectHandoffs", { id, grantId: access.grant._id, userId: access.user._id, clientId: access.grant.clientId!, resource: access.grant.resource, grantCreatedAt: access.grant._creationTime, originalScopes: access.scopes, absoluteExpiresAt, createdAt: now, expiresAt: Math.min(now + HANDOFF_TTL_MS, absoluteExpiresAt), state: "pending" });
+    const rowId = await ctx.db.insert("connectHandoffs", { id, grantId: access.grant._id, userId: access.user._id, clientId: access.grant.clientId!, resource: access.grant.resource, grantCreatedAt: access.grant._creationTime, originalScopes: connectOfferedSubset(access.scopes), absoluteExpiresAt, createdAt: now, expiresAt: Math.min(now + HANDOFF_TTL_MS, absoluteExpiresAt), state: "pending" });
     handoff = await ctx.db.get(rowId);
   }
   if (!handoff || handoff.userId !== access.user._id || handoff.clientId !== access.grant.clientId || handoff.resource !== access.grant.resource || handoff.grantCreatedAt !== access.grant._creationTime) fail("UNAUTHORIZED", "Connect attempt mismatch");
@@ -248,6 +262,10 @@ async function ownerInspection(ctx: QueryCtx | MutationCtx, args: { userId: Doc<
 }
 export const inspectOwnerLink = internalQuery({ args: ownerSelection, handler: ownerInspection });
 export const installOwnerLink = internalMutation({ args: { ...installLinkArgs, expectedStateDigest: v.string() }, handler: async (ctx, args) => {
+  // The owner's normal Connect entry point selects one supported workflow combination.
+  // Unsupported selections are refused, never quietly reduced. The generic internal
+  // installLink writer keeps the full eight-scope policy for non-Connect use.
+  if (!connectConsentSelection(args.scopes)) fail("INVALID_INPUT", `A Connect project link selects ${CONNECT_OFFER_SUMMARY} Select coord:read, optionally with coord:propose and/or coord:approval-request.`);
   const current = await ownerInspection(ctx, args);
   if (current.digest !== args.expectedStateDigest || args.generation !== current.highestGeneration + 1) fail("IDEMPOTENCY_CONFLICT", "Owner link state changed; review a fresh exact plan before replacing authority");
   const { expectedStateDigest: _reviewed, ...link } = args;

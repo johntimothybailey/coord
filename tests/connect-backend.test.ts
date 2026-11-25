@@ -577,3 +577,96 @@ test("listings, refresh and rebinding never move the original cap, and replaceme
   await assert.rejects(f.call(connect.status, { handoffId: consent.handoffId }), code("UNAUTHORIZED"));
   assert.equal(Number(f.rows.get(String(connection._id))!.absoluteExpiresAt), cap);
 });
+
+// Workflow-limited Connect consent. Read is the Connect baseline; rule proposal and
+// human approval routing are added only when that workflow was chosen. The five
+// execution/delegation scopes have no Connect workflow and are never consented here,
+// while the backend policy still maps all eight names.
+const OFFERED = ["coord:read", "coord:propose", "coord:approval-request"];
+const NOT_OFFERED = ["coord:run", "coord:supervise", "coord:artifact", "coord:verify", "coord:message"];
+
+test("Connect advertises only its workflow permissions with a human-facing purpose for each", () => {
+  const advertised = (mcpIngress as unknown as { options: { scopes: Record<string, string>; instructions: string } }).options;
+  assert.deepEqual(Object.keys(advertised.scopes).sort(), [...OFFERED].sort());
+  for (const scope of NOT_OFFERED) assert.equal(advertised.scopes[scope], undefined);
+  assert.match(advertised.scopes["coord:read"]!, /verify actual project access/);
+  assert.match(advertised.scopes["coord:propose"]!, /approves nothing by itself/);
+  assert.match(advertised.scopes["coord:approval-request"]!, /can never make the decision/);
+  assert.match(advertised.instructions, /does not offer execution, supervision, artifact, verification or messaging/);
+});
+
+test("a wider grant and link still consent only Connect's offered permissions, and the review discloses what it excludes", async () => {
+  const { f, link } = await setup();
+  const pending = await handoff(f);
+  // The permissions recorded for a new handoff are already the narrower selection.
+  assert.deepEqual(f.find("connectHandoffs", pending.handoffId).originalScopes, OFFERED);
+  const reviewed = await f.call(connect.review, { handoffId: pending.handoffId, ...link }) as { digest: string; review: { scopes: string[] }; offer: { summary: string; granted: { scope: string; purpose: string }[]; excluded: string[] } };
+  assert.deepEqual(reviewed.review.scopes, OFFERED);
+  assert.deepEqual(reviewed.offer.granted.map(item => item.scope), OFFERED);
+  for (const item of reviewed.offer.granted) assert(item.purpose.length > 40, item.scope);
+  assert.deepEqual(reviewed.offer.excluded, NOT_OFFERED);
+  assert.match(reviewed.offer.summary, /does not offer execution/);
+  await f.call(connect.complete, { handoffId: pending.handoffId, ...link, digest: reviewed.digest });
+  const connection = [...f.rows.values()].find(row => row._table === "mcpConnections")!;
+  // Exactly what was reviewed is what was consented: nothing extra, nothing silent.
+  assert.deepEqual(connection.scopes, OFFERED);
+  // A retry recomputes the identical review and the identical immutable consent.
+  const again = await f.call(connect.review, { handoffId: pending.handoffId, ...link }) as { digest: string; review: { scopes: string[] } };
+  assert.equal(again.digest, reviewed.digest);
+  assert.deepEqual(again.review.scopes, OFFERED);
+  await f.call(connect.complete, { handoffId: pending.handoffId, ...link, digest: reviewed.digest });
+  assert.deepEqual([...f.rows.values()].find(row => row._table === "mcpConnections")!.scopes, OFFERED);
+});
+
+test("each supported Connect workflow combination consents exactly its own selection", async () => {
+  for (const selection of [["coord:read"], ["coord:read", "coord:propose"], ["coord:read", "coord:approval-request"], OFFERED]) {
+    const { f, userId } = await setup();
+    const chosen = await f.call(oauth.installLink, { id: "chosen", generation: 2, userId, backendId: "backend", projectId: "project", sourceCredentialId: "agent", scopes: selection, activationExpiresAt: Date.now() + 60_000, expiresAt: Date.now() + CONNECTION_CAP_MS }) as { linkId: Doc<"identityLinks">["_id"]; generation: number };
+    await f.call(oauth.activateLink, chosen);
+    const pending = await handoff(f);
+    const reviewed = await f.call(connect.review, { handoffId: pending.handoffId, ...chosen }) as { digest: string; review: { scopes: string[] }; offer: { excluded: string[] } };
+    assert.deepEqual(reviewed.review.scopes, selection, selection.join(","));
+    assert.deepEqual(reviewed.offer.excluded, NOT_OFFERED, selection.join(","));
+    await f.call(connect.complete, { handoffId: pending.handoffId, ...chosen, digest: reviewed.digest });
+    assert.deepEqual([...f.rows.values()].find(row => row._table === "mcpConnections")!.scopes, selection, selection.join(","));
+  }
+});
+
+test("the owner's Connect link selection refuses an unsupported combination instead of quietly reducing it", async () => {
+  const { f, userId } = await setup();
+  const selected = { userId, backendId: "backend", projectId: "project", sourceCredentialId: "agent" };
+  const limits = { activationExpiresAt: Date.now() + 60_000, expiresAt: Date.now() + 120_000 };
+  const unsupported: string[][] = [[], ["coord:run"], ["coord:read", "coord:run"], ["coord:propose"], ["coord:read", "coord:read"], [...OAUTH_SCOPES]];
+  for (const [index, scopes] of unsupported.entries()) {
+    const current = await f.call(connect.inspectOwnerLink, selected) as { digest: string };
+    const before = structuredClone(f.rows);
+    await assert.rejects(f.call(connect.installOwnerLink, { ...selected, id: `refused_${index}`, generation: 2, scopes, ...limits, expectedStateDigest: current.digest }), code("INVALID_INPUT"), scopes.join(",") || "(empty)");
+    assert.deepEqual(f.rows, before, scopes.join(",") || "(empty)");
+  }
+  // Every supported combination installs through the same owner entry point.
+  for (const [index, scopes] of [["coord:read"], ["coord:read", "coord:propose"], ["coord:read", "coord:approval-request"], OFFERED].entries()) {
+    const current = await f.call(connect.inspectOwnerLink, selected) as { digest: string; highestGeneration: number };
+    await f.call(connect.installOwnerLink, { ...selected, id: `accepted_${index}`, generation: current.highestGeneration + 1, scopes, ...limits, expectedStateDigest: current.digest });
+    assert.deepEqual(f.find("identityLinks", `accepted_${index}`).scopes, scopes, scopes.join(","));
+  }
+  // The generic internal writer keeps the full eight-scope backend policy for any
+  // non-Connect use; only the owner's Connect entry point is narrowed.
+  const current = await f.call(connect.inspectOwnerLink, selected) as { highestGeneration: number };
+  await f.call(oauth.installLink, { ...selected, id: "policy_wide", generation: current.highestGeneration + 1, scopes: [...OAUTH_SCOPES], ...limits });
+  assert.deepEqual(f.find("identityLinks", "policy_wide").scopes, [...OAUTH_SCOPES]);
+});
+
+test("an existing wider connection is not relabelled, and its refusal and cleanup stay unchanged", async () => {
+  const { f, userId } = await setup();
+  // A connection recorded before the narrower offer keeps exactly its stored scopes.
+  const existing = f.seed("mcpConnections", { grantId: "historical_grant", userId, backendId: "backend", projectId: "project", resource: `${site}/mcp`, clientId: "host", linkId: "historical_link", linkGeneration: 1, membershipId: "historical_membership", membershipGeneration: 1, sourceCredentialId: "agent", memberId: "agent", scopes: [...OAUTH_SCOPES], grantCreatedAt: Date.now() - 1000, absoluteExpiresAt: Date.now() + CONNECTION_CAP_MS });
+  const listed = await f.call(connect.connectionPage, {}) as { connections: { connectionId: string; revoked: boolean; expired: boolean }[] };
+  assert(listed.connections.some(row => row.connectionId === existing && !row.revoked && !row.expired));
+  assert.deepEqual(f.rows.get(existing)!.scopes, [...OAUTH_SCOPES]);
+  // Cleanup still works on it and still only revokes, never rewrites or deletes.
+  await f.call(oauth.revokeConnection, { connectionId: existing as Doc<"mcpConnections">["_id"] });
+  assert.deepEqual(f.rows.get(existing)!.scopes, [...OAUTH_SCOPES]);
+  assert.notEqual(f.rows.get(existing)!.revokedAt, undefined);
+  const after = await f.call(connect.connectionPage, {}) as { connections: { connectionId: string; revoked: boolean }[] };
+  assert(after.connections.some(row => row.connectionId === existing && row.revoked));
+});

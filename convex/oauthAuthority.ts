@@ -80,11 +80,20 @@ export async function validateLineage(ctx: AuthorityCtx, actor: Doc<"credentials
   }
   fail("UNAUTHORIZED", "OAuth ancestry exceeds supported depth");
 }
-export async function authorizeOAuth(ctx: AuthorityCtx, actor: Doc<"credentials">, projectId: string, operation?: string) {
-  if (!isOAuth(actor)) return;
+// Returns the server-derived signed-in application user behind an OAuth actor, so a
+// requester-owned record can name the person rather than the shared delegated member.
+// A legacy credential identifies no application user and returns undefined; nothing
+// here accepts a caller-supplied person label.
+export async function authorizeOAuth(ctx: AuthorityCtx, actor: Doc<"credentials">, projectId: string, operation?: string): Promise<string | undefined> {
+  if (!isOAuth(actor)) return undefined;
   const scope = operationScope(operation, actor.role);
   if (!scope) fail("FORBIDDEN", "Operation does not permit OAuth authority");
   await validateLineage(ctx, actor, projectId, scope);
+  // validateLineage proved this exact connection current in this same transaction,
+  // including that connection.userId equals its link's user.
+  const connection = actor.connectionId && await ctx.db.get(actor.connectionId);
+  if (!connection) fail("UNAUTHORIZED", "Connection unavailable");
+  return connection.userId;
 }
 export function childLineage(actor: Doc<"credentials">) {
   return isOAuth(actor) ? { credentialSource: "oauth" as const, connectionId: actor.connectionId!, parentCredentialId: actor.id, oauthScopes: actor.oauthScopes!, absoluteExpiresAt: actor.absoluteExpiresAt! } : { credentialSource: "legacy" as const };
