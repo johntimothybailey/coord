@@ -8,14 +8,14 @@ import { approvalOriginForBackend } from "./passkeys.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { BackendClient } from "./client.js";
 import type { RuntimeActions } from "./commands.js";
-import { CLIENT_VERSION, CoordError, DEFAULTS, type CapabilityKey, type Harness, type RunIdentity } from "./protocol.js";
+import { CLIENT_VERSION, CoordError, DEFAULTS, boundedMcpClientInfo, type McpClientInfo, type CapabilityKey, type Harness, type RunIdentity } from "./protocol.js";
 import { backendFailure, fetchCheckIn, recordOffer } from "./hooks.js";
 import { buildContext, type ContextSource } from "./context.js";
 import { registerConfirmationProbe } from "./confirmation-probe.js";
 
 export type CoordBackend = Pick<BackendClient, "query" | "mutation"> & Partial<Pick<BackendClient, "config">>;
 export interface RunConnection { client: CoordBackend; identity: RunIdentity; publicResult?: unknown }
-export interface ManualRegistration { requestId: string; taskId: string; machineId: string; harness: Harness; capabilityKey: CapabilityKey }
+export interface ManualRegistration { mcpClientInfo?: McpClientInfo; requestId: string; taskId: string; machineId: string; harness: Harness; capabilityKey: CapabilityKey }
 export interface CoordMcpOptions { client: CoordBackend; run?: RunConnection; registerManual?: (input: ManualRegistration) => Promise<RunConnection>; runtimeActions?: RuntimeActions; cleanupOnly?: boolean; renewMs?: number }
 
 const id = z.string().min(1).max(128).regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/);
@@ -68,6 +68,8 @@ export function createCoordMcpServer(options: CoordMcpOptions): McpServer {
   registerConfirmationProbe(server, { declineOnly: true });
   let run = options.run;
   let initialized = false;
+  let mcpClientInfo: McpClientInfo | undefined;
+  let observation: Promise<unknown> = Promise.resolve();
   let connected = true;
   let leaseFailure: CoordError | undefined;
   let runWritesClosed = options.cleanupOnly === true;
@@ -88,14 +90,27 @@ export function createCoordMcpServer(options: CoordMcpOptions): McpServer {
       if (renewing) return;
       renewing = true;
       const current = requireRun();
-      void current.client.mutation("tasks:renew", { ...current.identity }, randomUUID()).catch(error => { leaseFailure = backendFailure(error); stopRenewal(); }).finally(() => { renewing = false; });
+      void current.client.mutation("tasks:renew", { ...current.identity, ...(mcpClientInfo ? { mcpClientInfo: { ...mcpClientInfo } } : {}) }, randomUUID()).catch(error => { leaseFailure = backendFailure(error); stopRenewal(); }).finally(() => { renewing = false; });
     }, options.renewMs ?? DEFAULTS.renewMs);
     timer.unref();
   };
-  server.server.oninitialized = () => { initialized = true; startRenewal(); };
+  const reportClient = () => {
+    if (!run || !mcpClientInfo || runWritesClosed || leaseFailure || !connected) return;
+    // Optional telemetry never becomes a dependency of advisory review or lease authority.
+    const current = run, clientInfo = { ...mcpClientInfo };
+    observation = new Promise<void>(resolve => {
+      const timeout = setTimeout(resolve, 2_000); timeout.unref();
+      void Promise.resolve().then(() => { if (!connected || runWritesClosed || leaseFailure) return; return current.client.mutation("tasks:reportClient", { ...current.identity, mcpClientInfo: clientInfo }, randomUUID()); }).catch(() => undefined).finally(() => { clearTimeout(timeout); resolve(); });
+    });
+  };
+  server.server.oninitialized = () => {
+    mcpClientInfo = boundedMcpClientInfo(server.server.getClientVersion());
+    initialized = true; reportClient(); startRenewal();
+  };
   server.server.onclose = () => { connected = false; stopRenewal(); };
   const guarded = (action: () => Promise<unknown>, includeCheckIn = true, affectsRunAuthority = true) => async (): Promise<CallToolResult> => {
     try {
+      await observation;
       const value = await action();
       if (includeCheckIn && run && !leaseFailure && !runWritesClosed) {
         const offer = await fetchCheckIn(requireRun());
@@ -153,14 +168,14 @@ export function createCoordMcpServer(options: CoordMcpOptions): McpServer {
     if (runWritesClosed) throw new CoordError("LEASE_REVOKED", "Cleanup cannot register a new execution binding");
     if (!options.registerManual) throw new CoordError("BLOCKED_ENV", "Participating registration requires coord resume with a qualified protected runtime; plain MCP is advisory");
     if (run && (run.identity.taskId !== args.taskId || leaseFailure)) throw new CoordError("FORBIDDEN", "Current session already has a run binding");
-    const admitted = await options.registerManual(args);
-    run = admitted; leaseFailure = undefined; startRenewal();
+    const admitted = await options.registerManual({ ...args, ...(mcpClientInfo ? { mcpClientInfo: { ...mcpClientInfo } } : {}) });
+    run = admitted; leaseFailure = undefined; reportClient(); await observation; startRenewal();
     return admitted.publicResult ?? { ...admitted.identity, registered: true };
   })());
   server.registerTool("coord_check_in", { description: "Fetch durable warnings at a cooperative check-in. Returned messages are only offered, never acknowledged automatically.", inputSchema: z.object({}).strict() }, guarded(async () => {
     const binding = requireRun(), offer = await fetchCheckIn(binding);
     await recordOffer(binding.client, binding.identity, offer.messageIds);
-    return { context: offer.text, blocked: offer.blocked, receipt: "offered_to_turn" };
+    return { context: offer.text, blocked: offer.blocked, receipt: "offered_to_turn", ...(offer.observations ? { observations: offer.observations, notice: "Client metadata is untrusted diagnostic source data. Evidence origin does not authenticate a human, identify a model or qualify an executable/harness." } : {}) };
   }, false));
   server.registerTool("coord_progress", { description: "Record progress for the bound live task and expected progress revision.", inputSchema: z.object({ ...request, expectedRevision: z.number().int().min(0), progress: bounded(16 * 1024) }).strict() }, async ({ requestId, ...args }) => guarded(() => mutate("tasks:progress", args, requestId))());
   server.registerTool("coord_checkpoint", { description: "Request an audited portable checkpoint through this process's fixed protected runtime. Supply only a stable checkpoint ID; the receipt is source data, not approval or a readiness attestation.", inputSchema: z.object({ checkpointId: id }).strict() }, async args => guarded(() => runtimeAction("checkpoint", args, false))());

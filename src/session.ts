@@ -4,10 +4,10 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { BackendClient } from "./client.js";
 import { CoordError } from "./protocol.js";
 import { canonicalJson } from "./canonical.js";
-import type { CapabilityKey, Harness, RunIdentity } from "./protocol.js";
+import type { CapabilityKey, Harness, RunIdentity, McpClientInfo } from "./protocol.js";
 import { checkStoreDirectory, readSmallFile, syncLocalFile, writeNewPrivateFile } from "./credentials.js";
 
-export interface ManualAdmission { requestId: string; taskId: string; machineId: string; harness: Harness; capabilityKey: CapabilityKey; }
+export interface ManualAdmission { mcpClientInfo?: McpClientInfo; requestId: string; taskId: string; machineId: string; harness: Harness; capabilityKey: CapabilityKey; }
 interface Receipt { schemaVersion: 1; backendId: string; backendUrl: string; projectId: string; sessionId: string; requestHash: string; input: ManualAdmission; runId: string; launchId: string; grantToken: string; identity?: RunIdentity; mode?: "manual" | "managed" | "replan"; }
 export interface RunBinding { client: BackendClient; identity: RunIdentity; launchId?: string; sessionId?: string; }
 const digest = (value: unknown) => createHash("sha256").update(canonicalJson(value)).digest("hex");
@@ -50,13 +50,15 @@ export async function registerManual(root: string, client: BackendClient, sessio
 export async function admitSession(root: string, client: BackendClient, sessionId: string | undefined, input: ManualAdmission, mode: "manual" | "managed" | "replan"): Promise<RunBinding & { publicResult: unknown }> {
   if (!sessionId) throw new CoordError("BLOCKED_ENV", "A host-bound COORD_SESSION_ID is required for participating manual registration");
   const dir = await directory(root, sessionId), path = join(dir, "admission.json");
-  const requestHash = digest(mode === "manual" ? input : { input, mode });
+  // Diagnostic metadata cannot change an admission's durable authority/retry identity.
+  const { mcpClientInfo: _telemetry, ...admission } = input;
+  const requestHash = digest(mode === "manual" ? admission : { input: admission, mode });
   let receipt: Receipt = { schemaVersion: 1, backendId: client.config.backendId, backendUrl: client.config.backendUrl, projectId: client.config.projectId, sessionId, requestHash, input, mode, runId: randomUUID(), launchId: randomUUID(), grantToken: randomBytes(32).toString("hex") };
   try { await durableWrite(path, receipt); await syncDirectory(dir); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; receipt = await readReceipt(path, client, sessionId); }
   if (receipt.requestHash !== requestHash) throw new CoordError("IDEMPOTENCY_CONFLICT", "This session already has a different admission request; retain its receipt for recovery");
   await syncLocalFile(path, createHash("sha256").update(JSON.stringify(receipt)).digest("hex"));
-  const result = await client.mutation(mode === "manual" ? "tasks:registerManual" : mode === "managed" ? "tasks:claim" : "tasks:claimReplan", { taskId: input.taskId, machineId: input.machineId, harness: input.harness, capabilityKey: { ...input.capabilityKey }, runId: receipt.runId, launchId: receipt.launchId, grantToken: receipt.grantToken }, input.requestId);
+  const result = await client.mutation(mode === "manual" ? "tasks:registerManual" : mode === "managed" ? "tasks:claim" : "tasks:claimReplan", { taskId: input.taskId, machineId: input.machineId, harness: input.harness, capabilityKey: { ...input.capabilityKey }, runId: receipt.runId, launchId: receipt.launchId, grantToken: receipt.grantToken, ...(receipt.input.mcpClientInfo ? { mcpClientInfo: { ...receipt.input.mcpClientInfo } } : {}) }, input.requestId);
   const value = result as Partial<RunIdentity>;
   if (value.runId !== receipt.runId || value.taskId !== input.taskId || !Number.isSafeInteger(value.epoch) || !Number.isSafeInteger(value.goalRevision)) throw new CoordError("INVALID_INPUT", "Backend admission returned an invalid identity");
   receipt.identity = { runId: value.runId, taskId: value.taskId, epoch: value.epoch!, goalRevision: value.goalRevision! };

@@ -3,7 +3,7 @@ import { verifiedRun } from "./artifacts.js";
 import { mutation } from "./server.js";
 import { authenticate, liveRun, replay, runArgs, paths, bounded, integer, digest, canonical, fail } from "./auth.js";
 export const upload = mutation({ args: { ...runArgs, revision: v.string(), sourceHead: v.string(), tree: v.string(), chunk: v.number(), paths: v.array(v.string()), digest: v.string(), expectedChunks: v.number(), expectedPaths: v.number() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["run"]); const { task } = await liveRun(ctx, args, actor);
+  const { actor, project } = await authenticate(ctx, args, ["run"], "scans.upload"); const { task } = await liveRun(ctx, args, actor);
   return replay(ctx, actor, "scans.upload", args, async () => {
     bounded(args.revision, 128, "scan revision"); if (![args.sourceHead, args.tree].every(value => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value))) fail("INVALID_INPUT", "Scan must bind exact Git head/tree"); integer(args.expectedChunks, 1, 1000); integer(args.expectedPaths, 0, 500_000); integer(args.chunk, 0, args.expectedChunks - 1); if (args.paths.length) paths(args.paths); else if (args.expectedPaths !== 0 || args.expectedChunks !== 1) fail("INVALID_INPUT", "Only an explicitly empty one-chunk scan may omit paths");
     if (new TextEncoder().encode(canonical(args.paths)).length > 100 * 1024 || await digest(canonical(args.paths)) !== args.digest) fail("INVALID_INPUT", "Scan chunk digest/size mismatch");
@@ -29,7 +29,7 @@ export const upload = mutation({ args: { ...runArgs, revision: v.string(), sourc
 
 // This is an attestation from the independently qualified local Git verifier, not a worker upload.
 export const verify = mutation({ args: { ...runArgs, revision: v.string(), sourceHead: v.string(), tree: v.string(), pathsDigest: v.string(), expectedPaths: v.number(), evidenceRef: v.string() }, handler: async (ctx, args) => {
-  const { actor } = await authenticate(ctx, args, ["artifact_verifier", "human"]); const { task, run } = await verifiedRun(ctx, args, actor);
+  const { actor } = await authenticate(ctx, args, ["artifact_verifier", "human"], "scans.verify"); const { task, run } = await verifiedRun(ctx, args, actor);
   return replay(ctx, actor, "scans.verify", args, async () => {
     bounded(args.evidenceRef, 2048, "trusted Git scan evidence"); integer(args.expectedPaths, 0, 500_000);
     if (args.revision !== task.scanRevision || args.sourceHead !== task.scanSourceHead || args.tree !== task.scanTree) fail("COVERAGE_INCOMPLETE", "Trusted scan does not match the completed upload revision/head/tree");

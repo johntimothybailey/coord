@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { connectOwnerCommand } from "./connect-owner.js";
 import { runDoctor } from "./doctor.js";
 import { CLIENT_VERSION, CoordError } from "./protocol.js";
 import { connectWorkspace } from "./client.js";
@@ -20,6 +21,7 @@ export async function main(argv = process.argv.slice(2), io: { mcpStreams?: { st
   const [command, ...args] = argv;
   if (command === "--version") { console.log(CLIENT_VERSION); return; }
   if (command === "setup") { if (args[0] === "passkey") await passkeySetupCommand(args.slice(1)); else if (args[0] === "recover-operator") await recoverOperatorCommand(args.slice(1)); else await setupCommand(args); return; }
+  if (command === "connect") { await connectOwnerCommand(args); return; }
   if (command === "approve") { await approveCommand(args); return; }
   if (["checkpoint", "resume", "review", "daemon", "run"].includes(command ?? "")) { console.log(JSON.stringify(await runCommand(command!, args))); return; }
   if (command === "doctor") {
@@ -87,7 +89,7 @@ export async function main(argv = process.argv.slice(2), io: { mcpStreams?: { st
     return;
   }
   if (!command || command === "--help" || command === "help") {
-    console.log("coord — private v2.5 implementation\n\n  doctor [--json] [--no-fixtures]\n  setup inspect <plan.json>\n  setup passkey <plan.json> <absolute-encrypted-vault> [--revoke <public-credential-id>]\n  setup recover-operator <plan.json> <NEW-absolute-vault> --replace <old-human-credential-id> [--retry]\n  setup bootstrap|connect <plan.json> <absolute-encrypted-vault>\n  approve goal <goal-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>\n  approve rule <memory-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>\n  approve policy <capture-policy.json> --plan <plan.json> --vault <absolute-encrypted-vault> --hash <sha256-hex>\n  checkpoint <id> --runtime <file> --session <id>\n  resume <task> --runtime <file> --session <id> [--checkpoint <id>] [--harness codex|antigravity] [--prepare-only]\n  review <publication> --checkpoint <id> --runtime <file> --session <id>\n  run finalize succeeded|failed|stopped --runtime <file> --session <id>\n  run reconcile <launch-id> --runtime <file> [--stop]\n  daemon --runtime <file> [--check]\n  status\n  mcp [--confirmation-probe | --confirmation-decline-probe]\n  hook codex|antigravity|claude [event]\n  rules sync\n  export <new-local-file.jsonl>\n  --version\n\nRuntime commands require actual qualified protected configuration. See docs/commands.md. Protected setup must run in a separate operator terminal following the maintainer's onboarding procedure."); return;
+    console.log("coord — private v2.5 implementation\n\n  doctor [--json] [--no-fixtures]\n  connect plan|inspect-plan|inspect-owner|link (run connect with no args for exact usage)\n  setup inspect <plan.json>\n  setup passkey <plan.json> <absolute-encrypted-vault> [--revoke <public-credential-id>]\n  setup recover-operator <plan.json> <NEW-absolute-vault> --replace <old-human-credential-id> [--retry]\n  setup bootstrap|connect <plan.json> <absolute-encrypted-vault>\n  approve goal <goal-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>\n  approve rule <memory-id> --plan <plan.json> --vault <absolute-encrypted-vault> --revision <n> --hash <sha256-hex>\n  approve policy <capture-policy.json> --plan <plan.json> --vault <absolute-encrypted-vault> --hash <sha256-hex>\n  checkpoint <id> --runtime <file> --session <id>\n  resume <task> --runtime <file> --session <id> [--checkpoint <id>] [--harness codex|antigravity] [--prepare-only]\n  review <publication> --checkpoint <id> --runtime <file> --session <id>\n  run finalize succeeded|failed|stopped --runtime <file> --session <id>\n  run reconcile <launch-id> --runtime <file> [--stop]\n  daemon --runtime <file> [--check]\n  status\n  mcp [--confirmation-probe | --confirmation-decline-probe]\n  hook codex|antigravity|claude [event]\n  rules sync\n  export <new-local-file.jsonl>\n  --version\n\nRuntime commands require actual qualified protected configuration. See docs/commands.md. Protected setup must run in a separate operator terminal following the maintainer's onboarding procedure."); return;
   }
   throw new CoordError("INVALID_INPUT", "Unknown command; run coord --help");
 }

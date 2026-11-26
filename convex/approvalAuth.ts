@@ -1,3 +1,4 @@
+import { isOAuth } from "./oauthAuthority.js";
 import { v } from "convex/values";
 import { authenticate, authorizeActor, canonical, digest, fail, identityArgs, replay, stableId } from "./auth.js";
 import { mutation, query, internalMutation, internalQuery } from "./server.js";
@@ -14,6 +15,7 @@ export function siteOrigin(): string { return trustedApprovalOrigin(process.env.
 const identityFor = (record: { backendId: string; projectId: string; id: string }) => ({ backendId: record.backendId, projectId: record.projectId, requestId: record.id, protocolVersion: PROTOCOL_VERSION, clientVersion: CLIENT_VERSION, capabilities: [...CAPABILITIES] });
 async function humanFor(ctx: Pick<QueryCtx, "db">, record: { backendId: string; projectId: string; id: string }, credentialId: string) {
   const actor = await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", credentialId)).unique();
+  if (actor && isOAuth(actor)) fail("FORBIDDEN", "OAuth cannot supply human approval authority");
   return authorizeActor(ctx, identityFor(record), actor, ["human"]);
 }
 async function userHandle(record: { backendId: string; projectId: string; memberId: string }): Promise<string> { const hex = await digest(`${record.backendId}:${record.projectId}:${record.memberId}`); return encode64(Uint8Array.from(hex.match(/../g)!, byte => parseInt(byte, 16))); }
@@ -27,7 +29,7 @@ async function enrollment(ctx: Pick<QueryCtx, "db">, id: string) {
   return record;
 }
 export const beginEnrollment = mutation({ args: { ...identityArgs, enrollmentId: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["human"]);
+  const { actor, project } = await authenticate(ctx, args, ["human"], "approvalAuth.beginEnrollment");
   const id = await replay(ctx, actor, "approvalAuth.beginEnrollment", args, async () => {
     stableId(args.enrollmentId);
     if (await ctx.db.query("approvalEnrollments").withIndex("by_stable_id", q => q.eq("id", args.enrollmentId)).unique()) fail("IDEMPOTENCY_CONFLICT", "Enrollment identity already used");
@@ -39,12 +41,12 @@ export const beginEnrollment = mutation({ args: { ...identityArgs, enrollmentId:
   return { enrollmentId: id, memberId: record.memberId, url: `${record.origin}/approval?enrollment=${encodeURIComponent(id)}`, expiresAt: record.expiresAt };
 } });
 export const enrollmentStatus = query({ args: { ...identityArgs, enrollmentId: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["human"]); const record = await enrollment(ctx, args.enrollmentId);
+  const { actor, project } = await authenticate(ctx, args, ["human"], "approvalAuth.enrollmentStatus"); const record = await enrollment(ctx, args.enrollmentId);
   if (record.projectId !== project.id || record.humanCredentialId !== actor.id) fail("FORBIDDEN", "Enrollment belongs to another operator");
   return { enrollmentId: record.id, memberId: record.memberId, fingerprint: record.fingerprint ?? null, credentialId: record.credentialId ?? null, enrolled: record.enrolledAt !== undefined, expiresAt: record.expiresAt };
 } });
 export const finishEnrollment = mutation({ args: { ...identityArgs, enrollmentId: v.string(), fingerprint: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["human"]);
+  const { actor, project } = await authenticate(ctx, args, ["human"], "approvalAuth.finishEnrollment");
   return replay(ctx, actor, "approvalAuth.finishEnrollment", args, async () => {
     const record = await enrollment(ctx, args.enrollmentId);
     if (record.projectId !== project.id || record.humanCredentialId !== actor.id || !record.credentialId || !record.publicKeySpki || !record.fingerprint || record.fingerprint !== args.fingerprint || record.signCount === undefined) fail("FORBIDDEN", "Exact browser key fingerprint must be confirmed by this operator");
@@ -57,7 +59,7 @@ export const finishEnrollment = mutation({ args: { ...identityArgs, enrollmentId
   });
 } });
 export const revokePasskey = mutation({ args: { ...identityArgs, credentialId: v.string() }, handler: async (ctx, args) => {
-  const { actor, project } = await authenticate(ctx, args, ["human"]);
+  const { actor, project } = await authenticate(ctx, args, ["human"], "approvalAuth.revokePasskey");
   return replay(ctx, actor, "approvalAuth.revokePasskey", args, async () => {
     const key = await ctx.db.query("approvalPasskeys").withIndex("by_credential", q => q.eq("id", args.credentialId)).unique();
     if (!key || key.projectId !== project.id || key.memberId !== actor.memberId) fail("FORBIDDEN", "Passkey does not belong to this human");

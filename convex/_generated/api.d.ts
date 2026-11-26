@@ -8,8 +8,14 @@
  * @module
  */
 
+import type * as attribution from "../attribution.js";
 import type * as artifacts from "../artifacts.js";
 import type * as auth from "../auth.js";
+import type * as authSignin from "../authSignin.js";
+import type * as connect from "../connect.js";
+import type * as authCore from "../authCore.js";
+import type * as oauthAuthority from "../oauthAuthority.js";
+import type * as mcpConsent from "../mcpConsent.js";
 import type * as checkpoints from "../checkpoints.js";
 import type * as crons from "../crons.js";
 import type * as dispatch from "../dispatch.js";
@@ -32,8 +38,14 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  attribution: typeof attribution;
   artifacts: typeof artifacts;
   auth: typeof auth;
+  authCore: typeof authCore;
+  authSignin: typeof authSignin;
+  connect: typeof connect;
+  oauthAuthority: typeof oauthAuthority;
+  mcpConsent: typeof mcpConsent;
   checkpoints: typeof checkpoints;
   crons: typeof crons;
   dispatch: typeof dispatch;
@@ -76,4 +88,9 @@ export declare const internal: FilterApi<
   FunctionReference<any, "internal">
 >;
 
-export declare const components: {};
+export declare const components: {
+  auth: import("@convex-dev/auth/_generated/component.js").ComponentApi<"auth">;
+  authPasskey: import("@convex-dev/auth/components/passkey/_generated/component.js").ComponentApi<"authPasskey">;
+  authUsername: import("@convex-dev/auth/components/username/_generated/component.js").ComponentApi<"authUsername">;
+  mcp: import("@convex-dev/mcp/_generated/component.js").ComponentApi<"mcp">;
+};

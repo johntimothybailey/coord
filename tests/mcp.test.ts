@@ -39,6 +39,9 @@ if (process.argv.includes("--fixture-mcp")) {
     const client = new Client({ name: "test", version: "1" });
     try {
       await server.connect(a); await client.connect(b);
+      await client.callTool({ name: "coord_status", arguments: {} });
+      assert.deepEqual(writes.slice(), [{ name: "tasks:reportClient", args: { ...identity, mcpClientInfo: { name: "test", version: "1" } }, requestId: (writes[0] as { requestId: string }).requestId }]);
+      writes.length = 0; // Isolate subsequent strict-schema tool calls from authenticated startup telemetry.
       const spoof = await client.callTool({ name: "coord_progress", arguments: { requestId: "req1", expectedRevision: 1, progress: "text", token: "secret", epoch: 99 } });
       assert.equal(spoof.isError, true);
       assert.equal(writes.length, 0);
@@ -51,15 +54,15 @@ if (process.argv.includes("--fixture-mcp")) {
   });
 
   test("disconnected MCP stops lease renewal and failed renewal rejects further run writes", async () => {
-    let renewals = 0, progressWrites = 0;
-    const backend: CoordBackend = { query: async () => checkIn, mutation: async name => { if (name === "tasks:renew") { renewals++; throw new CoordError("LEASE_REVOKED", "Expired"); } progressWrites++; return {}; } };
+    let renewals = 0, progressWrites = 0, observations = 0;
+    const backend: CoordBackend = { query: async () => checkIn, mutation: async name => { if (name === "tasks:reportClient") { observations++; return {}; } if (name === "tasks:renew") { renewals++; throw new CoordError("LEASE_REVOKED", "Expired"); } progressWrites++; return {}; } };
     const server = createCoordMcpServer({ client: backend, run: { client: backend, identity }, renewMs: 5 });
     const [a, b] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "test", version: "1" });
     try {
       await server.connect(a); await client.connect(b);
       await delay(30);
-      assert.equal(renewals, 1);
+      assert.equal(renewals, 1); assert.equal(observations, 1);
       const response = await client.callTool({ name: "coord_progress", arguments: { requestId: "req1", expectedRevision: 1, progress: "text" } });
       assert.equal(response.isError, true);
       assert.match(JSON.stringify(response), /LEASE_REVOKED/);
@@ -83,7 +86,7 @@ if (process.argv.includes("--fixture-mcp")) {
       await server.connect(a); await client.connect(b);
       const response = await client.callTool({ name: "coord_progress", arguments: { requestId: "next1", expectedRevision: 1, progress: "Updated progress" } });
       assert.match(JSON.stringify(response), /Reuse the shared implementation/);
-      assert.deepEqual(writes, [{ name: "tasks:progress", state: undefined }, { name: "messages:receipt", state: "offered_to_turn" }]);
+      assert.deepEqual(writes, [{ name: "tasks:reportClient", state: undefined }, { name: "tasks:progress", state: undefined }, { name: "messages:receipt", state: "offered_to_turn" }]);
     } finally { await client.close(); await server.close(); }
   });
 
@@ -139,6 +142,9 @@ if (process.argv.includes("--fixture-mcp")) {
     const client = new Client({ name: "test", version: "1" });
     try {
       await server.connect(a); await client.connect(b);
+      await client.callTool({ name: "coord_status", arguments: {} });
+      assert.deepEqual(writes.slice(), [{ name: "tasks:reportClient", args: { ...identity, mcpClientInfo: { name: "test", version: "1" } }, requestId: writes[0]!.requestId }]);
+      writes.length = 0;
       const tools = (await client.listTools()).tools;
       assert.match(tools.find(tool => tool.name === "coord_upload_scan")!.description!, /unverified/);
       assert.ok(!tools.some(tool => /verify.*scan|scan.*verify|artifact_verifier/.test(tool.name)));

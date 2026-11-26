@@ -136,22 +136,31 @@ test("strict review tool schemas reject model-supplied authority before any back
   } finally { await connection.close(); }
 });
 
-test("review attached to an existing run skips all check-ins, offers and mutations", async () => {
+test("review attached to an existing run adds no check-ins, offers or mutations after startup observation", async () => {
   const f = await fixture(), item = await seed(f, "rule"), b = backend(f);
-  const runClient: CoordBackend = { query: async () => { throw new Error("Review must use project authority, not check in through the run"); }, mutation: async () => { throw new Error("Review must not renew or mutate a run"); } };
+  const runCalls: { name: string; args: unknown }[] = [];
+  const runClient: CoordBackend = { query: async (name, args) => { runCalls.push({ name, args }); throw new Error("Review must use project authority, not check in through the run"); }, mutation: async (name, args) => { runCalls.push({ name, args }); throw new Error("Review must not renew or mutate a run"); } };
   const before = structuredClone(f.rows), connection = await session({ client: b.client, run: { client: runClient, identity: { taskId: "task", runId: "run", epoch: 1, goalRevision: 1 } }, renewMs: 60_000 });
   try {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(runCalls, [{ name: "tasks:reportClient", args: { taskId: "task", runId: "run", epoch: 1, goalRevision: 1, mcpClientInfo: { name: "review-fixture", version: "1" } } }]);
+    runCalls.length = 0;
     payload(await connection.client.callTool({ name: "coord_review_memories", arguments: { kind: "rule" } }));
     payload(await connection.client.callTool({ name: "coord_review_memory", arguments: { memoryId: item.id, revision: item.revision, hash: item.hash } }));
-    assert.deepEqual(b.calls, ["memories:reviewList", "memories:reviewDetail"]); assert.deepEqual(b.writes, []); assert.deepEqual(f.rows, before);
+    assert.deepEqual(b.calls, ["memories:reviewList", "memories:reviewDetail"]); assert.deepEqual(b.writes, []); assert.deepEqual(f.rows, before); assert.deepEqual(runCalls, []);
   } finally { await connection.close(); }
-  let runWrites = 0;
+  let runWrites = 0, runQueries = 0;
+  const independentWrites: { name: string; args: unknown }[] = [];
   const rejectedProject: CoordBackend = { query: async () => { throw { data: { code: "UNAUTHORIZED", message: "project-credential-canary" } }; }, mutation: async () => { throw new Error("Project review cannot mutate"); } };
-  const validRun: CoordBackend = { query: async () => ({ task: { id: "task", epoch: 1, progressRevision: 1, state: "running", dependencies: [] }, run: { id: "run", epoch: 1, goalRevision: 1 }, policyVersion: 1, messages: [], complete: true }), mutation: async () => { runWrites++; return {}; } };
+  const validRun: CoordBackend = { query: async () => { runQueries++; return { task: { id: "task", epoch: 1, progressRevision: 1, state: "running", dependencies: [] }, run: { id: "run", epoch: 1, goalRevision: 1 }, policyVersion: 1, messages: [], complete: true }; }, mutation: async (name, args) => { independentWrites.push({ name, args }); runWrites++; return {}; } };
   const independent = await session({ client: rejectedProject, run: { client: validRun, identity: { taskId: "task", runId: "run", epoch: 1, goalRevision: 1 } }, renewMs: 60_000 });
   try {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(independentWrites, [{ name: "tasks:reportClient", args: { taskId: "task", runId: "run", epoch: 1, goalRevision: 1, mcpClientInfo: { name: "review-fixture", version: "1" } } }]);
+    assert.equal(runWrites, 1); assert.equal(runQueries, 0);
+    runWrites = 0; independentWrites.length = 0;
     const denied = await independent.client.callTool({ name: "coord_review_memories", arguments: { kind: "rule" } });
-    assert.equal(denied.isError, true); assert.doesNotMatch(JSON.stringify(denied), /project-credential-canary/); assert.equal(runWrites, 0);
+    assert.equal(denied.isError, true); assert.doesNotMatch(JSON.stringify(denied), /project-credential-canary/); assert.equal(runWrites, 0); assert.equal(runQueries, 0); assert.deepEqual(independentWrites, []);
     const progress = await independent.client.callTool({ name: "coord_progress", arguments: { requestId: "valid_run", expectedRevision: 1, progress: "Existing run authority remains independently checked" } });
     assert.ok(!progress.isError, JSON.stringify(progress)); assert.equal(runWrites, 1, "project-read denial must not revoke a distinct run grant");
   } finally { await independent.close(); }

@@ -1,3 +1,5 @@
+import { validateLineage } from "./oauthAuthority.js";
+import type { AuthorityCtx } from "./oauthAuthority.js";
 import { v } from "convex/values";
 import { base } from "./schema.js";
 import type { Doc, QueryCtx } from "./server.js";
@@ -20,12 +22,14 @@ export async function validateManifest(manifest: Manifest, task: Doc<"tasks">, r
   if (manifest.manifestDigest !== await digest(canonical(core)) || !/^[a-f0-9]{64}$/.test(manifest.policyDigest)) fail("CHECKPOINT_INCOMPLETE", "Manifest digest or approved capture policy digest mismatch");
   if (new TextEncoder().encode(canonical(manifest)).length > 512 * 1024) fail("CHECKPOINT_INCOMPLETE", "Manifest requires a supported larger artifact transport");
 }
-export async function verifiedRun(ctx: Pick<QueryCtx, "db">, args: RunIdentity, actor: Doc<"credentials">) {
+export async function verifiedRun(ctx: AuthorityCtx, args: RunIdentity, actor: Doc<"credentials">) {
   const run = await ctx.db.query("runs").withIndex("by_stable_id", q => q.eq("id", args.runId)).unique();
   if (!run || run.projectId !== args.projectId || (actor.role !== "artifact_verifier" && actor.role !== "human") || (actor.role === "artifact_verifier" && (actor.machineId !== run.machineId || actor.memberId !== run.memberId))) fail("FORBIDDEN", "Independent project/machine verifier authority required");
   if (run.mode === "replan") fail("FORBIDDEN", "Replanning runs cannot verify or accept implementation code artifacts");
   const grant = await ctx.db.query("credentials").withIndex("by_stable_id", q => q.eq("id", run.grantId)).unique();
   if (!grant || grant.revokedAt !== undefined || grant.expiresAt <= Date.now()) fail("LEASE_REVOKED", "Artifact run grant is revoked");
+  await validateLineage(ctx, grant, args.projectId, "coord:run");
+  await validateLineage(ctx, grant, args.projectId, "coord:artifact");
   const live = await liveRun(ctx, args, grant, ["running"], ["running", "yielding", "review_ready"]);
   await noConflicts(ctx, live.task);
   return live;

@@ -6,6 +6,14 @@ export const DEFAULTS = Object.freeze({ leaseMs: 90_000, renewMs: 20_000, watchd
 export type EvidenceStatus = "PASS" | "FAIL" | "BLOCKED";
 export type ExecutionMode = "advisory" | "manual" | "managed";
 export type Harness = "codex" | "antigravity" | "claude";
+/** Untrusted display metadata; never an executable selector or qualification. */
+export interface McpClientInfo { name: string; version: string }
+export function boundedMcpClientInfo(value: unknown): McpClientInfo | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const { name, version } = value as Partial<McpClientInfo>;
+  if ([name, version].some(text => typeof text !== "string" || !text.length || new TextEncoder().encode(text).length > 256 || /[\u0000-\u001f\u007f]/.test(text))) return undefined;
+  return { name: name!, version: version! };
+}
 export interface CapabilityKey { os: string; harness: Harness; harnessVersion: string; adapterVersion: string; probeVersion: string; configurationDigest: string; gitPolicyDigest: string }
 export interface ProbeEvidence { schemaVersion: 1; checkId: string; status: EvidenceStatus; mode: ExecutionMode; observedAt: string; configurationDigest: string; command: string[]; summary: string; evidenceRef?: string; kind: "real" | "fixture"; }
 export interface CapabilityEvidence { key: CapabilityKey; checks: ProbeEvidence[]; }

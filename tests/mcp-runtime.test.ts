@@ -109,8 +109,8 @@ test("finalization reaches backend-revalidating callback after a stale local ren
 });
 
 test("review reconciliation reaches the authoritative callback after local lease failure and accepted result", async () => {
-  let renewals = 0, attempts = 0;
-  const renewing: CoordBackend = { query: async () => checkIn, mutation: async () => { renewals++; throw new CoordError("LEASE_REVOKED", "Expired locally"); } };
+  let renewals = 0, attempts = 0, observations = 0;
+  const renewing: CoordBackend = { query: async () => checkIn, mutation: async name => { if (name === "tasks:reportClient") { observations++; return {}; } renewals++; throw new CoordError("LEASE_REVOKED", "Expired locally"); } };
   const actions = callbacks([]);
   actions.review = async input => {
     attempts++;
@@ -119,7 +119,7 @@ test("review reconciliation reaches the authoritative callback after local lease
   };
   const connection = await session({ client: renewing, run: { client: renewing, identity }, runtimeActions: actions, renewMs: 5 });
   try {
-    await delay(25); assert.equal(renewals, 1);
+    await delay(25); assert.equal(renewals, 1); assert.equal(observations, 1);
     for (let attempt = 0; attempt < 2; attempt++) assert.ok(!(await connection.client.callTool({ name: "coord_review", arguments: { checkpointId: "cp1", publicationId: "publication1" } })).isError);
     const changed = await connection.client.callTool({ name: "coord_review", arguments: { checkpointId: "cp1", publicationId: "publication2" } });
     assert.equal(changed.isError, true); assert.match(JSON.stringify(changed), /FORBIDDEN/);
